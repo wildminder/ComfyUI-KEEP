@@ -4,8 +4,6 @@
 
 <p align="center">
   <img src="./workflow-examples/keep-workflow.png" alt="ComfyUI-KEEP Workflow Example" width="700">
-  <br>
-  This custom node integrates the powerful KEEP model into ComfyUI for both single image and video face super-resolution.
 </p>
     
 </div>
@@ -15,7 +13,7 @@
 - **2025-05-20**: Initial commit
 
 ## About ComfyUI-KEEP
-This repository provides custom nodes for ComfyUI that implement the **KEEP (Kalman-Inspired FEaturE Propagation)** algorithm for face super-resolution. KEEP is designed for robust video face super-resolution, and these nodes adapt its capabilities for use within the ComfyUI framework.
+This repository provides custom nodes for ComfyUI that implement the **KEEP** algorithm for face super-resolution. KEEP is designed for robust video face super-resolution, and these nodes adapt its capabilities for use within the ComfyUI framework.
 
 You can enhance faces in:
 *   Single images
