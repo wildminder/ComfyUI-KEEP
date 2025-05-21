@@ -1,0 +1,468 @@
+{
+  "id": "8d572b01-d28b-4720-9a8f-de78a462448a",
+  "revision": 0,
+  "last_node_id": 22,
+  "last_link_id": 25,
+  "nodes": [
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        516.8903198242188,
+        288.9566650390625
+      ],
+      "size": [
+        274.080078125,
+        314
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            20
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.34",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "180.webp",
+        "image"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "PreviewImage",
+      "pos": [
+        1253.10888671875,
+        290.5484313964844
+      ],
+      "size": [
+        333.02752685546875,
+        324.772705078125
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 21
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.34",
+        "Node name for S&R": "PreviewImage"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 16,
+      "type": "VHS_LoadVideo",
+      "pos": [
+        441.42437744140625,
+        691.3724365234375
+      ],
+      "size": [
+        364.2177734375,
+        668.2177734375
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            23
+          ]
+        },
+        {
+          "name": "frame_count",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "video_info",
+          "type": "VHS_VIDEOINFO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "a7ce59e381934733bfae03b1be029756d6ce936d",
+        "Node name for S&R": "VHS_LoadVideo"
+      },
+      "widgets_values": {
+        "video": "syn_03_lq.mp4",
+        "force_rate": 0,
+        "custom_width": 0,
+        "custom_height": 0,
+        "frame_load_cap": 0,
+        "skip_first_frames": 0,
+        "select_every_nth": 1,
+        "format": "None",
+        "choose video to upload": "image",
+        "videopreview": {
+          "hidden": false,
+          "paused": false,
+          "params": {
+            "force_rate": 0,
+            "custom_width": 0,
+            "custom_height": 0,
+            "frame_load_cap": 0,
+            "skip_first_frames": 0,
+            "select_every_nth": 1,
+            "filename": "syn_03_lq.mp4",
+            "type": "input",
+            "format": "video/mp4"
+          }
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        1250.33251953125,
+        690.7274780273438
+      ],
+      "size": [
+        356.87506103515625,
+        684.8750610351562
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 24
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Filenames",
+          "type": "VHS_FILENAMES",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "124c913ccdd8a585734ea758c35fa1bab8499c99",
+        "Node name for S&R": "VHS_VideoCombine",
+        "aux_id": "Kosinkadink/ComfyUI-VideoHelperSuite"
+      },
+      "widgets_values": {
+        "frame_rate": 15,
+        "loop_count": 0,
+        "filename_prefix": "Wan/wan",
+        "format": "video/h264-mp4",
+        "pix_fmt": "yuv420p",
+        "crf": 4,
+        "save_metadata": true,
+        "trim_to_audio": false,
+        "pingpong": false,
+        "save_output": true,
+        "videopreview": {
+          "hidden": false,
+          "paused": false,
+          "params": {
+            "filename": "wan_00009.mp4",
+            "subfolder": "Wan",
+            "type": "output",
+            "format": "video/h264-mp4",
+            "frame_rate": 15,
+            "workflow": "wan_00009.png",
+            "fullpath": "C:\\_Dev\\ComfyUI_test\\ComfyUI\\output\\Wan\\wan_00009.mp4"
+          },
+          "muted": false
+        }
+      }
+    },
+    {
+      "id": 1,
+      "type": "KEEP_ModelLoader",
+      "pos": [
+        856.6369018554688,
+        490.28631591796875
+      ],
+      "size": [
+        334.502685546875,
+        156.68629455566406
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "keep_model_pack",
+          "type": "KEEP_MODEL_PACK",
+          "links": [
+            22,
+            25
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "wildminder/ComfyUI-KEEP",
+        "ver": "unknown",
+        "Node name for S&R": "KEEP_ModelLoader"
+      },
+      "widgets_values": [
+        "KEEP",
+        "retinaface_resnet50",
+        true,
+        true,
+        400
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 20,
+      "type": "KEEP_FaceUpscaleImage",
+      "pos": [
+        856.6369018554688,
+        291.7147216796875
+      ],
+      "size": [
+        330.1480712890625,
+        150
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 20
+        },
+        {
+          "name": "keep_model",
+          "type": "KEEP_MODEL_PACK",
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "wildminder/ComfyUI-KEEP",
+        "ver": "unknown",
+        "Node name for S&R": "KEEP_FaceUpscaleImage"
+      },
+      "widgets_values": [
+        false,
+        true,
+        false,
+        1
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 21,
+      "type": "KEEP_ProcessImageSequence",
+      "pos": [
+        856.6369018554688,
+        699.2883911132812
+      ],
+      "size": [
+        333.1029968261719,
+        174.98497009277344
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 23
+        },
+        {
+          "name": "keep_model",
+          "type": "KEEP_MODEL_PACK",
+          "link": 25
+        }
+      ],
+      "outputs": [
+        {
+          "name": "processed_images",
+          "type": "IMAGE",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "wildminder/ComfyUI-KEEP",
+        "ver": "unknown",
+        "Node name for S&R": "KEEP_ProcessImageSequence"
+      },
+      "widgets_values": [
+        false,
+        true,
+        false,
+        1,
+        20
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 22,
+      "type": "Note",
+      "pos": [
+        877.5428466796875,
+        951.8934936523438
+      ],
+      "size": [
+        279.99578857421875,
+        88
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "Original project:\nhttps://github.com/jnjaby/KEEP\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      20,
+      3,
+      0,
+      20,
+      0,
+      "IMAGE"
+    ],
+    [
+      21,
+      20,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      22,
+      1,
+      0,
+      20,
+      1,
+      "KEEP_MODEL_PACK"
+    ],
+    [
+      23,
+      16,
+      0,
+      21,
+      0,
+      "IMAGE"
+    ],
+    [
+      24,
+      21,
+      0,
+      12,
+      0,
+      "IMAGE"
+    ],
+    [
+      25,
+      1,
+      0,
+      21,
+      1,
+      "KEEP_MODEL_PACK"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6934334949441382,
+      "offset": [
+        262.86549661987175,
+        -160.4970735647166
+      ]
+    },
+    "frontendVersion": "1.19.9",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
