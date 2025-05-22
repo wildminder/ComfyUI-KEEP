@@ -9,7 +9,7 @@
 </div>
 
 
-# Update. WIP
+# Update
 - **2025-05-20**: Initial commit
 
 ## About ComfyUI-KEEP
