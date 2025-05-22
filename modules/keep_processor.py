@@ -6,6 +6,7 @@ from torchvision.transforms.functional import normalize
 import os
 from tqdm import tqdm
 from .utils import comfy_image_to_cv2, cv2_to_comfy_image
+from comfy.utils import ProgressBar
 
 # Imports from vendored basicsr and facelib
 try:
@@ -457,10 +458,12 @@ class KEEPFaceProcessor:
 
         # Convert ComfyUI IMAGE tensor to a list of cv2 BGR images
         input_frames_bgr = []
+        pbar = ProgressBar(num_input_frames)
         for i in range(num_input_frames):
             # comfy_image_to_cv2 expects (1,H,W,C) or (H,W,C)
             frame_tensor = image_sequence_tensor[i].unsqueeze(0) 
             input_frames_bgr.append(comfy_image_to_cv2(frame_tensor))
+            pbar.update(1)
         
         # print(f"Processing image sequence: {num_input_frames} frames.")
 
@@ -493,6 +496,7 @@ class KEEPFaceProcessor:
         # Crop faces and prepare for KEEP network
         all_cropped_face_tensors = []
         # print("Cropping faces for KEEP network...")
+        pbar = ProgressBar(num_input_frames)
         for i in tqdm(range(num_input_frames), desc="Face Cropping (Sequence)"):
             img_bgr = input_frames_bgr[i]
             self.face_helper.clean_all()
@@ -520,6 +524,7 @@ class KEEPFaceProcessor:
             cropped_face_t = img2tensor(cropped_face_cv2 / 255., bgr2rgb=True, float32=True)
             normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
             all_cropped_face_tensors.append(cropped_face_t)
+            pbar.update(1)
         
         if not all_cropped_face_tensors:
             print("No faces could be cropped from the image sequence.")
@@ -531,6 +536,7 @@ class KEEPFaceProcessor:
         # KEEP Network Processing (in clips)
         # print("Restoring faces with KEEP network (in clips)...")
         temp_restored_face_tensors = []
+        pbar = ProgressBar(max_clip_length)
         for start_idx in tqdm(range(0, num_input_frames, max_clip_length), desc="KEEP Processing Clips (Sequence)"):
             end_idx = min(start_idx + max_clip_length, num_input_frames)
             current_clip_faces = batched_cropped_faces[:, start_idx:end_idx, ...]
@@ -543,7 +549,9 @@ class KEEPFaceProcessor:
             else:
                  clip_output_tensor = self.keep_net(current_clip_faces, need_upscale=False)
                  temp_restored_face_tensors.append(clip_output_tensor)
-        
+
+            pbar.update(1)
+
         if not temp_restored_face_tensors:
             print("KEEP network processing yielded no results for the sequence.")
             return image_sequence_tensor
@@ -557,6 +565,7 @@ class KEEPFaceProcessor:
         # Paste faces back onto each frame
         output_frames_cv2 = []
         # print("Pasting faces back onto frames...")
+        pbar = ProgressBar(num_input_frames)
         for i in tqdm(range(num_input_frames), desc="Pasting Faces (Sequence)"):
             original_frame_bgr = input_frames_bgr[i]
             
@@ -620,11 +629,12 @@ class KEEPFaceProcessor:
                     final_pasted_frame = cv2.cvtColor(final_pasted_frame, cv2.COLOR_GRAY2BGR)
 
             output_frames_cv2.append(final_pasted_frame)
+            pbar.update(1)
             
         # Convert list of cv2 BGR images back to ComfyUI IMAGE tensor (B, H, W, C), RGB, float32 [0,1]
         output_tensors = [cv2_to_comfy_image(frame) for frame in output_frames_cv2]
         if not output_tensors:
              return image_sequence_tensor
         final_batch_tensor = torch.cat(output_tensors, dim=0)
-        print("Video frame processing complete.")
+        # print("Video frame processing complete.")
         return final_batch_tensor

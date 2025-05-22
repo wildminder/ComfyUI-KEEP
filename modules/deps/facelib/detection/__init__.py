@@ -1,5 +1,6 @@
 import os
 import torch
+import pathlib
 
 try:
     from basicsr.utils.download_util import load_file_from_url
@@ -28,7 +29,8 @@ MODEL_NAMES = { # Map cli name to filename
 }
 
 
-def init_detection_model(model_name, half=False, device='cuda', model_rootpath=None): # <<< ADDED model_rootpath
+def init_detection_model(model_name, half=False, device='cuda', model_rootpath=None):
+    current_dir = str(pathlib.Path(__file__).parent.resolve())
     if model_name == 'retinaface_resnet50':
         from .retinaface.retinaface import RetinaFace
         model = RetinaFace(network_name='resnet50', half=half)
@@ -39,11 +41,11 @@ def init_detection_model(model_name, half=False, device='cuda', model_rootpath=N
         model_file_name = MODEL_NAMES['retinaface_mobile0.25']
     elif model_name == 'YOLOv5l':
         from .yolov5face.face_detector import YoloDetector
-        model = YoloDetector(config_name='facelib/detection/yolov5face/models/yolov5l.yaml', device=device)
+        model = YoloDetector(config_name=current_dir+'/yolov5face/models/yolov5l.yaml', device=device)
         model_file_name = MODEL_NAMES['YOLOv5l']
     elif model_name == 'YOLOv5n':
         from .yolov5face.face_detector import YoloDetector
-        model = YoloDetector(config_name='facelib/detection/yolov5face/models/yolov5n.yaml', device=device)
+        model = YoloDetector(config_name=current_dir+'/yolov5face/models/yolov5n.yaml', device=device)
         model_file_name = MODEL_NAMES['YOLOv5n']
     else:
         raise NotImplementedError(f'{model_name} is not implemented.')
@@ -66,23 +68,22 @@ def init_detection_model(model_name, half=False, device='cuda', model_rootpath=N
         # Better to ensure load_file_from_url_comfy in our utils handles all downloads.
         model_path_final = load_file_from_url(url=URLS[model_name], model_dir=model_rootpath, file_name=model_file_name)
 
-
     load_net = torch.load(model_path_final, map_location=lambda storage, loc: storage)
     if 'state_dict' in load_net:
         load_net = load_net['state_dict']
     
     # Special handling for YOLO models from the original inference_keep.py
     if model_name in ['YOLOv5l', 'YOLOv5n']:
-        if "model_state_dict" in load_net: # Check if it's the expected ultralytics format
-            model.model.load_state_dict(load_net["model_state_dict"])
-        else: # Assume it's a raw state_dict then
-            model.model.load_state_dict(load_net) # or model.load_state_dict(load_net) if YoloDetector handles it
+        model.detector.load_state_dict(load_net, strict=True)
+        model.detector.eval()
+        model.detector = model.detector.to(device).float()
+
     else: # RetinaFace
         new_load_net = {}
         for k, v in load_net.items():
             new_load_net[k.replace('module.', '')] = v
         model.load_state_dict(new_load_net)
 
-    model.eval()
-    model = model.to(device)
+        model.eval()
+        model = model.to(device)
     return model
