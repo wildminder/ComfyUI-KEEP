@@ -75,6 +75,7 @@ IMAGE: The processed image with the face(s) restored.
 - processed_images: The batch of processed frames with faces restored.
 
 ## Installation
+Via Manager or by cloning repo:
 
 1.  **Clone this repository:**
     ```bash
