@@ -1,0 +1,15 @@
+[project]
+name = "keep"
+description = "ComfyUI-KEEP: Kalman-Inspired Feature Propagation for Video Face Super-Resolution in ComfyUI"
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["addict", "future", "lmdb", "numpy", "opencv-python", "Pillow", "pyyaml", "scikit-image", "scipy", "torch", "torchvision", "tqdm", "yapf", "ffmpeg-python"]
+
+[project.urls]
+Repository = "https://github.com/wildminder/ComfyUI-KEEP"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-KEEP"
+Icon = ""
