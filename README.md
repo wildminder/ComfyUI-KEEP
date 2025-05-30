@@ -1,11 +1,9 @@
-<div align="center">
-
-<h1>ComfyUI-KEEP: Kalman-Inspired Feature Propagation for Video Face Super-Resolution in ComfyUI</h1>
-
-<p align="center">
-  <img src="./workflow-examples/keep-workflow.png" alt="ComfyUI-KEEP Workflow Example" width="700">
-</p>
-    
+<div style="text-align: center;">
+  <h1>ComfyUI-KEEP</h1><br>
+<h3>Kalman-Inspired Feature Propagation for Video Face Super-Resolution in ComfyUI</h3>
+  <p style="text-align: center;">
+    <img src="./workflow-examples/keep-workflow.png" alt="ComfyUI-KEEP Workflow Example" style="max-width: 100%; height: auto;">
+  </p>
 </div>
 
 
