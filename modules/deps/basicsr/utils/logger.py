@@ -7,8 +7,44 @@ from .dist_util import get_dist_info, master_only
 initialized_logger = {}
 
 
+class AvgTimer():
+
+    def __init__(self, window=200):
+        self.window = window  # average window
+        self.current_time = 0
+        self.total_time = 0
+        self.count = 0
+        self.avg_time = 0
+        self.start()
+
+    def start(self):
+        self.start_time = self.tic = time.time()
+
+    def record(self):
+        self.count += 1
+        self.toc = time.time()
+        self.current_time = self.toc - self.tic
+        self.total_time += self.current_time
+        # calculate average time
+        self.avg_time = self.total_time / self.count
+
+        # reset
+        if self.count > self.window:
+            self.count = 0
+            self.total_time = 0
+
+        self.tic = time.time()
+
+    def get_current_time(self):
+        return self.current_time
+
+    def get_avg_time(self):
+        return self.avg_time
+
+
 class MessageLogger():
     """Message logger for printing.
+
     Args:
         opt (dict): Config. It contains the following keys:
             name (str): Exp name.
@@ -29,14 +65,19 @@ class MessageLogger():
         self.start_time = time.time()
         self.logger = get_root_logger()
 
+    def reset_start_time(self):
+        self.start_time = time.time()
+
     @master_only
     def __call__(self, log_vars):
         """Format logging message.
+
         Args:
             log_vars (dict): It contains the following keys:
                 epoch (int): Epoch number.
                 iter (int): Current iter.
                 lrs (list): List for learning rates.
+
                 time (float): Iter time.
                 data_time (float): Data time for each iter.
         """
@@ -45,8 +86,7 @@ class MessageLogger():
         current_iter = log_vars.pop('iter')
         lrs = log_vars.pop('lrs')
 
-        message = (
-            f'[{self.exp_name[:5]}..][epoch:{epoch:3d}, ' f'iter:{current_iter:8,d}, lr:(')
+        message = (f'[{self.exp_name[:5]}..][epoch:{epoch:3d}, iter:{current_iter:8,d}, lr:(')
         for v in lrs:
             message += f'{v:.3e},'
         message += ')] '
@@ -68,10 +108,10 @@ class MessageLogger():
             message += f'{k}: {v:.4e} '
             # tensorboard logger
             if self.use_tb_logger and 'debug' not in self.exp_name:
-                # if k.startswith('l_'):
-                #     self.tb_logger.add_scalar(f'losses/{k}', v, current_iter)
-                # else:
-                self.tb_logger.add_scalar(k, v, current_iter)
+                if k.startswith('l_'):
+                    self.tb_logger.add_scalar(f'losses/{k}', v, current_iter)
+                else:
+                    self.tb_logger.add_scalar(k, v, current_iter)
         self.logger.info(message)
 
 
@@ -86,7 +126,7 @@ def init_tb_logger(log_dir):
 def init_wandb_logger(opt):
     """We now only use wandb to sync tensorboard log."""
     import wandb
-    logger = logging.getLogger('basicsr')
+    logger = get_root_logger()
 
     project = opt['logger']['wandb']['project']
     resume_id = opt['logger']['wandb'].get('resume_id')
@@ -98,17 +138,18 @@ def init_wandb_logger(opt):
         wandb_id = wandb.util.generate_id()
         resume = 'never'
 
-    wandb.init(id=wandb_id, resume=resume,
-               name=opt['name'], config=opt, project=project, sync_tensorboard=True)
+    wandb.init(id=wandb_id, resume=resume, name=opt['name'], config=opt, project=project, sync_tensorboard=True)
 
     logger.info(f'Use wandb logger with id={wandb_id}; project={project}.')
 
 
 def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None):
     """Get the root logger.
+
     The logger will be initialized if it has not been initialized. By default a
     StreamHandler will be added. If `log_file` is specified, a FileHandler will
     also be added.
+
     Args:
         logger_name (str): root logger name. Default: 'basicsr'.
         log_file (str | None): The log filename. If specified, a FileHandler
@@ -116,6 +157,7 @@ def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None
         log_level (int): The root logger level. Note that only the process of
             rank 0 is affected, while other processes will set the level to
             "Error" and be silent most of the time.
+
     Returns:
         logging.Logger: The root logger.
     """
@@ -135,9 +177,7 @@ def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None
     elif log_file is not None:
         logger.setLevel(log_level)
         # add file handler
-        # file_handler = logging.FileHandler(log_file, 'w')
-        # Shangchen: keep the previous log
-        file_handler = logging.FileHandler(log_file, 'a')
+        file_handler = logging.FileHandler(log_file, 'w')
         file_handler.setFormatter(logging.Formatter(format_str))
         file_handler.setLevel(log_level)
         logger.addHandler(file_handler)
@@ -147,6 +187,7 @@ def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None
 
 def get_env_info():
     """Get environment information.
+
     Currently, only log the software version.
     """
     import torch

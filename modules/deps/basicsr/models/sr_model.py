@@ -10,6 +10,7 @@ from basicsr.utils import get_root_logger, imwrite, tensor2img
 from basicsr.utils.registry import MODEL_REGISTRY
 from .base_model import BaseModel
 
+
 @MODEL_REGISTRY.register()
 class SRModel(BaseModel):
     """Base SR model for single image super-resolution."""
@@ -118,7 +119,7 @@ class SRModel(BaseModel):
             self.model_ema(decay=self.ema_decay)
 
     def test(self):
-        if hasattr(self, 'ema_decay'):
+        if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
             with torch.no_grad():
                 self.output = self.net_g_ema(self.lq)
@@ -128,6 +129,54 @@ class SRModel(BaseModel):
                 self.output = self.net_g(self.lq)
             self.net_g.train()
 
+    def test_selfensemble(self):
+        # TODO: to be tested
+        # 8 augmentations
+        # modified from https://github.com/thstkdgus35/EDSR-PyTorch
+
+        def _transform(v, op):
+            # if self.precision != 'single': v = v.float()
+            v2np = v.data.cpu().numpy()
+            if op == 'v':
+                tfnp = v2np[:, :, :, ::-1].copy()
+            elif op == 'h':
+                tfnp = v2np[:, :, ::-1, :].copy()
+            elif op == 't':
+                tfnp = v2np.transpose((0, 1, 3, 2)).copy()
+
+            ret = torch.Tensor(tfnp).to(self.device)
+            # if self.precision == 'half': ret = ret.half()
+
+            return ret
+
+        # prepare augmented data
+        lq_list = [self.lq]
+        for tf in 'v', 'h', 't':
+            lq_list.extend([_transform(t, tf) for t in lq_list])
+
+        # inference
+        if hasattr(self, 'net_g_ema'):
+            self.net_g_ema.eval()
+            with torch.no_grad():
+                out_list = [self.net_g_ema(aug) for aug in lq_list]
+        else:
+            self.net_g.eval()
+            with torch.no_grad():
+                out_list = [self.net_g_ema(aug) for aug in lq_list]
+            self.net_g.train()
+
+        # merge results
+        for i in range(len(out_list)):
+            if i > 3:
+                out_list[i] = _transform(out_list[i], 't')
+            if i % 4 > 1:
+                out_list[i] = _transform(out_list[i], 'h')
+            if (i % 4) % 2 == 1:
+                out_list[i] = _transform(out_list[i], 'v')
+        output = torch.cat(out_list, dim=0)
+
+        self.output = output.mean(dim=0, keepdim=True)
+
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img):
         if self.opt['rank'] == 0:
             self.nondist_validation(dataloader, current_iter, tb_logger, save_img)
@@ -135,9 +184,20 @@ class SRModel(BaseModel):
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         dataset_name = dataloader.dataset.opt['name']
         with_metrics = self.opt['val'].get('metrics') is not None
+        use_pbar = self.opt['val'].get('pbar', False)
+
         if with_metrics:
-            self.metric_results = {metric: 0 for metric in self.opt['val']['metrics'].keys()}
-        pbar = tqdm(total=len(dataloader), unit='image')
+            if not hasattr(self, 'metric_results'):  # only execute in the first run
+                self.metric_results = {metric: 0 for metric in self.opt['val']['metrics'].keys()}
+            # initialize the best metric results for each dataset_name (supporting multiple validation datasets)
+            self._initialize_best_metric_results(dataset_name)
+        # zero self.metric_results
+        if with_metrics:
+            self.metric_results = {metric: 0 for metric in self.metric_results}
+
+        metric_data = dict()
+        if use_pbar:
+            pbar = tqdm(total=len(dataloader), unit='image')
 
         for idx, val_data in enumerate(dataloader):
             img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
@@ -146,8 +206,10 @@ class SRModel(BaseModel):
 
             visuals = self.get_current_visuals()
             sr_img = tensor2img([visuals['result']])
+            metric_data['img'] = sr_img
             if 'gt' in visuals:
                 gt_img = tensor2img([visuals['gt']])
+                metric_data['img2'] = gt_img
                 del self.gt
 
             # tentative for out of GPU memory
@@ -171,27 +233,35 @@ class SRModel(BaseModel):
             if with_metrics:
                 # calculate metrics
                 for name, opt_ in self.opt['val']['metrics'].items():
-                    metric_data = dict(img1=sr_img, img2=gt_img)
                     self.metric_results[name] += calculate_metric(metric_data, opt_)
-            pbar.update(1)
-            pbar.set_description(f'Test {img_name}')
-        pbar.close()
+            if use_pbar:
+                pbar.update(1)
+                pbar.set_description(f'Test {img_name}')
+        if use_pbar:
+            pbar.close()
 
         if with_metrics:
             for metric in self.metric_results.keys():
                 self.metric_results[metric] /= (idx + 1)
+                # update the best metric result
+                self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
 
     def _log_validation_metric_values(self, current_iter, dataset_name, tb_logger):
         log_str = f'Validation {dataset_name}\n'
         for metric, value in self.metric_results.items():
-            log_str += f'\t # {metric}: {value:.4f}\n'
+            log_str += f'\t # {metric}: {value:.4f}'
+            if hasattr(self, 'best_metric_results'):
+                log_str += (f'\tBest: {self.best_metric_results[dataset_name][metric]["val"]:.4f} @ '
+                            f'{self.best_metric_results[dataset_name][metric]["iter"]} iter')
+            log_str += '\n'
+
         logger = get_root_logger()
         logger.info(log_str)
         if tb_logger:
             for metric, value in self.metric_results.items():
-                tb_logger.add_scalar(f'metrics/{metric}', value, current_iter)
+                tb_logger.add_scalar(f'metrics/{dataset_name}/{metric}', value, current_iter)
 
     def get_current_visuals(self):
         out_dict = OrderedDict()
@@ -202,7 +272,7 @@ class SRModel(BaseModel):
         return out_dict
 
     def save(self, epoch, current_iter):
-        if hasattr(self, 'ema_decay'):
+        if hasattr(self, 'net_g_ema'):
             self.save_network([self.net_g, self.net_g_ema], 'net_g', current_iter, param_key=['params', 'params_ema'])
         else:
             self.save_network(self.net_g, 'net_g', current_iter)

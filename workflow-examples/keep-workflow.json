@@ -1,15 +1,15 @@
 {
   "id": "8d572b01-d28b-4720-9a8f-de78a462448a",
   "revision": 0,
-  "last_node_id": 22,
-  "last_link_id": 25,
+  "last_node_id": 36,
+  "last_link_id": 59,
   "nodes": [
     {
       "id": 3,
       "type": "LoadImage",
       "pos": [
-        516.8903198242188,
-        288.9566650390625
+        593.166748046875,
+        93
       ],
       "size": [
         274.080078125,
@@ -24,7 +24,7 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            20
+            52
           ]
         },
         {
@@ -36,7 +36,11 @@
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.3.34",
-        "Node name for S&R": "LoadImage"
+        "Node name for S&R": "LoadImage",
+        "widget_ue_connectable": {
+          "image": true,
+          "upload": true
+        }
       },
       "widgets_values": [
         "180.webp",
@@ -44,44 +48,62 @@
       ]
     },
     {
-      "id": 4,
-      "type": "PreviewImage",
+      "id": 34,
+      "type": "KEEP_FaceUpscaleImage",
       "pos": [
-        1253.10888671875,
-        290.5484313964844
+        923.2999267578125,
+        93
       ],
       "size": [
-        333.02752685546875,
-        324.772705078125
+        310.1102600097656,
+        151.10000610351562
       ],
       "flags": {},
-      "order": 6,
+      "order": 5,
       "mode": 0,
       "inputs": [
         {
-          "name": "images",
+          "name": "image",
           "type": "IMAGE",
-          "link": 21
+          "link": 52
+        },
+        {
+          "name": "keep_model",
+          "type": "KEEP_MODEL_PACK",
+          "link": 53
         }
       ],
-      "outputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            54
+          ]
+        }
+      ],
       "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.3.34",
-        "Node name for S&R": "PreviewImage"
+        "cnr_id": "ComfyUI-KEEP",
+        "ver": "357fd3adf13fc2f3d51b9e3cbb77b6174b609e3f",
+        "Node name for S&R": "KEEP_FaceUpscaleImage"
       },
-      "widgets_values": []
+      "widgets_values": [
+        1,
+        false,
+        true,
+        true
+      ]
     },
     {
       "id": 16,
       "type": "VHS_LoadVideo",
       "pos": [
-        441.42437744140625,
-        691.3724365234375
+        597.5738525390625,
+        517.259033203125
       ],
       "size": [
-        364.2177734375,
-        668.2177734375
+        270.80987548828125,
+        574.18896484375
       ],
       "flags": {},
       "order": 1,
@@ -105,7 +127,7 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            23
+            56
           ]
         },
         {
@@ -116,18 +138,28 @@
         {
           "name": "audio",
           "type": "AUDIO",
-          "links": null
+          "links": []
         },
         {
           "name": "video_info",
           "type": "VHS_VIDEOINFO",
-          "links": null
+          "links": []
         }
       ],
       "properties": {
         "cnr_id": "comfyui-videohelpersuite",
         "ver": "a7ce59e381934733bfae03b1be029756d6ce936d",
-        "Node name for S&R": "VHS_LoadVideo"
+        "Node name for S&R": "VHS_LoadVideo",
+        "widget_ue_connectable": {
+          "video": true,
+          "force_rate": true,
+          "custom_width": true,
+          "custom_height": true,
+          "frame_load_cap": true,
+          "skip_first_frames": true,
+          "select_every_nth": true,
+          "format": true
+        }
       },
       "widgets_values": {
         "video": "syn_03_lq.mp4",
@@ -157,15 +189,15 @@
       }
     },
     {
-      "id": 12,
-      "type": "VHS_VideoCombine",
+      "id": 4,
+      "type": "PreviewImage",
       "pos": [
-        1250.33251953125,
-        690.7274780273438
+        1302,
+        99
       ],
       "size": [
-        356.87506103515625,
-        684.8750610351562
+        270.0765686035156,
+        301.67816162109375
       ],
       "flags": {},
       "order": 7,
@@ -174,7 +206,207 @@
         {
           "name": "images",
           "type": "IMAGE",
-          "link": 24
+          "link": 54
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.34",
+        "Node name for S&R": "PreviewImage",
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 35,
+      "type": "KEEP_ProcessImageSequence",
+      "pos": [
+        948.5642700195312,
+        517.259033203125
+      ],
+      "size": [
+        272.087890625,
+        174
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 56
+        },
+        {
+          "name": "keep_model",
+          "type": "KEEP_MODEL_PACK",
+          "link": 57
+        }
+      ],
+      "outputs": [
+        {
+          "name": "processed_images",
+          "type": "IMAGE",
+          "links": [
+            58
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-KEEP",
+        "ver": "357fd3adf13fc2f3d51b9e3cbb77b6174b609e3f",
+        "Node name for S&R": "KEEP_ProcessImageSequence"
+      },
+      "widgets_values": [
+        1,
+        false,
+        false,
+        true,
+        20
+      ]
+    },
+    {
+      "id": 25,
+      "type": "UpscaleModelLoader",
+      "pos": [
+        235.92953491210938,
+        399.3072814941406
+      ],
+      "size": [
+        305.3117980957031,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "UPSCALE_MODEL",
+          "type": "UPSCALE_MODEL",
+          "links": [
+            49
+          ]
+        }
+      ],
+      "title": "Face Upscale Model",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.43",
+        "Node name for S&R": "UpscaleModelLoader"
+      },
+      "widgets_values": [
+        "4x_UltraSharp.safetensors"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 28,
+      "type": "UpscaleModelLoader",
+      "pos": [
+        233.8800811767578,
+        289.32672119140625
+      ],
+      "size": [
+        309.068359375,
+        58
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "UPSCALE_MODEL",
+          "type": "UPSCALE_MODEL",
+          "links": [
+            48
+          ]
+        }
+      ],
+      "title": "Background Upscale Model",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.43",
+        "Node name for S&R": "UpscaleModelLoader"
+      },
+      "widgets_values": [
+        "4x_NomosUniDAT_otf.pth"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 33,
+      "type": "KEEP_ModelLoader",
+      "pos": [
+        233.84231567382812,
+        513.2171630859375
+      ],
+      "size": [
+        312.474609375,
+        102
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "bg_upscale_model",
+          "shape": 7,
+          "type": "UPSCALE_MODEL",
+          "link": 48
+        },
+        {
+          "name": "face_upscale_model",
+          "shape": 7,
+          "type": "UPSCALE_MODEL",
+          "link": 49
+        }
+      ],
+      "outputs": [
+        {
+          "name": "keep_model_pack",
+          "type": "KEEP_MODEL_PACK",
+          "links": [
+            53,
+            57
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-KEEP",
+        "ver": "357fd3adf13fc2f3d51b9e3cbb77b6174b609e3f",
+        "Node name for S&R": "KEEP_ModelLoader"
+      },
+      "widgets_values": [
+        "KEEP",
+        "retinaface_resnet50"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 12,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        1305.87109375,
+        517.259033203125
+      ],
+      "size": [
+        262.87506103515625,
+        590.8750610351562
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 58
         },
         {
           "name": "audio",
@@ -206,12 +438,20 @@
         "cnr_id": "comfyui-videohelpersuite",
         "ver": "124c913ccdd8a585734ea758c35fa1bab8499c99",
         "Node name for S&R": "VHS_VideoCombine",
-        "aux_id": "Kosinkadink/ComfyUI-VideoHelperSuite"
+        "aux_id": "Kosinkadink/ComfyUI-VideoHelperSuite",
+        "widget_ue_connectable": {
+          "frame_rate": true,
+          "loop_count": true,
+          "filename_prefix": true,
+          "format": true,
+          "pingpong": true,
+          "save_output": true
+        }
       },
       "widgets_values": {
         "frame_rate": 15,
         "loop_count": 0,
-        "filename_prefix": "Wan/wan",
+        "filename_prefix": "keep",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 4,
@@ -223,242 +463,123 @@
           "hidden": false,
           "paused": false,
           "params": {
-            "filename": "wan_00009.mp4",
+            "filename": "wan_00048.mp4",
             "subfolder": "Wan",
             "type": "output",
             "format": "video/h264-mp4",
             "frame_rate": 15,
-            "workflow": "wan_00009.png",
-            "fullpath": "C:\\_Dev\\ComfyUI_test\\ComfyUI\\output\\Wan\\wan_00009.mp4"
+            "workflow": "wan_00048.png",
+            "fullpath": "C:\\_Dev\\ComfyUI_test\\ComfyUI\\output\\Wan\\wan_00048.mp4"
           },
           "muted": false
         }
       }
-    },
-    {
-      "id": 1,
-      "type": "KEEP_ModelLoader",
-      "pos": [
-        856.6369018554688,
-        490.28631591796875
-      ],
-      "size": [
-        334.502685546875,
-        156.68629455566406
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "keep_model_pack",
-          "type": "KEEP_MODEL_PACK",
-          "links": [
-            22,
-            25
-          ]
-        }
-      ],
-      "properties": {
-        "aux_id": "wildminder/ComfyUI-KEEP",
-        "ver": "unknown",
-        "Node name for S&R": "KEEP_ModelLoader"
-      },
-      "widgets_values": [
-        "KEEP",
-        "retinaface_resnet50",
-        true,
-        true,
-        400
-      ],
-      "color": "#332922",
-      "bgcolor": "#593930"
-    },
-    {
-      "id": 20,
-      "type": "KEEP_FaceUpscaleImage",
-      "pos": [
-        856.6369018554688,
-        291.7147216796875
-      ],
-      "size": [
-        330.1480712890625,
-        150
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": 20
-        },
-        {
-          "name": "keep_model",
-          "type": "KEEP_MODEL_PACK",
-          "link": 22
-        }
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": [
-            21
-          ]
-        }
-      ],
-      "properties": {
-        "aux_id": "wildminder/ComfyUI-KEEP",
-        "ver": "unknown",
-        "Node name for S&R": "KEEP_FaceUpscaleImage"
-      },
-      "widgets_values": [
-        false,
-        true,
-        false,
-        1
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
-      "id": 21,
-      "type": "KEEP_ProcessImageSequence",
-      "pos": [
-        856.6369018554688,
-        699.2883911132812
-      ],
-      "size": [
-        333.1029968261719,
-        174.98497009277344
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 23
-        },
-        {
-          "name": "keep_model",
-          "type": "KEEP_MODEL_PACK",
-          "link": 25
-        }
-      ],
-      "outputs": [
-        {
-          "name": "processed_images",
-          "type": "IMAGE",
-          "links": [
-            24
-          ]
-        }
-      ],
-      "properties": {
-        "aux_id": "wildminder/ComfyUI-KEEP",
-        "ver": "unknown",
-        "Node name for S&R": "KEEP_ProcessImageSequence"
-      },
-      "widgets_values": [
-        false,
-        true,
-        false,
-        1,
-        20
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
-      "id": 22,
-      "type": "Note",
-      "pos": [
-        877.5428466796875,
-        951.8934936523438
-      ],
-      "size": [
-        279.99578857421875,
-        88
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "properties": {},
-      "widgets_values": [
-        "Original project:\nhttps://github.com/jnjaby/KEEP\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
     }
   ],
   "links": [
     [
-      20,
+      48,
+      28,
+      0,
+      33,
+      0,
+      "UPSCALE_MODEL"
+    ],
+    [
+      49,
+      25,
+      0,
+      33,
+      1,
+      "UPSCALE_MODEL"
+    ],
+    [
+      52,
       3,
       0,
-      20,
+      34,
       0,
       "IMAGE"
     ],
     [
-      21,
-      20,
+      53,
+      33,
+      0,
+      34,
+      1,
+      "KEEP_MODEL_PACK"
+    ],
+    [
+      54,
+      34,
       0,
       4,
       0,
       "IMAGE"
     ],
     [
-      22,
-      1,
-      0,
-      20,
-      1,
-      "KEEP_MODEL_PACK"
-    ],
-    [
-      23,
+      56,
       16,
       0,
-      21,
+      35,
       0,
       "IMAGE"
     ],
     [
-      24,
-      21,
+      57,
+      33,
+      0,
+      35,
+      1,
+      "KEEP_MODEL_PACK"
+    ],
+    [
+      58,
+      35,
       0,
       12,
       0,
       "IMAGE"
-    ],
-    [
-      25,
-      1,
-      0,
-      21,
-      1,
-      "KEEP_MODEL_PACK"
     ]
   ],
-  "groups": [],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Image processing",
+      "bounding": [
+        583.166748046875,
+        19.399999618530273,
+        1017.9097900390625,
+        400.2781677246094
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "Video",
+      "bounding": [
+        587.5738525390625,
+        443.65899658203125,
+        1010.5322265625,
+        681.735107421875
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.6934334949441382,
+      "scale": 0.8264462809917354,
       "offset": [
-        262.86549661987175,
-        -160.4970735647166
+        -133.84231567382812,
+        7
       ]
     },
-    "frontendVersion": "1.19.9",
+    "frontendVersion": "1.23.4",
     "VHS_latentpreview": false,
     "VHS_latentpreviewrate": 0,
     "VHS_MetadataImage": true,

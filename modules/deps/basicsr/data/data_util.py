@@ -1,16 +1,14 @@
 import cv2
-import math
 import numpy as np
 import torch
 from os import path as osp
-from PIL import Image, ImageDraw
 from torch.nn import functional as F
 
 from basicsr.data.transforms import mod_crop
 from basicsr.utils import img2tensor, scandir
 
 
-def read_img_seq(path, require_mod_crop=False, scale=1):
+def read_img_seq(path, require_mod_crop=False, scale=1, return_imgname=False):
     """Read a sequence of images from a given folder path.
 
     Args:
@@ -18,20 +16,28 @@ def read_img_seq(path, require_mod_crop=False, scale=1):
         require_mod_crop (bool): Require mod crop for each image.
             Default: False.
         scale (int): Scale factor for mod_crop. Default: 1.
+        return_imgname(bool): Whether return image names. Default False.
 
     Returns:
         Tensor: size (t, c, h, w), RGB, [0, 1].
+        list[str]: Returned image name list.
     """
     if isinstance(path, list):
         img_paths = path
     else:
         img_paths = sorted(list(scandir(path, full_path=True)))
     imgs = [cv2.imread(v).astype(np.float32) / 255. for v in img_paths]
+
     if require_mod_crop:
         imgs = [mod_crop(img, scale) for img in imgs]
     imgs = img2tensor(imgs, bgr2rgb=True, float32=True)
     imgs = torch.stack(imgs, dim=0)
-    return imgs
+
+    if return_imgname:
+        imgnames = [osp.splitext(osp.basename(path))[0] for path in img_paths]
+        return imgs, imgnames
+    else:
+        return imgs
 
 
 def generate_frame_indices(crt_idx, max_frame_num, num_frames, padding='reflection'):
@@ -91,10 +97,12 @@ def paired_paths_from_lmdb(folders, keys):
 
     Contents of lmdb. Taking the `lq.lmdb` for example, the file structure is:
 
-    lq.lmdb
-    ├── data.mdb
-    ├── lock.mdb
-    ├── meta_info.txt
+    ::
+
+        lq.lmdb
+        ├── data.mdb
+        ├── lock.mdb
+        ├── meta_info.txt
 
     The data.mdb and lock.mdb are standard lmdb files and you can refer to
     https://lmdb.readthedocs.io/en/release/ for more details.
@@ -123,7 +131,7 @@ def paired_paths_from_lmdb(folders, keys):
     """
     assert len(folders) == 2, ('The len of folders should be 2 with [input_folder, gt_folder]. '
                                f'But got {len(folders)}')
-    assert len(keys) == 2, ('The len of keys should be 2 with [input_key, gt_key]. ' f'But got {len(keys)}')
+    assert len(keys) == 2, f'The len of keys should be 2 with [input_key, gt_key]. But got {len(keys)}'
     input_folder, gt_folder = folders
     input_key, gt_key = keys
 
@@ -172,12 +180,12 @@ def paired_paths_from_meta_info_file(folders, keys, meta_info_file, filename_tmp
     """
     assert len(folders) == 2, ('The len of folders should be 2 with [input_folder, gt_folder]. '
                                f'But got {len(folders)}')
-    assert len(keys) == 2, ('The len of keys should be 2 with [input_key, gt_key]. ' f'But got {len(keys)}')
+    assert len(keys) == 2, f'The len of keys should be 2 with [input_key, gt_key]. But got {len(keys)}'
     input_folder, gt_folder = folders
     input_key, gt_key = keys
 
     with open(meta_info_file, 'r') as fin:
-        gt_names = [line.split(' ')[0] for line in fin]
+        gt_names = [line.strip().split(' ')[0] for line in fin]
 
     paths = []
     for gt_name in gt_names:
@@ -206,7 +214,7 @@ def paired_paths_from_folder(folders, keys, filename_tmpl):
     """
     assert len(folders) == 2, ('The len of folders should be 2 with [input_folder, gt_folder]. '
                                f'But got {len(folders)}')
-    assert len(keys) == 2, ('The len of keys should be 2 with [input_key, gt_key]. ' f'But got {len(keys)}')
+    assert len(keys) == 2, f'The len of keys should be 2 with [input_key, gt_key]. But got {len(keys)}'
     input_folder, gt_folder = folders
     input_key, gt_key = keys
 
@@ -219,7 +227,7 @@ def paired_paths_from_folder(folders, keys, filename_tmpl):
         basename, ext = osp.splitext(osp.basename(gt_path))
         input_name = f'{filename_tmpl.format(basename)}{ext}'
         input_path = osp.join(input_folder, input_name)
-        assert input_name in input_paths, (f'{input_name} is not in ' f'{input_key}_paths.')
+        assert input_name in input_paths, f'{input_name} is not in {input_key}_paths.'
         gt_path = osp.join(gt_folder, gt_path)
         paths.append(dict([(f'{input_key}_path', input_path), (f'{gt_key}_path', gt_path)]))
     return paths
@@ -305,88 +313,3 @@ def duf_downsample(x, kernel_size=13, scale=4):
     if squeeze_flag:
         x = x.squeeze(0)
     return x
-
-
-def brush_stroke_mask(img, color=(255,255,255)):
-    min_num_vertex = 8
-    max_num_vertex = 28
-    mean_angle = 2*math.pi / 5
-    angle_range = 2*math.pi / 12
-    # training large mask ratio (training setting)
-    min_width = 30
-    max_width = 70
-    # very large mask ratio (test setting and refine after 200k)
-    # min_width = 80
-    # max_width = 120
-    def generate_mask(H, W, img=None):
-        average_radius = math.sqrt(H*H+W*W) / 8
-        mask = Image.new('RGB', (W, H), 0)
-        if img is not None: mask = img # Image.fromarray(img)
-
-        for _ in range(np.random.randint(1, 4)):
-            num_vertex = np.random.randint(min_num_vertex, max_num_vertex)
-            angle_min = mean_angle - np.random.uniform(0, angle_range)
-            angle_max = mean_angle + np.random.uniform(0, angle_range)
-            angles = []
-            vertex = []
-            for i in range(num_vertex):
-                if i % 2 == 0:
-                    angles.append(2*math.pi - np.random.uniform(angle_min, angle_max))
-                else:
-                    angles.append(np.random.uniform(angle_min, angle_max))
-
-            h, w = mask.size
-            vertex.append((int(np.random.randint(0, w)), int(np.random.randint(0, h))))
-            for i in range(num_vertex):
-                r = np.clip(
-                    np.random.normal(loc=average_radius, scale=average_radius//2),
-                    0, 2*average_radius)
-                new_x = np.clip(vertex[-1][0] + r * math.cos(angles[i]), 0, w)
-                new_y = np.clip(vertex[-1][1] + r * math.sin(angles[i]), 0, h)
-                vertex.append((int(new_x), int(new_y)))
-
-            draw = ImageDraw.Draw(mask)
-            width = int(np.random.uniform(min_width, max_width))
-            draw.line(vertex, fill=color, width=width)
-            for v in vertex:
-                draw.ellipse((v[0] - width//2,
-                              v[1] - width//2,
-                              v[0] + width//2,
-                              v[1] + width//2),
-                             fill=color)
-
-        return mask
-
-    width, height = img.size
-    mask = generate_mask(height, width, img)
-    return mask
-
-
-def random_ff_mask(shape, max_angle = 10, max_len = 100, max_width = 70, times = 10):
-    """Generate a random free form mask with configuration.
-    Args:
-        config: Config should have configuration including IMG_SHAPES,
-            VERTICAL_MARGIN, HEIGHT, HORIZONTAL_MARGIN, WIDTH.
-    Returns:
-        tuple: (top, left, height, width)
-    Link:
-        https://github.com/csqiangwen/DeepFillv2_Pytorch/blob/master/train_dataset.py
-    """
-    height = shape[0]
-    width = shape[1]
-    mask = np.zeros((height, width), np.float32)
-    times = np.random.randint(times-5, times)
-    for i in range(times):
-        start_x = np.random.randint(width)
-        start_y = np.random.randint(height)
-        for j in range(1 + np.random.randint(5)):
-            angle = 0.01 + np.random.randint(max_angle)
-            if i % 2 == 0:
-                angle = 2 * 3.1415926 - angle
-            length = 10 + np.random.randint(max_len-20, max_len)
-            brush_w = 5 + np.random.randint(max_width-30, max_width)
-            end_x = (start_x + length * np.sin(angle)).astype(np.int32)
-            end_y = (start_y + length * np.cos(angle)).astype(np.int32)
-            cv2.line(mask, (start_y, start_x), (end_y, end_x), 1.0, brush_w)
-            start_x, start_y = end_x, end_y
-    return mask.astype(np.float32)

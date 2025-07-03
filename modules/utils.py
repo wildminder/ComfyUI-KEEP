@@ -10,6 +10,7 @@ import hashlib
 import sys
 from torch.hub import download_url_to_file, get_dir
 
+from .. import logger
 
 # Path to ComfyUI-KEEP/modules/
 module_path = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +25,6 @@ try:
     # print("Successfully imported ARCH_REGISTRY and load_file_from_url from vendored basicsr.")
 except ImportError as e:
     print(f"Error importing from vendored basicsr in utils.py: {e}")
-    # print("Please ensure 'basicsr' directory is correctly placed in 'modules/deps/'.")
     # Fallback ARCH_REGISTRY if needed, though ideally the import should work
     class DummyArchRegistry:
         def __init__(self): self._registry = {}
@@ -33,14 +33,11 @@ except ImportError as e:
     ARCH_REGISTRY = DummyArchRegistry()
     # Fallback load_file_from_url if needed
     def load_file_from_url(url, model_dir, progress, file_name): # Simplified
-        # print(f"Warning: Using fallback load_file_from_url. Download {url} to {model_dir} manually if needed.")
         target_path = os.path.join(model_dir, file_name if file_name else os.path.basename(url))
         if not os.path.exists(target_path):
             raise FileNotFoundError(f"Fallback load_file_from_url: {target_path} not found. Please download manually.")
         return target_path
 
-
-# As in inference_keep.py
 KEEP_MODEL_CONFIGS = {
     'KEEP': {
         'architecture': {
@@ -92,13 +89,6 @@ for model_key in KEEP_MODEL_CONFIGS:
         if param_key not in KEEP_MODEL_CONFIGS[model_key]['architecture']:
             KEEP_MODEL_CONFIGS[model_key]['architecture'][param_key] = default_val
 
-
-REALESRGAN_MODEL_CONFIG = {
-    'url': "https://github.com/jnjaby/KEEP/releases/download/v1.0.0/RealESRGAN_x2plus.pth",
-    'dest_dir': 'upscale_models',
-    'sha256': None # Add SHA256 if known for verification
-}
-
 FACELIB_MODEL_URLS = {
     'detection_Resnet50_Final.pth': ('https://github.com/jnjaby/KEEP/releases/download/v1.0.0/detection_Resnet50_Final.pth', None),
     'detection_mobilenet0.25_Final.pth': ('https://github.com/jnjaby/KEEP/releases/download/v1.0.0/detection_mobilenet0.25_Final.pth', None),
@@ -134,20 +124,20 @@ def load_file_from_url_comfy(url, model_dir_name, progress=True, file_name=None,
         with open(cached_file, "rb") as f:
             file_hash = hashlib.sha256(f.read()).hexdigest()
         if file_hash == sha256:
-            # print(f"File {file_name} already exists in {destination_dir} and hash matches. Skipping download.")
+            logger.debug(f"File {file_name} already exists and hash matches. Skipping download.")
             return cached_file
         else:
-            print(f"File {file_name} exists but hash mismatch. Redownloading.")
+            logger.warning(f"File {file_name} exists but hash mismatch. Redownloading.")
     elif os.path.exists(cached_file) and not sha256:
-        # print(f"File {file_name} already exists in {destination_dir}. Skipping download (no hash check).")
+        logger.debug(f"File {file_name} already exists. Skipping download (no hash check).")
         return cached_file
 
-    print(f'Downloading: "{file_name}" from {url} to {cached_file}')
+    logger.info(f'Downloading: "{file_name}" from {url} to {cached_file}')
     
     try:
         download_url_to_file(url, cached_file, hash_prefix=None, progress=progress)
     except Exception as e:
-        print(f"Error downloading {url} using torch.hub.download_url_to_file: {e}")
+        logger.error(f"Error downloading {url} using torch.hub.download_url_to_file: {e}")
         if os.path.exists(cached_file):
             os.remove(cached_file)
         raise

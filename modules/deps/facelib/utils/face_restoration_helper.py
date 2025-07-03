@@ -2,40 +2,18 @@ import cv2
 import numpy as np
 import os
 import torch
-# import dlib # Keep dlib import, but handle its model loading via model_rootpath
 from torchvision.transforms.functional import normalize
+import comfy.model_management as model_management
+from comfy.utils import tiled_scale # Import for upscaling
 
-# Important: Change these imports to use the vendored basicsr if FaceRestoreHelper itself uses them.
-# If FaceRestoreHelper is self-contained or only uses facelib internal utils, these might not be needed here.
-# However, the original file shows it uses basicsr.utils.download_util and basicsr.utils.misc
-# So, we need to make sure these are resolvable, potentially by ensuring facelib is also under a common 'deps' root
-# or by adjusting these specific imports if facelib is at the same level as basicsr in 'deps'.
-try:
-    from basicsr.utils.download_util import load_file_from_url
-    from basicsr.utils.misc import get_device
-except ImportError:
-    print("WARNING (FaceRestoreHelper): Could not import from basicsr. Ensure it's in sys.path or facelib is structured accordingly.")
-    # dummy fallbacks, justfor testing
-    def load_file_from_url(url, model_dir, **kwargs):
-        # Simplified fallback, actual implementation should be robust
-        # print(f"Fallback load_file_from_url for: {url} to {model_dir}")
-        filename = os.path.basename(urlparse(url).path)
-        path = os.path.join(model_dir, filename)
-        if not os.path.exists(path): raise FileNotFoundError(f"{path} not found, please download manually.")
-        return path
-    def get_device(): return torch.device("cpu")
+from facelib.detection import init_detection_model
+from facelib.parsing import init_parsing_model
+from facelib.utils.misc import img2tensor, imwrite, is_gray, bgr2gray, adain_npy
 
-
-from facelib.detection import init_detection_model # facelib internal import
-from facelib.parsing import init_parsing_model   # facelib internal import
-from facelib.utils.misc import img2tensor, imwrite, is_gray, bgr2gray, adain_npy # facelib internal import
-
-# dlib_model_url needs to be defined or accessible here
 dlib_model_url = {
     'face_detector': 'https://github.com/jnjaby/KEEP/releases/download/v1.0.0/mmod_human_face_detector-4cb19393.dat',
     'shape_predictor_5': 'https://github.com/jnjaby/KEEP/releases/download/v1.0.0/shape_predictor_5_face_landmarks-c4b1e980.dat'
 }
-# (Keep get_largest_face, get_center_face functions as they are)
 
 class FaceRestoreHelper(object):
     def __init__(self,
@@ -59,13 +37,10 @@ class FaceRestoreHelper(object):
         self.use_parse = use_parse
         
         self.model_rootpath = model_rootpath
-        # If model_rootpath is None, facelib's internal load_file_from_url might try default paths
-        # like 'weights/facelib' relative to its own location.
         if self.model_rootpath is None:
             print("WARNING (FaceRestoreHelper): model_rootpath is None. Model loading might rely on default relative paths.")
 
         if self.det_model == 'dlib':
-            # standard 5 landmarks for FFHQ faces with 1024 x 1024
             self.face_template = np.array([[686.77227723, 488.62376238], [586.77227723, 493.59405941],
                                            [337.91089109, 488.38613861], [
                                                437.95049505, 493.51485149],
@@ -88,19 +63,16 @@ class FaceRestoreHelper(object):
         self.restored_faces = []
         self.pad_input_imgs = []
 
-
         if device is None:
-            self.device = get_device()
+            self.device = model_management.get_torch_device()
         else:
             self.device = device
 
         # init face detection model
         if self.det_model == 'dlib':
-            # Use self.model_rootpath for dlib models
             dlib_face_det_path = os.path.join(self.model_rootpath if self.model_rootpath else 'weights/dlib', os.path.basename(dlib_model_url['face_detector']))
             dlib_sp5_path = os.path.join(self.model_rootpath if self.model_rootpath else 'weights/dlib', os.path.basename(dlib_model_url['shape_predictor_5']))
             
-            # Ensure dlib models are actually present at these paths (downloaded by loader)
             if not os.path.exists(dlib_face_det_path):
                 print(f"Dlib face detector model not found at {dlib_face_det_path}. Ensure it's downloaded.")
             if not os.path.exists(dlib_sp5_path):
@@ -116,11 +88,30 @@ class FaceRestoreHelper(object):
         # init face parsing model
         self.use_parse = use_parse
         if self.use_parse:
-            # Similar to detection model, ensure init_parsing_model handles model_rootpath
             self.face_parse = init_parsing_model(
                 model_name='parsenet', device=self.device, model_rootpath=self.model_rootpath
             )
-    
+ 
+    def _run_upscaler(self, model, cv2_image):
+        """Helper to run a comfy-native upscaler on a cv2 image."""
+        if model is None:
+            return cv2_image
+        # Replicate cv2_to_comfy_image
+        img_rgb = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
+        img_np = img_rgb.astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(img_np).unsqueeze(0).to(self.device)
+        
+        img_tensor_bchw = img_tensor.movedim(-1, -3)
+        s = tiled_scale(img_tensor_bchw, lambda a: model.model(a), tile_x=512, tile_y=512, overlap=64, upscale_amount=model.scale)
+        s = torch.clamp(s.movedim(-3, -1), min=0, max=1.0)
+        
+        # Replicate comfy_image_to_cv2
+        img_np_out = s.cpu().numpy()
+        img_np_out = (img_np_out.squeeze(0) * 255).astype(np.uint8)
+        img_cv2_out = cv2.cvtColor(img_np_out, cv2.COLOR_RGB2BGR)
+        return img_cv2_out
+
+    #ToDo: remove dlib
     def init_dlib_from_paths(self, detection_model_path, landmark_model_path):
         """Initialize the dlib detectors and predictors from specified paths."""
         try:
@@ -384,111 +375,23 @@ class FaceRestoreHelper(object):
         inv_mask_borders = []
         for idx, restored_face_orig in enumerate(self.restored_faces): # Use restored_face_orig
             if idx >= len(self.inverse_affine_matrices) or self.inverse_affine_matrices[idx] is None:
-                print(f"Warning: No inverse affine matrix for restored face {idx}. Skipping.")
                 continue
             
             inverse_affine_matrix = self.inverse_affine_matrices[idx]
             
-            # Determine the size of the face image that will be warped
-            # This is self.face_size if no face_upsampler, or the output size of face_upsampler
-            
-            # current_restored_face refers to the face image that will be warped by inverse_affine_matrix
-            current_restored_face = restored_face_orig.copy() # Work on a copy
+            current_restored_face = restored_face_orig.copy()
 
             if face_upsampler is not None:
-                # Condition: Only apply face_upsampler if the main upscale_factor > 1,
-                # implying the background (upsample_img) is also being upscaled.
-                # And, ensure the face_upsampler's scale is somewhat harmonized.
-                # For simplicity, we can assume if face_upsampler is on, we want it.
-                # But the affine math needs to be right.
-
-                # The key is that inverse_affine_matrix is already scaled by self.upscale_factor.
-                # If self.upscale_factor is 1, but face_upsampler is x2, we have a mismatch.
-
-                # Let's refine the logic:
-                # The `inverse_affine_matrix` is calculated in `get_inverse_affine` as:
-                #   inverse_affine = cv2.invertAffineTransform(affine_matrix)
-                #   inverse_affine *= self.upscale_factor
-                # This means it's prepared to map `self.face_size` to an image scaled by `self.upscale_factor`.
-
-                # If we use face_upsampler, current_restored_face becomes (say) 2 * self.face_size.
-                # We need an inverse_affine that maps this 2 * self.face_size to the *same target footprint*
-                # on upsample_img as the original self.face_size would have occupied.
-                # This means the affine transformation itself needs to effectively "zoom out" the upscaled face
-                # before placing it, OR the target canvas (upsample_img) must also be upscaled.
-
-                # Simplest consistent approach for now:
-                # The face_upsampler will produce a face at its native scale (e.g., 2x the input to it).
-                # The existing inverse_affine_matrix is designed to place a face of size `self.face_size`
-                # onto a background of `self.input_img.shape * self.upscale_factor`.
-
-                # If face_upsampler is used, restored_face_orig (which is ~self.face_size) is upscaled.
-                # Let original_face_to_warp_dims = self.face_size[::-1] # H, W
+                # 1. Upscale the face patch using the provided model
+                upscaled_face_patch = self._run_upscaler(face_upsampler, current_restored_face)
                 
-                effective_face_upsampler_scale = getattr(face_upsampler, 'scale', 2) # Default to 2 if not specified
-                current_restored_face = face_upsampler.enhance(current_restored_face, outscale=effective_face_upsampler_scale)[0]
-                
-                # Now, current_restored_face is, for example, (2*H, 2*W) compared to self.face_size.
-                # The inverse_affine_matrix was computed to map a region of original self.face_size.
-                # To correctly place the *larger* current_restored_face into the *same target region*
-                # on the upsample_img, the inverse_affine_matrix needs to be adjusted.
-                # Specifically, its scaling part needs to be divided by effective_face_upsampler_scale,
-                # and its translation part needs to be adjusted for the new center of the larger face.
-                # This is complex.
-
-                # A more straightforward conceptualization:
-                # 1. `affine_matrix` maps original landmarks to `self.face_template` (size `self.face_size`).
-                # 2. `cv2.invertAffineTransform(affine_matrix)` gives `inv_affine_orig_to_template`.
-                # 3. `inv_affine_orig_to_template` then needs to be scaled by `self.upscale_factor` to map to the
-                #    potentially upscaled background: `inv_affine_template_to_bg = inv_affine_orig_to_template * self.upscale_factor`.
-                #    (This is what `get_inverse_affine` does, storing it in `self.inverse_affine_matrices`)
-
-                # If `current_restored_face` is `effective_face_upsampler_scale` times `self.face_size`,
-                # we need to map it from its upscaled dimensions back.
-                # The existing `inverse_affine_matrix` expects an input of `self.face_size`.
-                # To use it with an upscaled face, we'd conceptually have to either:
-                #    a) Downscale current_restored_face back to self.face_size, warp, then let background be upscaled (defeats purpose).
-                #    b) Adjust inverse_affine_matrix:
-                #       - The scaling part of inverse_affine_matrix should be effectively divided by `effective_face_upsampler_scale`.
-                #       - The translation part also needs adjustment.
-                
-                # Original problematic line in get_inverse_affine:
-                # inverse_affine *= self.upscale_factor
-                # This prepares it to map a face of self.face_size to a background scaled by self.upscale_factor.
-
-                # If face_upsampler is active, the face itself is already upscaled.
-                # Let's assume inverse_affine_matrix is correctly calculated in get_inverse_affine
-                # to map a source image of size self.face_size to the target canvas (w_up, h_up).
-                # If current_restored_face is larger than self.face_size due to face_upsampler,
-                # then warping it with this matrix will make it appear larger.
-
-                # IF THE GOAL IS: final face size on the output image should be "natural",
-                # regardless of intermediate upsampling, then the `face_upsampler` step
-                # is more about *internal quality improvement* before a final resize if needed.
-
-                # Consider what `upscale_img` represents. It's `self.input_img` scaled by `self.upscale_factor`.
-                # The `inverse_affine_matrix` is designed to paste `self.face_size` content onto this `upsample_img`.
-                
-                # If `current_restored_face` is now (e.g.) 2x `self.face_size` due to `face_upsampler`,
-                # and `upsample_img` is still at `self.input_img` scale (`self.upscale_factor=1`),
-                # then the face *will* be 2x too large.
-
-                # The most "correct" way if self.upscale_factor=1 (no background upscaling):
-                if self.upscale_factor == 1 and effective_face_upsampler_scale > 1:
-                    # The face was upscaled, but the background wasn't.
-                    # We need to paste this higher-quality upscaled face, but ensure it's
-                    # resized back to the original intended physical size on the final image.
-                    # The `inverse_affine_matrix` expects to warp something of `self.face_size` dimensions.
-                    # So, we should resize the `current_restored_face` (which is upscaled)
-                    # back down to `self.face_size` *before* warping, but use high-quality resize.
-                    # This preserves the quality improvement but fixes the size.
-                    target_h_for_warp, target_w_for_warp = self.face_size[1], self.face_size[0] # H, W
-                    # print(f"Face upsampler active with no BG upscale. Resizing face from {current_restored_face.shape[:2]} to {(target_h_for_warp, target_w_for_warp)}")
-                    current_restored_face = cv2.resize(
-                        current_restored_face,
-                        (target_w_for_warp, target_h_for_warp), # cv2.resize expects (W, H)
-                        interpolation=cv2.INTER_LANCZOS4 # Good quality downscale
-                    )
+                # 2. To ensure correct geometry, resize the high-quality upscaled patch
+                #    back to the original template size before warping.
+                target_w_for_warp, target_h_for_warp = self.face_size
+                current_restored_face = cv2.resize(
+                    upscaled_face_patch, (target_w_for_warp, target_h_for_warp),
+                    interpolation=cv2.INTER_LANCZOS4
+                )
                 # Now current_restored_face is back to self.face_size dimensions, but with improved quality.
                 # The existing inverse_affine_matrix (scaled by self.upscale_factor) should work correctly.
 
@@ -529,9 +432,8 @@ class FaceRestoreHelper(object):
                 border_thickness = int(1400 / np.sqrt(total_face_area)) 
                 border_thickness = max(1, min(border_thickness, min(h_fs, w_fs) // 20)) 
                 cv2.rectangle(mask_border, (border_thickness, border_thickness), (w_fs-border_thickness-1, h_fs-border_thickness-1), (0,0,0), -1) # Black interior
+
                 # The above creates a white border on black. We want a colored border on the image.
-                # Alternative: create a colored line border
-                # For now, let's assume the previous logic created a visual border correctly on mask_border
                 inv_mask_border_img = cv2.warpAffine(mask_border, inverse_affine_matrix, (w_up, h_up))
                 inv_mask_borders.append(inv_mask_border_img) 
 
@@ -645,7 +547,7 @@ class FaceAligner(object):
                  pad_blur=False,
                  use_parse=False,
                  device=None):
-        self.template_3points = template_3points  # improve robustness
+        self.template_3points = template_3points
         self.upscale_factor = int(upscale_factor)
         # the cropped face ratio based on the square face
         self.crop_ratio = crop_ratio  # (h, w)
@@ -696,7 +598,7 @@ class FaceAligner(object):
 
         if device is None:
             # self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            self.device = get_device()
+            self.device = model_management.get_torch_device()
         else:
             self.device = device
 
