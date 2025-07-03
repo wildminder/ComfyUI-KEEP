@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-KEEP"
 description = "Kalman-Inspired Feature Propagation for Video Face Super-Resolution"
-version = "1.0.0"
+version = "1.1.0"
 license = {file = "LICENSE"}
 dependencies = ["addict", "future", "lmdb", "numpy", "opencv-python", "Pillow", "pyyaml", "scikit-image", "scipy", "torch", "torchvision", "tqdm", "yapf", "ffmpeg-python"]
 
