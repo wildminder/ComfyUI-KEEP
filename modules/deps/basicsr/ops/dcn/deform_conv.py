@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 from torch import nn as nn
 from torch.autograd import Function
@@ -6,22 +7,27 @@ from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair, _single
 
-try:
-    from . import deform_conv_ext
-except ImportError:
-    import os
-    BASICSR_JIT = os.getenv('BASICSR_JIT')
-    if BASICSR_JIT == 'True':
-        from torch.utils.cpp_extension import load
-        module_path = os.path.dirname(__file__)
-        deform_conv_ext = load(
-            'deform_conv',
-            sources=[
-                os.path.join(module_path, 'src', 'deform_conv_ext.cpp'),
-                os.path.join(module_path, 'src', 'deform_conv_cuda.cpp'),
-                os.path.join(module_path, 'src', 'deform_conv_cuda_kernel.cu'),
-            ],
-        )
+BASICSR_JIT = os.getenv('BASICSR_JIT')
+if BASICSR_JIT == 'True':
+    from torch.utils.cpp_extension import load
+    module_path = os.path.dirname(__file__)
+    deform_conv_ext = load(
+        'deform_conv',
+        sources=[
+            os.path.join(module_path, 'src', 'deform_conv_ext.cpp'),
+            os.path.join(module_path, 'src', 'deform_conv_cuda.cpp'),
+            os.path.join(module_path, 'src', 'deform_conv_cuda_kernel.cu'),
+        ],
+    )
+else:
+    try:
+        from . import deform_conv_ext
+    except ImportError:
+        pass
+        # avoid annoying print output
+        # print(f'Cannot import deform_conv_ext. Error: {error}. You may need to: \n '
+        #       '1. compile with BASICSR_EXT=True. or\n '
+        #       '2. set BASICSR_JIT=True during running')
 
 
 class DeformConvFunction(Function):
@@ -38,7 +44,7 @@ class DeformConvFunction(Function):
                 deformable_groups=1,
                 im2col_step=64):
         if input is not None and input.dim() != 4:
-            raise ValueError(f'Expected 4D tensor as input, got {input.dim()}' 'D tensor instead.')
+            raise ValueError(f'Expected 4D tensor as input, got {input.dim()}D tensor instead.')
         ctx.stride = _pair(stride)
         ctx.padding = _pair(padding)
         ctx.dilation = _pair(dilation)
@@ -108,7 +114,7 @@ class DeformConvFunction(Function):
             stride_ = stride[d]
             output_size += ((in_size + (2 * pad) - kernel) // stride_ + 1, )
         if not all(map(lambda s: s > 0, output_size)):
-            raise ValueError('convolution input is too small (output would be ' f'{"x".join(map(str, output_size))})')
+            raise ValueError(f'convolution input is too small (output would be {"x".join(map(str, output_size))})')
         return output_size
 
 
@@ -136,8 +142,7 @@ class ModulatedDeformConvFunction(Function):
             bias = input.new_empty(1)  # fake tensor
         if not input.is_cuda:
             raise NotImplementedError
-        if weight.requires_grad or mask.requires_grad or offset.requires_grad \
-                or input.requires_grad:
+        if weight.requires_grad or mask.requires_grad or offset.requires_grad or input.requires_grad:
             ctx.save_for_backward(input, offset, mask, weight, bias)
         output = input.new_empty(ModulatedDeformConvFunction._infer_shape(ctx, input, weight))
         ctx._bufs = [input.new_empty(0), input.new_empty(0)]
@@ -198,11 +203,8 @@ class DeformConv(nn.Module):
         super(DeformConv, self).__init__()
 
         assert not bias
-        assert in_channels % groups == 0, \
-            f'in_channels {in_channels} is not divisible by groups {groups}'
-        assert out_channels % groups == 0, \
-            f'out_channels {out_channels} is not divisible ' \
-            f'by groups {groups}'
+        assert in_channels % groups == 0, f'in_channels {in_channels} is not divisible by groups {groups}'
+        assert out_channels % groups == 0, f'out_channels {out_channels} is not divisible by groups {groups}'
 
         self.in_channels = in_channels
         self.out_channels = out_channels

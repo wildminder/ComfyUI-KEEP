@@ -11,10 +11,11 @@ from facelib.detection.retinaface.retinaface_net import FPN, SSH, MobileNetV1, m
 from facelib.detection.retinaface.retinaface_utils import (PriorBox, batched_decode, batched_decode_landm, decode, decode_landm,
                                                            py_cpu_nms)
 
-from basicsr.utils.misc import get_device
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-device = get_device()
-# device = 'cpu'
+# Import comfy.model_management for device handling
+import comfy.model_management as model_management
+
+# Set device using ComfyUI's function
+device = model_management.get_torch_device()
 
 
 def generate_config(network_name):
@@ -86,6 +87,7 @@ class RetinaFace(nn.Module):
         self.phase = phase
         self.target_size, self.max_size = 1600, 2150
         self.resize, self.scale, self.scale1 = 1., None, None
+        # The 'device' variable is now correctly defined at the module level
         self.mean_tensor = torch.tensor(
             [[[[104.]], [[117.]], [[123.]]]]).to(device)
         self.reference = get_reference_facial_points(default_square=True)
@@ -96,7 +98,7 @@ class RetinaFace(nn.Module):
             self.body = IntermediateLayerGetter(backbone, cfg['return_layers'])
         elif cfg['name'] == 'Resnet50':
             import torchvision.models as models
-            backbone = models.resnet50(pretrained=False)
+            backbone = models.resnet50(weights=None) # Use weights=None to avoid deprecation warning
             self.body = IntermediateLayerGetter(backbone, cfg['return_layers'])
 
         in_channels_stage2 = cfg['in_channel']
@@ -246,10 +248,7 @@ class RetinaFace(nn.Module):
             (boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
         keep = py_cpu_nms(bounding_boxes, nms_threshold)
         bounding_boxes, landmarks = bounding_boxes[keep, :], landmarks[keep]
-        # self.t['forward_pass'].toc()
-        # print(self.t['forward_pass'].average_time)
-        # import sys
-        # sys.stdout.flush()
+
         return np.concatenate((bounding_boxes, landmarks), axis=1)
 
     def __align_multi(self, image, boxes, landmarks, limit=None):
@@ -338,7 +337,6 @@ class RetinaFace(nn.Module):
                 type=np.float32).
             final_landmarks: list of np.array ([n_boxes, 10], type=np.float32).
         """
-        # self.t['forward_pass'].tic()
         frames, self.resize = self.batched_transform(frames, use_origin_size)
         frames = frames.to(device)
         frames = frames - self.mean_tensor
@@ -371,10 +369,6 @@ class RetinaFace(nn.Module):
                 final_landmarks.append(np.array([], dtype=np.float32))
                 continue
 
-            # sort
-            # order = score.argsort(descending=True)
-            # box, landm, score = box[order], landm[order], score[order]
-
             # to CPU
             bounding_boxes, landm = pred.cpu().numpy(), landm.cpu().numpy()
 
@@ -385,9 +379,5 @@ class RetinaFace(nn.Module):
             # append
             final_bounding_boxes.append(bounding_boxes)
             final_landmarks.append(landmarks)
-        # self.t['forward_pass'].toc(average=True)
-        # self.batch_time += self.t['forward_pass'].diff
-        # self.total_frame += len(frames)
-        # print(self.batch_time / self.total_frame)
 
         return final_bounding_boxes, final_landmarks

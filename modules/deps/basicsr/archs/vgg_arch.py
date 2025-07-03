@@ -102,7 +102,7 @@ class VGGFeatureExtractor(nn.Module):
 
         if os.path.exists(VGG_PRETRAIN_PATH):
             vgg_net = getattr(vgg, vgg_type)(pretrained=False)
-            state_dict = torch.load(VGG_PRETRAIN_PATH, map_location=lambda storage, loc: storage, weights_only=True)
+            state_dict = torch.load(VGG_PRETRAIN_PATH, map_location=lambda storage, loc: storage)
             vgg_net.load_state_dict(state_dict)
         else:
             vgg_net = getattr(vgg, vgg_type)(pretrained=True)
@@ -151,8 +151,8 @@ class VGGFeatureExtractor(nn.Module):
             x = (x + 1) / 2
         if self.use_input_norm:
             x = (x - self.mean) / self.std
-        output = {}
 
+        output = {}
         for key, layer in self.vgg_net._modules.items():
             x = layer(x)
             if key in self.layer_name_list:

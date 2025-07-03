@@ -1,86 +1,89 @@
 import torch
 import os
 from comfy import model_management
-import folder_paths # Import folder_paths for model directory management
+import folder_paths 
 
+from .. import logger # Import from parent __init__.py
 from .utils import (
     load_file_from_url_comfy, ARCH_REGISTRY,
-    KEEP_MODEL_CONFIGS, REALESRGAN_MODEL_CONFIG, FACELIB_MODEL_URLS, FACELIB_DEST_DIR
+    KEEP_MODEL_CONFIGS, FACELIB_MODEL_URLS, FACELIB_DEST_DIR
 )
 
 try:
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from basicsr.utils.realesrgan_utils import RealESRGANer
-    import basicsr.archs # Ensure KEEP arch is registered
-    # print("basicsr components imported for KEEPModelLoader.")
-except ImportError as e:
-    print(f"Critical Import Error in keep_model_loader.py (basicsr): {e}")
-    class RRDBNet: pass
-    class RealESRGANer: pass
-
-try:
-    # This now refers to the MODIFIED FaceRestoreHelper in deps/facelib/
     from facelib.utils.face_restoration_helper import FaceRestoreHelper
-    # print("FaceRestoreHelper imported (hopefully modified version).")
 except ImportError as e:
-    print(f"Critical Import Error in keep_model_loader.py (facelib): {e}")
+    logger.error(f"Critical Import Error in keep_model_loader.py (facelib): {e}")
     class FaceRestoreHelper: pass
 
-
 class KEEPModelPack:
-    def __init__(self, keep_net, face_helper, bg_upsampler, face_upsampler, device, model_type_str):
+    def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model, model_type_str):
         self.keep_net = keep_net
         self.face_helper = face_helper
-        self.bg_upsampler = bg_upsampler
-        self.face_upsampler = face_upsampler
-        self.device = device
+        self.bg_upscale_model = bg_upscale_model
+        self.face_upscale_model = face_upscale_model
         self.model_type_str = model_type_str
+        self.device = model_management.get_torch_device()
+        self.offload_device = model_management.unet_offload_device()
+
+    def load_device(self):
+        """Move all models to the main compute device."""
+        if self.keep_net is not None:
+            self.keep_net.to(self.device)
+        # The spandrel model descriptor has a 'model' attribute that needs to be moved
+        if self.bg_upscale_model is not None:
+            self.bg_upscale_model.model.to(self.device)
+        if self.face_upscale_model is not None:
+            self.face_upscale_model.model.to(self.device)
+        
+        if self.face_helper is not None:
+            self.face_helper.device = self.device
+            if hasattr(self.face_helper, 'face_detector'):
+                self.face_helper.face_detector.to(self.device)
+            if hasattr(self.face_helper, 'face_parse'):
+                self.face_helper.face_parse.to(self.device)
+
+    def offload(self):
+        """Move all models to the offload device (CPU)."""
+        if self.keep_net is not None:
+            self.keep_net.to(self.offload_device)
+        if self.bg_upscale_model is not None:
+            self.bg_upscale_model.model.to(self.offload_device)
+        if self.face_upscale_model is not None:
+            self.face_upscale_model.model.to(self.offload_device)
+            
+        if self.face_helper is not None:
+            self.face_helper.device = self.offload_device
+            if hasattr(self.face_helper, 'face_detector'):
+                self.face_helper.face_detector.to(self.offload_device)
+            if hasattr(self.face_helper, 'face_parse'):
+                self.face_helper.face_parse.to(self.offload_device)
+                
+        model_management.soft_empty_cache()
 
 class KEEPModelLoader:
     def __init__(self):
         self.device = model_management.get_torch_device()
+        self.offload_device = model_management.unet_offload_device()
         self.loaded_models = {}
 
-    def _set_realesrgan(self, tile_size=400):
-        cache_key = f"realesrgan_x2_tile{tile_size}"
-        if cache_key in self.loaded_models:
-            return self.loaded_models[cache_key]
-        
-        try:
-            use_half = False
-            if torch.cuda.is_available():
-                no_half_gpu_list = ['1650', '1660']
-                if not any(gpu in torch.cuda.get_device_name(0) for gpu in no_half_gpu_list):
-                    use_half = True
-            
-            model_path = load_file_from_url_comfy(
-                url=REALESRGAN_MODEL_CONFIG['url'],
-                model_dir_name=REALESRGAN_MODEL_CONFIG['dest_dir'],
-                file_name=os.path.basename(REALESRGAN_MODEL_CONFIG['url']),
-                sha256=REALESRGAN_MODEL_CONFIG.get('sha256')
-            )
-            
-            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-            
-            upsampler = RealESRGANer(
-                scale=2, model_path=model_path, model=model, tile=tile_size,
-                tile_pad=40, pre_pad=0, half=use_half, device=self.device
-            )
-            self.loaded_models[cache_key] = upsampler
-            print(f"RealESRGAN model loaded for {cache_key}.")
-            return upsampler
-        except Exception as e:
-            print(f"Error setting up RealESRGAN: {e}")
-            return None
-
-
     def load_keep_model_pack(self, model_type_str, detection_model_str,
-                             use_bg_upsampler, use_face_upsampler, bg_tile_size):
+                             bg_upscale_model=None, face_upscale_model=None):
         
-        cache_key = (model_type_str, detection_model_str, use_bg_upsampler, use_face_upsampler, bg_tile_size)
+        bg_upscaler_present = bg_upscale_model is not None
+        face_upscaler_present = face_upscale_model is not None
+        cache_key = (model_type_str, detection_model_str, bg_upscaler_present, face_upscaler_present)
+
         if cache_key in self.loaded_models:
-            print(f"Returning cached KEEPModelPack for {model_type_str}")
-            return self.loaded_models[cache_key]
+            logger.debug(f"Returning cached base models for {cache_key}")
+            cached_pack = self.loaded_models[cache_key]
+            model_pack = KEEPModelPack(
+                cached_pack.keep_net, 
+                cached_pack.face_helper, 
+                bg_upscale_model,
+                face_upscale_model,
+                model_type_str
+            )
+            return model_pack
 
         if model_type_str not in KEEP_MODEL_CONFIGS:
             raise ValueError(f"Unknown KEEP model type: {model_type_str}")
@@ -91,7 +94,7 @@ class KEEPModelLoader:
         if keep_model_arch_class is None:
             raise RuntimeError("KEEP architecture class not found in ARCH_REGISTRY.")
         
-        net = keep_model_arch_class(**config_entry['architecture']).to(self.device)
+        net = keep_model_arch_class(**config_entry['architecture']).to(self.offload_device)
         
         ckpt_path = load_file_from_url_comfy(
             url=config_entry['url'],
@@ -99,15 +102,14 @@ class KEEPModelLoader:
             file_name=os.path.basename(config_entry['url']),
             sha256=config_entry.get('sha256')
         )
-        checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=True) # Assuming state_dict only
+        checkpoint = torch.load(ckpt_path, map_location=self.offload_device, weights_only=True)
         
         state_dict_key = 'params_ema' if 'params_ema' in checkpoint else 'params'
-        state_dict = checkpoint.get(state_dict_key, checkpoint) # Fallback to raw checkpoint if keys not present
+        state_dict = checkpoint.get(state_dict_key, checkpoint)
 
         converted_state_dict = {}
         needs_conversion = any('cross_fuse' in k or 'fuse_convs_dict' in k for k in state_dict.keys())
         if needs_conversion:
-            print("Applying key conversion for KEEP model weights...")
             for k, v in state_dict.items():
                 new_k = k
                 if 'cross_fuse' in k: new_k = k.replace('cross_fuse', 'cfa')
@@ -117,42 +119,27 @@ class KEEPModelLoader:
         
         net.load_state_dict(state_dict, strict=True)
         net.eval()
-        print(f"KEEP model '{model_type_str}' loaded onto {self.device}.")
+        logger.debug(f"KEEP model '{model_type_str}' loaded onto {self.offload_device}.")
 
-
-        # Download facelib models to ComfyUI's standard directory for face detection models
         for fname, (url, sha) in FACELIB_MODEL_URLS.items():
             load_file_from_url_comfy(url=url, model_dir_name=FACELIB_DEST_DIR, file_name=fname, sha256=sha)
         
-        # Get the actual disk path for FACELIB_DEST_DIR category
-        #facelib_actual_paths = folder_paths.get_folder_paths(FACELIB_DEST_DIR)
         facelib_actual_paths = os.path.join(folder_paths.models_dir, FACELIB_DEST_DIR)
-        if not facelib_actual_paths:
-            face_helper_model_root = os.path.join(folder_paths.models_dir, FACELIB_DEST_DIR)
-            print(f"Warning: Facelib model dir category '{FACELIB_DEST_DIR}' not in folder_paths. Using default: {face_helper_model_root}")
-        else:
-            face_helper_model_root = facelib_actual_paths
-            os.makedirs(face_helper_model_root, exist_ok=True)
+        os.makedirs(facelib_actual_paths, exist_ok=True)
         
-
         try:
             face_helper = FaceRestoreHelper(
                 upscale_factor=1, face_size=512, crop_ratio=(1, 1),
-                det_model=detection_model_str, save_ext='png', use_parse=True, device=self.device,
-                model_rootpath=face_helper_model_root # Pass the ComfyUI managed path
+                det_model=detection_model_str, save_ext='png', use_parse=True, device=self.offload_device,
+                model_rootpath=facelib_actual_paths
             )
-            # print(f"FaceRestoreHelper initialized with detection model: {detection_model_str} and model_rootpath: {face_helper_model_root}")
         except Exception as e:
-            print(f"Error initializing FaceRestoreHelper: {e}")
-            # print("Ensure that the vendored FaceRestoreHelper and its dependent model loaders "
-            #       "(e.g., init_detection_model, init_parsing_model in facelib) "
-            #       "are correctly modified to use the 'model_rootpath' argument or can find models "
-            #       f"in '{face_helper_model_root}'.")
+            logger.error(f"Error initializing FaceRestoreHelper: {e}")
             raise
 
-        bg_upsampler = self._set_realesrgan(tile_size=bg_tile_size) if use_bg_upsampler else None
-        face_upsampler = self._set_realesrgan(tile_size=bg_tile_size) if use_face_upsampler else None
+        model_pack = KEEPModelPack(net, face_helper, bg_upscale_model, face_upscale_model, model_type_str)
+
+        base_pack_for_cache = KEEPModelPack(net, face_helper, None, None, model_type_str)
+        self.loaded_models[cache_key] = base_pack_for_cache
         
-        model_pack = KEEPModelPack(net, face_helper, bg_upsampler, face_upsampler, self.device, model_type_str)
-        self.loaded_models[cache_key] = model_pack
         return model_pack
