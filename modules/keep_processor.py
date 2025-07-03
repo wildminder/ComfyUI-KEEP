@@ -8,13 +8,13 @@ from tqdm import tqdm # Import tqdm for console progress bars
 from .utils import comfy_image_to_cv2, cv2_to_comfy_image
 from comfy.utils import ProgressBar, tiled_scale
 
-# Imports from vendored basicsr and facelib
+# Imports from vendored wm_basicsr and facelib
 try:
-    from basicsr.utils.img_util import img2tensor, tensor2img
-    from basicsr.utils.video_util import VideoReader, VideoWriter
-    from facelib.utils.misc import is_gray
+    from wm_basicsr.utils.img_util import img2tensor, tensor2img
+    from wm_basicsr.utils.video_util import VideoReader, VideoWriter
+    from wm_facelib.utils.misc import is_gray
 except ImportError as e:
-    print(f"ImportError in keep_processor: {e}. Check vendored 'basicsr' and 'facelib'.")
+    print(f"ImportError in keep_processor: {e}. Check vendored 'wm_basicsr' and 'facelib'.")
     # Dummy just in case
     def img2tensor(img, bgr2rgb, float32): return None
     def tensor2img(tensor, rgb2bgr, min_max): return None

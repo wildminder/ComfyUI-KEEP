@@ -18,13 +18,13 @@ deps_path = os.path.join(module_path, 'deps')
 if deps_path not in sys.path:
     sys.path.insert(0, deps_path)
 
-# directly import from the vendored basicsr
+# directly import from the vendored wm_basicsr
 try:
-    from basicsr.utils.registry import ARCH_REGISTRY
-    from basicsr.utils.download_util import load_file_from_url
-    # print("Successfully imported ARCH_REGISTRY and load_file_from_url from vendored basicsr.")
+    from wm_basicsr.utils.registry import ARCH_REGISTRY
+    from wm_basicsr.utils.download_util import load_file_from_url
+    # print("Successfully imported ARCH_REGISTRY and load_file_from_url from vendored wm_basicsr.")
 except ImportError as e:
-    print(f"Error importing from vendored basicsr in utils.py: {e}")
+    print(f"Error importing from vendored wm_basicsr in utils.py: {e}")
     # Fallback ARCH_REGISTRY if needed, though ideally the import should work
     class DummyArchRegistry:
         def __init__(self): self._registry = {}

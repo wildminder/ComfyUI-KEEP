@@ -10,7 +10,7 @@ from .utils import (
 )
 
 try:
-    from facelib.utils.face_restoration_helper import FaceRestoreHelper
+    from wm_facelib.utils.face_restoration_helper import FaceRestoreHelper
 except ImportError as e:
     logger.error(f"Critical Import Error in keep_model_loader.py (facelib): {e}")
     class FaceRestoreHelper: pass
