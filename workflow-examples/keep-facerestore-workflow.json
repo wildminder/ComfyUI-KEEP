@@ -1,0 +1,457 @@
+{
+  "id": "8d572b01-d28b-4720-9a8f-de78a462448a",
+  "revision": 0,
+  "last_node_id": 40,
+  "last_link_id": 68,
+  "nodes": [
+    {
+      "id": 33,
+      "type": "KEEP_ModelLoader",
+      "pos": [
+        206.87503051757812,
+        137.2619171142578
+      ],
+      "size": [
+        312.474609375,
+        102
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "bg_upscale_model",
+          "shape": 7,
+          "type": "UPSCALE_MODEL",
+          "link": 48
+        },
+        {
+          "name": "face_upscale_model",
+          "shape": 7,
+          "type": "UPSCALE_MODEL",
+          "link": 49
+        }
+      ],
+      "outputs": [
+        {
+          "name": "keep_model_pack",
+          "type": "KEEP_MODEL_PACK",
+          "links": [
+            53
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-KEEP",
+        "ver": "357fd3adf13fc2f3d51b9e3cbb77b6174b609e3f",
+        "Node name for S&R": "KEEP_ModelLoader"
+      },
+      "widgets_values": [
+        "KEEP",
+        "retinaface_resnet50"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [
+        598.2536010742188,
+        -80.40119934082031
+      ],
+      "size": [
+        274.080078125,
+        314
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            62
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.34",
+        "Node name for S&R": "LoadImage",
+        "widget_ue_connectable": {
+          "image": true,
+          "upload": true
+        }
+      },
+      "widgets_values": [
+        "images.jpg",
+        "image"
+      ]
+    },
+    {
+      "id": 34,
+      "type": "KEEP_FaceUpscaleImage",
+      "pos": [
+        910.7468872070312,
+        -80.40119934082031
+      ],
+      "size": [
+        310.1102600097656,
+        151.10000610351562
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 64
+        },
+        {
+          "name": "keep_model",
+          "type": "KEEP_MODEL_PACK",
+          "link": 53
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            65
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-KEEP",
+        "ver": "357fd3adf13fc2f3d51b9e3cbb77b6174b609e3f",
+        "Node name for S&R": "KEEP_FaceUpscaleImage"
+      },
+      "widgets_values": [
+        1,
+        false,
+        false,
+        true
+      ]
+    },
+    {
+      "id": 39,
+      "type": "FaceRestoreCFWithModel",
+      "pos": [
+        910.7468872070312,
+        141.14297485351562
+      ],
+      "size": [
+        309.4769592285156,
+        106.31905364990234
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "facerestore_model",
+          "type": "FACERESTORE_MODEL",
+          "link": 63
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 62
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            64,
+            66
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "facerestore_cf",
+        "ver": "ff4d7a5c102441d8f058dd6135797ffb57b6c6ad",
+        "Node name for S&R": "FaceRestoreCFWithModel"
+      },
+      "widgets_values": [
+        "retinaface_resnet50",
+        1
+      ]
+    },
+    {
+      "id": 38,
+      "type": "FaceRestoreModelLoader",
+      "pos": [
+        910.7468872070312,
+        316.27813720703125
+      ],
+      "size": [
+        306.0392150878906,
+        58.81402587890625
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "FACERESTORE_MODEL",
+          "type": "FACERESTORE_MODEL",
+          "links": [
+            63
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "facerestore_cf",
+        "ver": "ff4d7a5c102441d8f058dd6135797ffb57b6c6ad",
+        "Node name for S&R": "FaceRestoreModelLoader"
+      },
+      "widgets_values": [
+        "codeformer-v0.1.0.pth"
+      ]
+    },
+    {
+      "id": 40,
+      "type": "Image Comparer (rgthree)",
+      "pos": [
+        1250.946044921875,
+        -80.40119934082031
+      ],
+      "size": [
+        330.7626037597656,
+        299.5447082519531
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "dir": 3,
+          "name": "image_a",
+          "type": "IMAGE",
+          "link": 65
+        },
+        {
+          "dir": 3,
+          "name": "image_b",
+          "type": "IMAGE",
+          "link": 66
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "rgthree-comfy",
+        "ver": "1.0.2506230015",
+        "comparer_mode": "Click"
+      },
+      "widgets_values": [
+        [
+          {
+            "name": "A",
+            "selected": true,
+            "url": "/api/view?filename=rgthree.compare._temp_vaevg_00013_.png&type=temp&subfolder=&rand=0.1079648365810214"
+          },
+          {
+            "name": "B",
+            "selected": true,
+            "url": "/api/view?filename=rgthree.compare._temp_vaevg_00014_.png&type=temp&subfolder=&rand=0.7693092050267897"
+          }
+        ]
+      ]
+    },
+    {
+      "id": 28,
+      "type": "UpscaleModelLoader",
+      "pos": [
+        206.9127960205078,
+        -86.62854766845703
+      ],
+      "size": [
+        309.068359375,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "UPSCALE_MODEL",
+          "type": "UPSCALE_MODEL",
+          "links": [
+            48
+          ]
+        }
+      ],
+      "title": "Background Upscale Model",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.43",
+        "Node name for S&R": "UpscaleModelLoader"
+      },
+      "widgets_values": [
+        "SwinIR\\2x-003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x2_GAN.pth"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 25,
+      "type": "UpscaleModelLoader",
+      "pos": [
+        208.96224975585938,
+        23.351966857910156
+      ],
+      "size": [
+        305.3117980957031,
+        58
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "UPSCALE_MODEL",
+          "type": "UPSCALE_MODEL",
+          "links": [
+            49
+          ]
+        }
+      ],
+      "title": "Face Upscale Model",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.43",
+        "Node name for S&R": "UpscaleModelLoader"
+      },
+      "widgets_values": [
+        "4x_UltraSharp.safetensors"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    }
+  ],
+  "links": [
+    [
+      48,
+      28,
+      0,
+      33,
+      0,
+      "UPSCALE_MODEL"
+    ],
+    [
+      49,
+      25,
+      0,
+      33,
+      1,
+      "UPSCALE_MODEL"
+    ],
+    [
+      53,
+      33,
+      0,
+      34,
+      1,
+      "KEEP_MODEL_PACK"
+    ],
+    [
+      62,
+      3,
+      0,
+      39,
+      1,
+      "IMAGE"
+    ],
+    [
+      63,
+      38,
+      0,
+      39,
+      0,
+      "FACERESTORE_MODEL"
+    ],
+    [
+      64,
+      39,
+      0,
+      34,
+      0,
+      "IMAGE"
+    ],
+    [
+      65,
+      34,
+      0,
+      40,
+      0,
+      "IMAGE"
+    ],
+    [
+      66,
+      39,
+      0,
+      40,
+      1,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Image processing",
+      "bounding": [
+        575.5823364257812,
+        -162.623046875,
+        1020.0767211914062,
+        567.1326293945312
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "KEEP model",
+      "bounding": [
+        196.87503051757812,
+        -160.22857666015625,
+        332.4745788574219,
+        409.4904479980469
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1.015255979947706,
+      "offset": [
+        -106.87503051757812,
+        186.62854766845703
+      ]
+    },
+    "frontendVersion": "1.23.4",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
