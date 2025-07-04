@@ -11,6 +11,8 @@ Kalman-Inspired Feature Propagation for Video Face Super-Resolution in ComfyUI
 
 
 # Update
+- **2025-07-04**
+  	*   Multiface processing and tracking.
 - **2025-07-03**: 
 	*   Standard ComfyUI `Upscale Model` inputs instead of a hardcoded Real-ESRGAN
 	*   Added `final_upscale_factor` for precise output scaling.
@@ -35,6 +37,10 @@ The nodes leverage the core architecture and pre-trained models from the <a href
 *   **Single Image & Sequence Processing:** Enhance faces in individual images or entire video frame sequences.
 *   **Choice of Detection Models:** Supports various face detection backbones (RetinaFace, YOLOv5).
 
+
+| Single Img Restore | Video Restore |
+|--------------------|---------------|
+| ![Single Img Restore](https://github.com/wildminder/ComfyUI-KEEP/blob/master/assets/keep-imgench.jpg?raw=true) | ![Video Restore](https://github.com/wildminder/ComfyUI-KEEP/blob/master/assets/keep-vidench.jpg?raw=true) |
 
 ## Nodes
 This package includes the following custom nodes:
