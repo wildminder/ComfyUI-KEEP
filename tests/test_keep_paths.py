@@ -330,3 +330,23 @@ def test_the_real_folder_paths_know_the_keep_folders():
     for name in ("keep_models", "facedetection", "gmflow"):
         assert report[name], f"{name} is not registered: {report}"
         assert report[name][0].endswith(name), report
+
+
+@pytest.mark.unit
+def test_the_primary_root_is_registered_first(keep_paths, mock_folder_paths):
+    """The primary-root-first rule (P3.5 / P5.2).
+
+    An extra model root that was registered **before** the pack must not
+    shadow the primary root: the lookup (``get_full_path_or_raise``) and the
+    download target both follow the primary root first.
+    """
+    extra = _extra_model_root(mock_folder_paths)
+    mock_folder_paths.add_model_folder_path("keep_models", extra)
+
+    keep_paths.register_model_folders()
+
+    roots = keep_paths.get_model_folder_paths("keep_models")
+    primary = os.path.join(mock_folder_paths.models_dir, "keep_models")
+    assert roots[0] == primary, roots
+    assert keep_paths.get_primary_folder("keep_models") == primary
+    assert keep_paths.resolve_model_target("keep_models", "x.pth").startswith(primary)

@@ -48,9 +48,12 @@ def _registered_paths(name: str) -> list[str]:
 def register_model_folders() -> bool:
     """Register the KEEP model folders with ComfyUI's ``folder_paths``.
 
-    The registration is idempotent: a folder that is already registered is
-    left alone (an extra model root that was configured before the pack was
-    loaded keeps its place, the primary root stays first).
+    The registration is idempotent: ComfyUI's ``add_model_folder_path`` does
+    not add a path twice, and with ``is_default=True`` it puts the path
+    **first** (the real implementation moves it to the front - see
+    ``folder_paths.py:382``).  The primary root is therefore always the first
+    root of a folder: the lookup (``get_full_path_or_raise``) and the
+    download target both follow that order.
 
     Returns ``False`` when ComfyUI is not available (the pack then imports,
     but no weight can be resolved).
@@ -60,8 +63,6 @@ def register_model_folders() -> bool:
 
     for name in MODEL_FOLDERS:
         primary = os.path.join(folder_paths.models_dir, name)
-        if primary in _registered_paths(name):
-            continue
         folder_paths.add_model_folder_path(name, primary, is_default=True)
         logger.debug(f"registered the model folder {name!r} -> {primary}")
     return True

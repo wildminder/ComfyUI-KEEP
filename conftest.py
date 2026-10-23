@@ -620,8 +620,27 @@ class _MockFolderPaths(types.ModuleType):
         self.calls: list[tuple] = []
 
     def add_model_folder_path(self, name: str, path: str, is_default: bool = False) -> None:
+        """The real API puts a ``is_default`` path **first** (ComfyUI 0.42).
+
+        ``folder_paths.add_model_folder_path`` (the real one) moves a default
+        path to the front of the list and appends a non-default one.  The
+        mock mirrors that behaviour - the pack relies on it (the primary
+        model root must be the first root of a folder).
+        """
         self.calls.append(("add_model_folder_path", name, path, is_default))
-        self.folder_names_and_paths.setdefault(name, []).append((str(path), is_default))
+        entries = self.folder_names_and_paths.setdefault(name, [])
+        path = str(path)
+        existing = next((entry for entry in entries if entry[0] == path), None)
+        if existing is not None:
+            if is_default and entries[0][0] != path:
+                entries.remove(existing)
+                entries.insert(0, existing)
+            return
+        entry = (path, is_default)
+        if is_default:
+            entries.insert(0, entry)
+        else:
+            entries.append(entry)
 
     def get_folder_paths(self, name: str) -> list[str]:
         self.calls.append(("get_folder_paths", name))
