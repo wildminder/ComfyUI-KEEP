@@ -570,3 +570,90 @@ def test_every_third_party_import_of_the_closure_is_declared():
         f"the closure imports {sorted(declared)}, requirements.txt declares "
         f"{sorted(entries)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P2.7 - no swallow-and-stub fallbacks any more
+# ---------------------------------------------------------------------------
+
+_IMPORT_PACKAGE_SCRIPT = """
+import sys
+
+root = sys.argv[1]
+sys.path.insert(0, root)
+import conftest  # registers the package alias and the ComfyUI mocks
+
+import ComfyUI_KEEP.modules.utils
+print("KEEP_IMPORT_OK")
+"""
+
+
+@pytest.mark.unit
+def test_the_stub_sites_yield_the_real_vendored_symbols():
+    """P2.7 (a): every former stub site resolves to the vendored symbol."""
+    import importlib
+
+    utils = importlib.import_module("ComfyUI_KEEP.modules.utils")
+    processor = importlib.import_module("ComfyUI_KEEP.modules.keep_processor")
+    loader = importlib.import_module("ComfyUI_KEEP.modules.keep_model_loader")
+
+    assert utils.ARCH_REGISTRY.__module__.endswith(
+        ".modules.deps.basicsr.utils.registry"
+    )
+    assert utils.load_file_from_url.__module__.endswith(
+        ".modules.deps.basicsr.utils.download_util"
+    )
+    assert processor.img2tensor.__module__.endswith(
+        ".modules.deps.basicsr.utils.img_util"
+    )
+    assert processor.tensor2img.__module__.endswith(
+        ".modules.deps.basicsr.utils.img_util"
+    )
+    assert processor.is_gray.__module__.endswith(".modules.deps.facelib.utils.misc")
+    assert loader.FaceRestoreHelper.__module__.endswith(
+        ".modules.deps.facelib.utils.face_restoration_helper"
+    )
+    # the dummy fallbacks are gone
+    assert not hasattr(utils, "DummyArchRegistry")
+    assert not hasattr(processor, "VideoReader")
+    assert not hasattr(processor, "VideoWriter")
+
+
+@pytest.mark.unit
+def test_a_broken_vendored_import_fails_loudly(tmp_path):
+    """P2.7 (b): a broken vendored dependency makes the import fail.
+
+    The vendored ``registry`` module is renamed in a **copy** of the
+    repository: the import of the package must raise instead of falling back
+    to the dummy registry (which silently lost the KEEP architecture).
+    """
+    import shutil
+
+    copy_root = tmp_path / "repo"
+    shutil.copytree(
+        REPO_ROOT,
+        copy_root,
+        ignore=shutil.ignore_patterns(
+            "__pycache__", ".git", ".dev", ".codegraph", "*.pyc", ".pytest_cache"
+        ),
+    )
+    registry = copy_root / "modules" / "deps" / "basicsr" / "utils" / "registry.py"
+    registry.rename(registry.with_suffix(".py.broken"))
+
+    result = _run_python(_IMPORT_PACKAGE_SCRIPT, str(copy_root))
+    assert result.returncode != 0, (
+        "the broken vendored import must fail loudly: "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "KEEP_IMPORT_OK" not in result.stdout, result.stdout
+    assert (
+        "ModuleNotFoundError" in result.stderr or "ImportError" in result.stderr
+    ), result.stderr
+    assert "registry" in result.stderr, result.stderr
+    # the dummy registry must not appear any more
+    assert "DummyArchRegistry" not in result.stderr, result.stderr
+
+    # the control: the unmodified repository imports fine
+    control = _run_python(_IMPORT_PACKAGE_SCRIPT, str(REPO_ROOT))
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert "KEEP_IMPORT_OK" in control.stdout, control.stdout

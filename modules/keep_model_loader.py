@@ -9,11 +9,9 @@ from .utils import (
     KEEP_MODEL_CONFIGS, FACELIB_MODEL_URLS, FACELIB_DEST_DIR
 )
 
-try:
-    from .deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
-except ImportError as e:
-    logger.error(f"Critical Import Error in keep_model_loader.py (facelib): {e}")
-    class FaceRestoreHelper: pass
+# P2.7: the swallow-and-stub fallback is gone - a broken vendored dependency
+# must fail loudly instead of silently producing an unusable model pack.
+from .deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
 
 class KEEPModelPack:
     def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model, model_type_str):

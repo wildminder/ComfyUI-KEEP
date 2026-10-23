@@ -16,25 +16,11 @@ from comfy.utils import ProgressBar, tiled_scale
 # ``process_video`` is the only user and it is dead code (nothing in
 # the package calls it; P4.7 removes it), so it now fails loudly instead of
 # silently importing a stub.  The image / image-sequence paths are unaffected.
-try:
-    from .deps.basicsr.utils.img_util import img2tensor, tensor2img
-    from .deps.facelib.utils.misc import is_gray
-except ImportError as e:
-    print(f"ImportError in keep_processor: {e}. Check vendored 'basicsr' and 'facelib'.")
-    # Dummy just in case
-    def img2tensor(img, bgr2rgb, float32): return None
-    def tensor2img(tensor, rgb2bgr, min_max): return None
-    def is_gray(img, threshold): return False
-    class VideoReader:
-        def __init__(self, path): self.path = path
-        def __len__(self): return 0
-        def get_frame(self): return None
-        def get_fps(self): return 25
-        def close(self): pass
-    class VideoWriter:
-        def __init__(self, path, h, w, fps): pass
-        def write_frame(self, frame): pass
-        def close(self): pass
+#
+# P2.7: the dummy image helpers are gone - a broken vendored dependency must
+# fail loudly instead of returning ``None`` images.
+from .deps.basicsr.utils.img_util import img2tensor, tensor2img
+from .deps.facelib.utils.misc import is_gray
 
 
 def interpolate_sequence(sequence):

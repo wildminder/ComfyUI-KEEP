@@ -12,24 +12,12 @@ from torch.hub import download_url_to_file, get_dir
 from .. import logger
 
 # directly import from the vendored basicsr
-try:
-    from .deps.basicsr.utils.registry import ARCH_REGISTRY
-    from .deps.basicsr.utils.download_util import load_file_from_url
-    # print("Successfully imported ARCH_REGISTRY and load_file_from_url from vendored basicsr.")
-except ImportError as e:
-    print(f"Error importing from vendored basicsr in utils.py: {e}")
-    # Fallback ARCH_REGISTRY if needed, though ideally the import should work
-    class DummyArchRegistry:
-        def __init__(self): self._registry = {}
-        def register(self, obj): self._registry[obj.__name__] = obj; return obj
-        def get(self, name): return self._registry.get(name)
-    ARCH_REGISTRY = DummyArchRegistry()
-    # Fallback load_file_from_url if needed
-    def load_file_from_url(url, model_dir, progress, file_name): # Simplified
-        target_path = os.path.join(model_dir, file_name if file_name else os.path.basename(url))
-        if not os.path.exists(target_path):
-            raise FileNotFoundError(f"Fallback load_file_from_url: {target_path} not found. Please download manually.")
-        return target_path
+#
+# P2.7: the swallow-and-stub fallback is gone.  A broken vendored dependency
+# must fail loudly - the dummy registry hid the missing KEEP architecture and
+# the node kept loading without it.
+from .deps.basicsr.utils.registry import ARCH_REGISTRY
+from .deps.basicsr.utils.download_util import load_file_from_url
 
 KEEP_MODEL_CONFIGS = {
     'KEEP': {
