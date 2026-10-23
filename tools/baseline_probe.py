@@ -338,6 +338,17 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
         stub_weight.write_bytes(b"stub-weight-not-a-real-checkpoint")
         original_models_dir = folder_paths.models_dir
         folder_paths.models_dir = str(models_dir)
+        # The probe must never download a weight: the stub file is not the
+        # real one (its sha256 does not match the manifest since P5.3), so
+        # the resolution would delete it and fetch ~634 MB from upstream.
+        # The resolution is therefore stubbed - the build itself stays real.
+        download_mod = sys.modules[f"{sys_module_name}.src.keep_download"]
+        original_ensure_weight = download_mod.ensure_weight
+        original_ensure_required = download_mod.ensure_required
+        download_mod.ensure_weight = lambda entry, progress=True: str(stub_weight)
+        download_mod.ensure_required = lambda entry, progress=True: str(
+            stub_weight.parent / entry.name
+        )
         try:
             loader = loader_mod.KEEPModelLoader()
             loader.load_keep_model_pack(
@@ -357,6 +368,8 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
                 "stub_weight_present": stub_weight.is_file(),
             }
         finally:
+            download_mod.ensure_weight = original_ensure_weight
+            download_mod.ensure_required = original_ensure_required
             folder_paths.models_dir = original_models_dir
 
     pip_module.main = pip_main_original

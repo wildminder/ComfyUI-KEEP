@@ -82,10 +82,21 @@ def stubbed_loader(loader_module, monkeypatch, tmp_path):
             self.kwargs = kwargs
 
     monkeypatch.setattr(loader_module, "ARCH_REGISTRY", {"KEEP": _StubArch})
+    # P5.3: the weights are resolved through the manifest downloader
     monkeypatch.setattr(
-        loader_module,
-        "load_file_from_url_comfy",
-        lambda **kwargs: str(tmp_path / "checkpoint.pth"),
+        loader_module.keep_download,
+        "ensure_weight",
+        lambda entry, progress=True: str(tmp_path / "checkpoint.pth"),
+    )
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_required",
+        lambda entry, progress=True: str(tmp_path / "checkpoint.pth"),
+    )
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_optional",
+        lambda entry, progress=True: None,
     )
     monkeypatch.setattr(
         loader_module.torch,

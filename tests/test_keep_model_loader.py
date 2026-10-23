@@ -10,7 +10,9 @@ exactly once per execute.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import os
 
 import pytest
 import torch
@@ -24,6 +26,11 @@ def loader_module():
 @pytest.fixture(scope="module")
 def node_module():
     return importlib.import_module("ComfyUI_KEEP.nodes.keep_face_upscale_image")
+
+
+@pytest.fixture(scope="module")
+def configs_module():
+    return importlib.import_module("ComfyUI_KEEP.src.keep_model_configs")
 
 
 @pytest.fixture
@@ -302,3 +309,173 @@ def test_ensure_flow_reports_a_missing_flownet(loader_module):
     net.flownet = None
     pack = loader_module.KEEPModelPack(net, _StubFaceHelper(), None, None, "KEEP")
     assert pack.ensure_flow() is False
+
+
+# ---------------------------------------------------------------------------
+# P5.3 - the fail-fast weight validation
+# ---------------------------------------------------------------------------
+PAYLOAD = b"not a real checkpoint"
+PAYLOAD_SHA256 = hashlib.sha256(PAYLOAD).hexdigest()
+
+
+@pytest.fixture
+def synthetic_manifest(loader_module, configs_module, monkeypatch):
+    """The manifest with the hash of the test payload.
+
+    The real hashes cannot be reproduced by a test, so the manifest the
+    loader and the downloader see is replaced by entries that carry the hash
+    of the payload the transport double writes.  Everything else - the
+    resolution order, the fail-fast rule, the error messages - is the
+    production code.
+    """
+    entries = tuple(
+        configs_module.WeightEntry(
+            name=entry.name,
+            url=entry.url,
+            sha256=PAYLOAD_SHA256,
+            dest_folder=entry.dest_folder,
+            subdir=entry.subdir,
+            required=entry.required,
+            available=entry.available,
+            unverified=entry.unverified,
+            sha256_prefix=entry.sha256_prefix,
+        )
+        for entry in configs_module.WEIGHT_MANIFEST
+    )
+    by_name = {entry.name: entry for entry in entries}
+    monkeypatch.setattr(loader_module, "WEIGHT_MANIFEST", entries)
+    monkeypatch.setattr(
+        loader_module,
+        "weight_entry_for",
+        lambda model_type: by_name[
+            "KEEP_Asian-4765ebe0.pth" if model_type == "Asian" else "KEEP-b76feb75.pth"
+        ],
+    )
+    monkeypatch.setattr(
+        loader_module.keep_download, "WEIGHT_MANIFEST", entries
+    )
+    return by_name
+
+
+@pytest.fixture
+def transport(monkeypatch):
+    """The transport double: it records the URLs and writes the payload."""
+    download_module = importlib.import_module("ComfyUI_KEEP.src.keep_download")
+    calls: list[str] = []
+
+    def _download(url, dst, hash_prefix=None, progress=True):
+        calls.append(url)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as handle:
+            handle.write(PAYLOAD)
+
+    monkeypatch.setattr(download_module, "download_url_to_file", _download)
+    return calls
+
+
+@pytest.fixture
+def loader(loader_module, monkeypatch, tmp_path, synthetic_manifest, transport):
+    """A loader whose model build is stubbed out (the weights are real)."""
+
+    class _StubArch:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def to(self, device):
+            return self
+
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded = state_dict
+            return self
+
+        def eval(self):
+            return self
+
+    class _StubHelper:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(loader_module, "ARCH_REGISTRY", {"KEEP": _StubArch})
+    monkeypatch.setattr(
+        loader_module.torch,
+        "load",
+        lambda *args, **kwargs: {"params_ema": {"weight": torch.zeros(1)}},
+    )
+    monkeypatch.setattr(loader_module, "_face_restore_helper", lambda: _StubHelper)
+    monkeypatch.setattr(
+        loader_module.keep_paths, "resolve_model_root", lambda *args, **kwargs: str(tmp_path)
+    )
+    return loader_module.KEEPModelLoader()
+
+
+@pytest.mark.unit
+def test_a_missing_required_weight_triggers_a_download(loader, transport):
+    """The weights are resolved (and downloaded) before the net is built."""
+    pack = loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    assert pack.keep_net is not None
+    urls = [url.rsplit("/", 1)[-1] for url in transport]
+    assert "KEEP-b76feb75.pth" in urls, urls
+    for name in (
+        "detection_Resnet50_Final.pth",
+        "detection_mobilenet0.25_Final.pth",
+        "yolov5n-face.pth",
+        "yolov5l-face.pth",
+        "parsing_parsenet.pth",
+    ):
+        assert name in urls, (name, urls)
+
+
+@pytest.mark.unit
+def test_a_failed_download_raises_the_actionable_message(
+    loader_module, loader, monkeypatch, transport
+):
+    """A missing required weight names the file, the path and the URL."""
+    download_module = importlib.import_module("ComfyUI_KEEP.src.keep_download")
+
+    def _fail(url, dst, hash_prefix=None, progress=True):
+        raise RuntimeError("the server is not reachable")
+
+    monkeypatch.setattr(download_module, "download_url_to_file", _fail)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    message = str(excinfo.value)
+    assert "KEEP-b76feb75.pth" in message
+    assert "https://github.com/jnjaby/KEEP/releases/download/v1.0.0/KEEP-b76feb75.pth" in message
+    assert "keep_models" in message and "KEEP" in message
+
+
+@pytest.mark.unit
+def test_the_optional_gmflow_weight_is_not_resolved_at_pack_construction(
+    loader, transport
+):
+    """The GMFlow checkpoint is deferred to ``ensure_flow()``."""
+    loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    urls = [url.rsplit("/", 1)[-1] for url in transport]
+    assert "gmflow_sintel-0c07dcb3.pth" not in urls, urls
+
+
+@pytest.mark.unit
+def test_the_unavailable_asian_entry_does_not_break_the_default_pack(loader, transport):
+    """The Asian checkpoint is not required - the default pack still builds."""
+    pack = loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    assert pack is not None
+    urls = [url.rsplit("/", 1)[-1] for url in transport]
+    assert "KEEP_Asian-4765ebe0.pth" not in urls, urls
+
+
+@pytest.mark.unit
+def test_selecting_the_asian_model_raises_an_actionable_error(loader):
+    """The Asian checkpoint is not published upstream (HTTP 404)."""
+    with pytest.raises(FileNotFoundError) as excinfo:
+        loader.load_keep_model_pack("Asian", "retinaface_resnet50")
+
+    message = str(excinfo.value)
+    assert "KEEP_Asian-4765ebe0.pth" in message
+    assert "not published upstream" in message
+    assert "KEEP_Asian-4765ebe0.pth" in message
+    assert "keep_models" in message

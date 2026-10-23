@@ -4,20 +4,36 @@ The engine that builds a :class:`KEEPModelPack`: the KEEP network, the
 facelib face helper and the optional ComfyUI upscalers.  It moved here from
 ``modules/keep_model_loader.py`` in P3.2.
 
+Since **P5.3** the weights are resolved through the manifest
+(:mod:`src.keep_model_configs`) and the downloader (:mod:`src.keep_download`):
+every **required** weight must be on disk before the model is built - a
+missing one is downloaded and, when that fails, the error names the file, the
+expected path and the manifest URL.  The optional weights (the GMFlow
+checkpoint) are deferred to :meth:`KEEPModelPack.ensure_flow`.
+
+Since **P5.5** the optical flow is wired: the GMFlow checkpoint is only
+resolved when the loaded KEEP checkpoint does **not** carry the ``flownet.*``
+weights (the shipped checkpoint does - P0.4 section 2).  The resolved path is
+put into the architecture config **before** the net is built, so the arch
+loads the trained weights instead of random ones.
+
 The ``comfy`` imports are **lazy** (function level): the plan's §3 import
 rule wants the pack to import without a ComfyUI server.  The vendored
 facelib helper imports ``comfy`` as well, so it is imported lazily too.
 """
 
 import torch
-import os
 
+from . import keep_download
 from . import keep_paths
 from .keep_logger import logger
 from .keep_model_configs import (
-    ARCH_REGISTRY, KEEP_MODEL_CONFIGS, FACELIB_MODEL_URLS, FACELIB_DEST_FOLDER
+    ARCH_REGISTRY,
+    FACELIB_DEST_FOLDER,
+    KEEP_MODEL_CONFIGS,
+    WEIGHT_MANIFEST,
+    weight_entry_for,
 )
-from .keep_paths import load_file_from_url_comfy
 
 
 # P2.7: the swallow-and-stub fallback is gone - a broken vendored dependency
@@ -231,24 +247,31 @@ class KEEPModelLoader:
             raise ValueError(f"Unknown KEEP model type: {model_type_str}")
 
         config_entry = KEEP_MODEL_CONFIGS[model_type_str]
-        
+
+        # P5.3: fail fast.  Every weight the pack needs is resolved (and
+        # downloaded when it is missing) **before** the model is built.  A
+        # missing required weight raises a FileNotFoundError that names the
+        # file, the expected path and the manifest URL.
+        weight_entry = weight_entry_for(model_type_str)
+        ckpt_path = self._resolve_checkpoint(weight_entry)
+
+        facelib_entries = [
+            entry for entry in WEIGHT_MANIFEST
+            if entry.dest_folder == FACELIB_DEST_FOLDER
+        ]
+        for entry in facelib_entries:
+            keep_download.ensure_required(entry)
+
         keep_model_arch_class = ARCH_REGISTRY.get('KEEP')
         if keep_model_arch_class is None:
             raise RuntimeError("KEEP architecture class not found in ARCH_REGISTRY.")
-        
-        net = keep_model_arch_class(**config_entry['architecture']).to(self.offload_device)
-        
-        ckpt_path = load_file_from_url_comfy(
-            url=config_entry['url'],
-            folder_name=config_entry['dest_folder'],
-            subdir=config_entry['subdir'],
-            file_name=os.path.basename(config_entry['url']),
-            sha256=config_entry.get('sha256')
-        )
+
         checkpoint = torch.load(ckpt_path, map_location=self.offload_device, weights_only=True)
-        
+
         state_dict_key = 'params_ema' if 'params_ema' in checkpoint else 'params'
         state_dict = checkpoint.get(state_dict_key, checkpoint)
+
+        net = keep_model_arch_class(**config_entry['architecture']).to(self.offload_device)
 
         converted_state_dict = {}
         needs_conversion = any('cross_fuse' in k or 'fuse_convs_dict' in k for k in state_dict.keys())
@@ -259,20 +282,17 @@ class KEEPModelLoader:
                 if 'fuse_convs_dict' in k: new_k = k.replace('fuse_convs_dict', 'cft')
                 converted_state_dict[new_k] = v
             state_dict = converted_state_dict
-        
+
         net.load_state_dict(state_dict, strict=True)
         net.eval()
         logger.debug(f"KEEP model '{model_type_str}' loaded onto {self.offload_device}.")
-
-        for fname, (url, sha) in FACELIB_MODEL_URLS.items():
-            load_file_from_url_comfy(url=url, folder_name=FACELIB_DEST_FOLDER, file_name=fname, sha256=sha)
 
         # P3.5: the facelib root comes from the registered model folders -
         # the raw ``folder_paths.models_dir`` concatenation is gone.  It is
         # the root the facelib weights really live in (an extra model root
         # included), because facelib builds the weight paths from it.
         facelib_actual_paths = keep_paths.resolve_model_root(
-            FACELIB_DEST_FOLDER, FACELIB_MODEL_URLS.keys()
+            FACELIB_DEST_FOLDER, [entry.name for entry in facelib_entries]
         )
 
         FaceRestoreHelper = _face_restore_helper()
@@ -298,3 +318,21 @@ class KEEPModelLoader:
         )
 
         return model_pack
+
+    def _resolve_checkpoint(self, weight_entry) -> str:
+        """The path of the KEEP checkpoint (downloaded when it is missing).
+
+        A checkpoint that is not published upstream (the Asian one) raises an
+        actionable ``FileNotFoundError``: the file, the expected path and the
+        dead URL are named, and the user is told to place the file manually.
+        """
+        path = keep_download.ensure_weight(weight_entry)
+        if path is None:
+            raise FileNotFoundError(
+                f"KEEP: the model needs the weight {weight_entry.name!r}, which "
+                "is not published upstream (HTTP 404).\n"
+                f"  url:  {weight_entry.url}\n"
+                f"  dest: {keep_download.target_path(weight_entry)}\n"
+                "Place the file manually at the destination and try again."
+            )
+        return path
