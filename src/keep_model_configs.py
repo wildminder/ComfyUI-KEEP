@@ -1,19 +1,13 @@
 """The model configurations of the KEEP pack (P3.2).
 
 The config half of the old ``modules/utils.py``: the architecture configs of
-the two KEEP checkpoints, the facelib weight list and the download helper.
-The image half moved to ``src/keep_image_utils.py``.
+the two KEEP checkpoints and the facelib weight list.  The image half moved
+to ``src/keep_image_utils.py``, the download helper to ``src/keep_paths.py``.
 
-P5.1 turns the config table into the ``WEIGHT_MANIFEST`` (with the
-``dest_folder`` / ``subdir`` fields) and P5.2 moves the download helper into
-``src/keep_download.py``; until then this module owns both.
+P5.1 turns the config table into the ``WEIGHT_MANIFEST`` (the ``dest_folder``
+/ ``subdir`` fields are already in place since P3.5) and P5.2 moves the
+download helper into ``src/keep_download.py``.
 """
-
-import hashlib
-import os
-
-import folder_paths
-from torch.hub import download_url_to_file
 
 from .keep_logger import logger
 
@@ -44,7 +38,7 @@ KEEP_MODEL_CONFIGS = {
             'temp_reg_list': ['32'], # From stage3_KEEP.yml (network_g)
         },
         'url': 'https://github.com/jnjaby/KEEP/releases/download/v1.0.0/KEEP-b76feb75.pth',
-        'dest_dir': 'keep_models/KEEP'
+        'dest_folder': 'keep_models', 'subdir': 'KEEP'
     },
     'Asian': {
         'architecture': {
@@ -60,7 +54,7 @@ KEEP_MODEL_CONFIGS = {
             'temp_reg_list': [], # Check if Asian model uses temp_reg_list
         },
         'url': 'https://github.com/jnjaby/KEEP/releases/download/v1.0.0/KEEP_Asian-4765ebe0.pth',
-        'dest_dir': 'keep_models/KEEP'
+        'dest_folder': 'keep_models', 'subdir': 'KEEP'
     }
 }
 
@@ -87,58 +81,4 @@ FACELIB_MODEL_URLS = {
     'yolov5l-face.pth': ('https://github.com/jnjaby/KEEP/releases/download/v1.0.0/yolov5l-face.pth', None),
     'parsing_parsenet.pth': ('https://github.com/jnjaby/KEEP/releases/download/v1.0.0/parsing_parsenet.pth', None),
 }
-FACELIB_DEST_DIR = 'facedetection'
-
-def load_file_from_url_comfy(url, model_dir_name, progress=True, file_name=None, sha256=None):
-    """
-    `model_dir_name` is a category like 'upscale_models', 'facedetection', etc.
-    """
-    if file_name is None:
-        file_name = os.path.basename(url)
-        if '?' in file_name:
-            file_name = file_name.split('?')[0]
-
-    destination_dir_paths = [os.path.join(folder_paths.models_dir, model_dir_name)]
-    
-    if not destination_dir_paths:
-        # If category not found, default to ComfyUI/models/<model_dir_name>
-        destination_dir = os.path.join(folder_paths.models_dir, model_dir_name)
-        # print(f"Warning: Model directory type '{model_dir_name}' not in folder_paths. Using default: {destination_dir}")
-    else:
-        # Use the first path
-        destination_dir = destination_dir_paths[0]
-
-    os.makedirs(destination_dir, exist_ok=True)
-    cached_file = os.path.join(destination_dir, file_name)
-
-    if os.path.exists(cached_file) and sha256:
-        with open(cached_file, "rb") as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()
-        if file_hash == sha256:
-            logger.debug(f"File {file_name} already exists and hash matches. Skipping download.")
-            return cached_file
-        else:
-            logger.warning(f"File {file_name} exists but hash mismatch. Redownloading.")
-    elif os.path.exists(cached_file) and not sha256:
-        logger.debug(f"File {file_name} already exists. Skipping download (no hash check).")
-        return cached_file
-
-    logger.info(f'Downloading: "{file_name}" from {url} to {cached_file}')
-    
-    try:
-        download_url_to_file(url, cached_file, hash_prefix=None, progress=progress)
-    except Exception as e:
-        logger.error(f"Error downloading {url} using torch.hub.download_url_to_file: {e}")
-        if os.path.exists(cached_file):
-            os.remove(cached_file)
-        raise
-
-    if sha256:
-        with open(cached_file, "rb") as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()
-        if file_hash != sha256:
-            if os.path.exists(cached_file):
-                os.remove(cached_file)
-            raise ValueError(f"Downloaded file {file_name} hash mismatch. Expected {sha256}, got {file_hash}.")
-    
-    return cached_file
+FACELIB_DEST_FOLDER = 'facedetection'

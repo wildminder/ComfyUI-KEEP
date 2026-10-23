@@ -8,13 +8,13 @@ facelib face helper and the optional ComfyUI upscalers.  It moved here from
 import torch
 import os
 from comfy import model_management
-import folder_paths
 
+from . import keep_paths
 from .keep_logger import logger
 from .keep_model_configs import (
-    load_file_from_url_comfy, ARCH_REGISTRY,
-    KEEP_MODEL_CONFIGS, FACELIB_MODEL_URLS, FACELIB_DEST_DIR
+    ARCH_REGISTRY, KEEP_MODEL_CONFIGS, FACELIB_MODEL_URLS, FACELIB_DEST_FOLDER
 )
+from .keep_paths import load_file_from_url_comfy
 
 # P2.7: the swallow-and-stub fallback is gone - a broken vendored dependency
 # must fail loudly instead of silently producing an unusable model pack.
@@ -106,7 +106,8 @@ class KEEPModelLoader:
         
         ckpt_path = load_file_from_url_comfy(
             url=config_entry['url'],
-            model_dir_name=config_entry['dest_dir'],
+            folder_name=config_entry['dest_folder'],
+            subdir=config_entry['subdir'],
             file_name=os.path.basename(config_entry['url']),
             sha256=config_entry.get('sha256')
         )
@@ -130,10 +131,11 @@ class KEEPModelLoader:
         logger.debug(f"KEEP model '{model_type_str}' loaded onto {self.offload_device}.")
 
         for fname, (url, sha) in FACELIB_MODEL_URLS.items():
-            load_file_from_url_comfy(url=url, model_dir_name=FACELIB_DEST_DIR, file_name=fname, sha256=sha)
-        
-        facelib_actual_paths = os.path.join(folder_paths.models_dir, FACELIB_DEST_DIR)
-        os.makedirs(facelib_actual_paths, exist_ok=True)
+            load_file_from_url_comfy(url=url, folder_name=FACELIB_DEST_FOLDER, file_name=fname, sha256=sha)
+
+        # P3.5: the facelib root comes from the registered model folders -
+        # the raw ``folder_paths.models_dir`` concatenation is gone.
+        facelib_actual_paths = keep_paths.get_primary_folder(FACELIB_DEST_FOLDER)
         
         try:
             face_helper = FaceRestoreHelper(

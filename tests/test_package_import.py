@@ -36,12 +36,12 @@ PACK_NODE_IDS = [
 #: The probe: it registers the package the way ComfyUI does (the root
 #: ``__init__.py`` is executed under an alias) and reports the result.
 _HEADLESS_PROBE = """
-import json, sys
+import json, os, sys
 
 comfyui_root, repo_root = sys.argv[1], sys.argv[2]
 sys.path.insert(0, comfyui_root)
 sys.path.insert(0, repo_root)
-sys.path.insert(0, repo_root / "tests")
+sys.path.insert(0, os.path.join(repo_root, "tests"))
 
 import _headless
 

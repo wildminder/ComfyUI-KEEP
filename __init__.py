@@ -7,10 +7,12 @@ the same either way).
 """
 
 from .src.keep_logger import logger
+from .src import keep_paths
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-# The model folders are registered with ComfyUI's ``folder_paths`` in P3.5
-# (``src/keep_paths.py``); the registration is wired into this entry point
-# there.
+# P3.5: the model folders of the pack (``keep_models``, ``facedetection`` and
+# ``gmflow``) are registered with ComfyUI's ``folder_paths``, so every weight
+# path is resolved by the host.
+keep_paths.register_model_folders()
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "logger"]
