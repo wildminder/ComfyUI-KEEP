@@ -12,6 +12,7 @@ gate runs without environment variables).
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -78,6 +79,19 @@ def _comfyui_root() -> str:
             "(folder_paths.py is missing)"
         )
     return str(root.resolve())
+
+
+@pytest.mark.mock_integration
+def test_the_package_imports_for_real_under_the_mocks():
+    """P3.6: the package imports for real under the mocks - no exception.
+
+    This is the strict version of the import smoke test: the root
+    ``__init__.py`` is executed and the three node mappings are exported.
+    """
+    conftest = importlib.import_module("conftest")
+    package = conftest.execute_package_init()
+    assert sorted(package.NODE_CLASS_MAPPINGS) == PACK_NODE_IDS
+    assert sorted(package.NODE_DISPLAY_NAME_MAPPINGS) == PACK_NODE_IDS
 
 
 @pytest.mark.headless
