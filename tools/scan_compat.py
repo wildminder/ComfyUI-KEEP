@@ -3,16 +3,16 @@
 Walks the **runtime import closure** of the current package and greps every
 file in it for Python 3.13 / numpy 2 incompatibilities.
 
-Entry points (plan P0.3):
+Entry points (plan P0.3; moved to ``src/`` by P3.2):
 
-    modules/utils.py
-    modules/keep_model_loader.py
-    modules/keep_processor.py
+    src/keep_model_configs.py
+    src/keep_model_loader.py
+    src/keep_processor.py
 
 The closure is computed with a static import tracer:
 
 * absolute imports of ``basicsr`` / ``facelib`` resolve into ``modules/deps``
-  (that is where ``modules/utils.py:16-19`` puts them on ``sys.path``);
+  (the vendored tree lives there since P2.5);
 * relative imports resolve inside the current package;
 * importing a package also imports its parent packages' ``__init__.py``;
 * the **eager folder scans** of the vendored ``basicsr`` packages are dynamic
@@ -45,13 +45,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPS_DIR = REPO_ROOT / "modules" / "deps"
 
 ENTRY_POINTS = (
-    "modules/utils.py",
-    "modules/keep_model_loader.py",
-    "modules/keep_processor.py",
+    "src/keep_model_configs.py",
+    "src/keep_model_loader.py",
+    "src/keep_processor.py",
 )
 
 #: Top-level packages that are vendored and therefore resolved inside
-#: ``modules/deps`` (they are put on ``sys.path`` by ``modules/utils.py``).
+#: ``modules/deps`` (the vendored tree is part of the node package since
+#: P2.5 - it is never put on ``sys.path``).
 VENDORED_ROOTS = ("basicsr", "facelib")
 
 #: The vendored ``basicsr`` packages whose ``__init__.py`` scans its own folder

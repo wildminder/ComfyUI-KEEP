@@ -12,7 +12,7 @@ guard  what it checks                                  flip owner
 ===== ================================================ ==================
 (a)    every class under ``nodes/*.py`` is exported     **P3.1** (flipped)
        from ``nodes/__init__.py``
-(b)    ``src/**`` contains no ``io.Schema(`` /           **P3.2**
+(b)    ``src/**`` contains no ``io.Schema(`` /           **P3.2** (flipped)
        ``define_schema``
 (c)    the root ``__init__.py`` exposes exactly          **P4.4**
        ``comfy_entrypoint`` (no V1 mapping names)
@@ -231,11 +231,8 @@ def test_guard_nodes_classes_are_exported():
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=False,
-    reason="flip owner: P3.2 - src/ must not contain node schemas",
-)
 def test_guard_src_has_no_schema():
+    """Guard (b) - flipped to strict in P3.2 (its flip owner)."""
     assert src_schema_violations(REPO_ROOT) == []
 
 
@@ -354,7 +351,7 @@ def test_self_test_guard_c_detects_a_v1_entrypoint(repo_copy):
 
 @pytest.mark.unit
 def test_self_test_guard_d_detects_a_sys_path_mutation(repo_copy):
-    utils_file = repo_copy / "modules" / "utils.py"
+    utils_file = repo_copy / "src" / "keep_model_configs.py"
     text = utils_file.read_text(encoding="utf-8")
     cleaned = "\n".join(
         line for line in text.splitlines() if "sys.path.insert" not in line

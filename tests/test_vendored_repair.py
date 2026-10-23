@@ -483,8 +483,8 @@ def test_the_processor_and_loader_use_the_vendored_classes():
     """P2.5 (c): the real vendored symbols - not stubs."""
     import importlib
 
-    processor = importlib.import_module("ComfyUI_KEEP.modules.keep_processor")
-    loader = importlib.import_module("ComfyUI_KEEP.modules.keep_model_loader")
+    processor = importlib.import_module("ComfyUI_KEEP.src.keep_processor")
+    loader = importlib.import_module("ComfyUI_KEEP.src.keep_model_loader")
     assert processor.img2tensor.__module__.startswith(f"{VENDORED}.basicsr")
     assert processor.tensor2img.__module__.startswith(f"{VENDORED}.basicsr")
     assert processor.is_gray.__module__.startswith(f"{VENDORED}.facelib")
@@ -500,9 +500,9 @@ def test_importing_the_package_does_not_change_sys_path():
         "sys.path.insert(0, root)\n"
         "import conftest\n"
         "before = list(sys.path)\n"
-        "import ComfyUI_KEEP.modules.utils\n"
-        "import ComfyUI_KEEP.modules.keep_processor\n"
-        "import ComfyUI_KEEP.modules.keep_model_loader\n"
+        "import ComfyUI_KEEP.src.keep_model_configs\n"
+        "import ComfyUI_KEEP.src.keep_processor\n"
+        "import ComfyUI_KEEP.src.keep_model_loader\n"
         "print('KEEP_SYS_PATH_SAME', before == sys.path)\n"
     )
     result = _run_python(code, str(REPO_ROOT))
@@ -536,6 +536,11 @@ _HOST_MODULES = ("comfy", "comfy_api", "folder_paths")
 
 #: The vendored packages - imported relatively (P2.5), never a dependency.
 _VENDORED_MODULES = ("basicsr", "facelib")
+
+#: The pack's own top-level packages - they are part of this repository, not
+#: a distribution.  ``modules`` shows up in the closure through the flat
+#: import fallback of the dual-mode imports (``from modules.deps...``).
+_OWN_PACKAGES = ("modules", "src", "nodes")
 
 #: The third-party modules the closure imports **lazily** (inside a
 #: function).  They are not runtime dependencies of the node, so they are not
@@ -668,7 +673,10 @@ def _closure_third_party_imports() -> tuple[set[str], set[str]]:
     """
     collector = _closure_import_collector()
     excluded = (
-        set(sys.stdlib_module_names) | set(_VENDORED_MODULES) | set(_HOST_MODULES)
+        set(sys.stdlib_module_names)
+        | set(_VENDORED_MODULES)
+        | set(_OWN_PACKAGES)
+        | set(_HOST_MODULES)
     )
     module_level = collector.module_level - excluded
     lazy = (collector.lazy - excluded) - module_level
@@ -747,7 +755,7 @@ root = sys.argv[1]
 sys.path.insert(0, root)
 import conftest  # registers the package alias and the ComfyUI mocks
 
-import ComfyUI_KEEP.modules.utils
+import ComfyUI_KEEP.src.keep_model_configs
 print("KEEP_IMPORT_OK")
 """
 
@@ -757,9 +765,9 @@ def test_the_stub_sites_yield_the_real_vendored_symbols():
     """P2.7 (a): every former stub site resolves to the vendored symbol."""
     import importlib
 
-    utils = importlib.import_module("ComfyUI_KEEP.modules.utils")
-    processor = importlib.import_module("ComfyUI_KEEP.modules.keep_processor")
-    loader = importlib.import_module("ComfyUI_KEEP.modules.keep_model_loader")
+    utils = importlib.import_module("ComfyUI_KEEP.src.keep_model_configs")
+    processor = importlib.import_module("ComfyUI_KEEP.src.keep_processor")
+    loader = importlib.import_module("ComfyUI_KEEP.src.keep_model_loader")
 
     assert utils.ARCH_REGISTRY.__module__.endswith(
         ".modules.deps.basicsr.utils.registry"
@@ -793,7 +801,7 @@ def test_the_dead_video_path_references_no_deleted_symbol():
     the raise and nothing else (the AST is checked, so the docstrings that
     *mention* the deleted symbols are not offenders).
     """
-    source = (REPO_ROOT / "modules" / "keep_processor.py").read_text(
+    source = (REPO_ROOT / "src" / "keep_processor.py").read_text(
         encoding="utf-8"
     )
     tree = ast.parse(source)

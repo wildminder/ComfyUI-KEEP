@@ -9,14 +9,13 @@ import torch
 import traceback
 
 try:  # the package import (ComfyUI loads the node package)
-    from ..modules.keep_model_loader import KEEPModelPack
-    from ..modules.keep_processor import KEEPFaceProcessor
-    from .. import logger
+    from ..src.keep_model_loader import KEEPModelPack
+    from ..src.keep_processor import KEEPFaceProcessor
+    from ..src.keep_logger import logger
 except ImportError:  # the flat import (the repository root on sys.path)
-    from modules.keep_model_loader import KEEPModelPack
-    from modules.keep_processor import KEEPFaceProcessor
-    import logging
-    logger = logging.getLogger("ComfyUI-KEEP")
+    from src.keep_model_loader import KEEPModelPack
+    from src.keep_processor import KEEPFaceProcessor
+    from src.keep_logger import logger
 
 
 class KEEP_ProcessImageSequenceNode:

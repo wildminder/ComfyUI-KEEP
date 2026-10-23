@@ -1,17 +1,27 @@
+"""The model loader of the KEEP pack (P3.2).
+
+The engine that builds a :class:`KEEPModelPack`: the KEEP network, the
+facelib face helper and the optional ComfyUI upscalers.  It moved here from
+``modules/keep_model_loader.py`` in P3.2.
+"""
+
 import torch
 import os
 from comfy import model_management
-import folder_paths 
+import folder_paths
 
-from .. import logger # Import from parent __init__.py
-from .utils import (
+from .keep_logger import logger
+from .keep_model_configs import (
     load_file_from_url_comfy, ARCH_REGISTRY,
     KEEP_MODEL_CONFIGS, FACELIB_MODEL_URLS, FACELIB_DEST_DIR
 )
 
 # P2.7: the swallow-and-stub fallback is gone - a broken vendored dependency
 # must fail loudly instead of silently producing an unusable model pack.
-from .deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
+try:  # the package import (the node package is the parent package)
+    from ..modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
+except ImportError:  # the flat import (the repository root on sys.path)
+    from modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
 
 class KEEPModelPack:
     def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model, model_type_str):

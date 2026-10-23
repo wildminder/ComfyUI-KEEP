@@ -35,9 +35,10 @@ PRODUCTION_FILES = (
     REPO_ROOT / "nodes" / "keep_model_loader.py",
     REPO_ROOT / "nodes" / "keep_face_upscale_image.py",
     REPO_ROOT / "nodes" / "keep_process_image_sequence.py",
-    REPO_ROOT / "modules" / "utils.py",
-    REPO_ROOT / "modules" / "keep_model_loader.py",
-    REPO_ROOT / "modules" / "keep_processor.py",
+    REPO_ROOT / "src" / "keep_model_configs.py",
+    REPO_ROOT / "src" / "keep_model_loader.py",
+    REPO_ROOT / "src" / "keep_processor.py",
+    REPO_ROOT / "src" / "keep_image_utils.py",
 )
 
 #: Symbols the mocks imitate (plan section 6, mock-fidelity tripwires).

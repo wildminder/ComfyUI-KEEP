@@ -186,9 +186,9 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
         pip_module.main = pip_main_original
         return report
 
-    utils_mod = sys.modules[f"{sys_module_name}.modules.utils"]
-    loader_mod = sys.modules[f"{sys_module_name}.modules.keep_model_loader"]
-    processor_mod = sys.modules[f"{sys_module_name}.modules.keep_processor"]
+    utils_mod = sys.modules[f"{sys_module_name}.src.keep_model_configs"]
+    loader_mod = sys.modules[f"{sys_module_name}.src.keep_model_loader"]
+    processor_mod = sys.modules[f"{sys_module_name}.src.keep_processor"]
 
     # ------------------------------------------------------------------
     # 2. which swallow-and-stub block swallowed which failure (B9)

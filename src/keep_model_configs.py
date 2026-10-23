@@ -1,23 +1,33 @@
-import os
-import torch
-import numpy as np
-import cv2
-from PIL import Image
-import folder_paths
-from comfy.utils import ProgressBar
-from urllib.request import urlopen, Request
-import hashlib
-from torch.hub import download_url_to_file, get_dir
+"""The model configurations of the KEEP pack (P3.2).
 
-from .. import logger
+The config half of the old ``modules/utils.py``: the architecture configs of
+the two KEEP checkpoints, the facelib weight list and the download helper.
+The image half moved to ``src/keep_image_utils.py``.
+
+P5.1 turns the config table into the ``WEIGHT_MANIFEST`` (with the
+``dest_folder`` / ``subdir`` fields) and P5.2 moves the download helper into
+``src/keep_download.py``; until then this module owns both.
+"""
+
+import hashlib
+import os
+
+import folder_paths
+from torch.hub import download_url_to_file
+
+from .keep_logger import logger
 
 # directly import from the vendored basicsr
 #
 # P2.7: the swallow-and-stub fallback is gone.  A broken vendored dependency
 # must fail loudly - the dummy registry hid the missing KEEP architecture and
 # the node kept loading without it.
-from .deps.basicsr.utils.registry import ARCH_REGISTRY
-from .deps.basicsr.utils.download_util import load_file_from_url
+try:  # the package import (the node package is the parent package)
+    from ..modules.deps.basicsr.utils.registry import ARCH_REGISTRY
+    from ..modules.deps.basicsr.utils.download_util import load_file_from_url
+except ImportError:  # the flat import (the repository root on sys.path)
+    from modules.deps.basicsr.utils.registry import ARCH_REGISTRY
+    from modules.deps.basicsr.utils.download_util import load_file_from_url
 
 KEEP_MODEL_CONFIGS = {
     'KEEP': {
@@ -132,16 +142,3 @@ def load_file_from_url_comfy(url, model_dir_name, progress=True, file_name=None,
             raise ValueError(f"Downloaded file {file_name} hash mismatch. Expected {sha256}, got {file_hash}.")
     
     return cached_file
-
-def comfy_image_to_cv2(comfy_image: torch.Tensor) -> np.ndarray:
-    if comfy_image.ndim == 3: comfy_image = comfy_image.unsqueeze(0)
-    img_np = comfy_image.cpu().numpy()
-    img_np = (img_np.squeeze(0) * 255).astype(np.uint8)
-    img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    return img_cv2
-
-def cv2_to_comfy_image(cv2_image: np.ndarray) -> torch.Tensor:
-    img_rgb = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
-    img_np = img_rgb.astype(np.float32) / 255.0
-    comfy_image = torch.from_numpy(img_np).unsqueeze(0)
-    return comfy_image

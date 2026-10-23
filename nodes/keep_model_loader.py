@@ -10,11 +10,11 @@ module (the repository root on ``sys.path``).
 """
 
 try:  # the package import (ComfyUI loads the node package)
-    from ..modules.utils import KEEP_MODEL_CONFIGS
-    from ..modules.keep_model_loader import KEEPModelLoader
+    from ..src.keep_model_configs import KEEP_MODEL_CONFIGS
+    from ..src.keep_model_loader import KEEPModelLoader
 except ImportError:  # the flat import (the repository root on sys.path)
-    from modules.utils import KEEP_MODEL_CONFIGS
-    from modules.keep_model_loader import KEEPModelLoader
+    from src.keep_model_configs import KEEP_MODEL_CONFIGS
+    from src.keep_model_loader import KEEPModelLoader
 
 GLOBAL_KEEP_MODEL_LOADER = None
 

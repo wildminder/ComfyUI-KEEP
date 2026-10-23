@@ -24,16 +24,26 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_DIR = REPO_ROOT / "modules"
-UTILS_FILE = PACKAGE_DIR / "utils.py"
+SRC_DIR = REPO_ROOT / "src"
+NODES_DIR = REPO_ROOT / "nodes"
+UTILS_FILE = SRC_DIR / "keep_model_configs.py"
 AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-dependency-decisions.md"
 
 EXPECTED_DIFFUSERS_SYMBOLS = {"FeedForward", "AdaLayerNorm"}
 
 
+def _package_files() -> list[Path]:
+    """Every production python file of the pack (P3.2 layout)."""
+    files: list[Path] = []
+    for directory in (PACKAGE_DIR, SRC_DIR, NODES_DIR):
+        files.extend(sorted(directory.rglob("*.py")))
+    return files
+
+
 def _diffusers_imports() -> list[tuple[str, int, set[str]]]:
     """Every diffusers import in the package: (file, line, imported names)."""
     found = []
-    for path in sorted(PACKAGE_DIR.rglob("*.py")):
+    for path in _package_files():
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         except (SyntaxError, UnicodeDecodeError):
@@ -54,62 +64,16 @@ def _diffusers_imports() -> list[tuple[str, int, set[str]]]:
 
 @pytest.fixture(scope="module")
 def utils_module():
-    """Execute ``modules/utils.py`` the way the package does.
+    """The model configs of the package, imported the way the package does.
 
-    The module needs two ComfyUI symbols (``folder_paths`` and
-    ``comfy.utils.ProgressBar``) and the parent package's ``logger``.  Only
-    those *ComfyUI* seams are stubbed - the vendored dependencies are **not**,
-    so the real ``from re import T`` failure still happens and the real
-    fallback behaviour is observed.
+    Since P3.2 the configs live in ``src/keep_model_configs.py``; the module
+    is imported through the package alias, so the *real* module is observed
+    (the ComfyUI seams - ``folder_paths`` and ``comfy.utils`` - are the ones
+    of the root conftest's mocks).
     """
-    saved_path = list(sys.path)
-    saved_modules = dict(sys.modules)
+    import importlib
 
-    folder_paths = types.ModuleType("folder_paths")
-    folder_paths.models_dir = str(REPO_ROOT / "models")
-    comfy = types.ModuleType("comfy")
-    comfy_utils = types.ModuleType("comfy.utils")
-
-    class ProgressBar:  # minimal stand-in for comfy.utils.ProgressBar
-        def __init__(self, total=None):
-            self.total = total
-
-        def update(self, value=1):
-            return None
-
-    comfy_utils.ProgressBar = ProgressBar
-    comfy.utils = comfy_utils
-
-    parent_name = "keep_p0_probe"
-    parent = types.ModuleType(parent_name)
-    parent.__path__ = [str(REPO_ROOT)]  # type: ignore[attr-defined]
-    parent.logger = logging.getLogger(parent_name)
-
-    package_name = f"{parent_name}.modules"
-    package = types.ModuleType(package_name)
-    package.__path__ = [str(PACKAGE_DIR)]  # type: ignore[attr-defined]
-
-    child_name = f"{package_name}.utils"
-    child = types.ModuleType(child_name)
-    child.__file__ = str(UTILS_FILE)
-    child.__package__ = package_name
-    child.__path__ = [str(PACKAGE_DIR)]  # type: ignore[attr-defined]
-
-    sys.modules["folder_paths"] = folder_paths
-    sys.modules["comfy"] = comfy
-    sys.modules["comfy.utils"] = comfy_utils
-    sys.modules[parent_name] = parent
-    sys.modules[package_name] = package
-    sys.modules[child_name] = child
-
-    try:
-        source = UTILS_FILE.read_text(encoding="utf-8")
-        exec(compile(source, str(UTILS_FILE), "exec"), child.__dict__)
-        yield child
-    finally:
-        sys.path[:] = saved_path
-        sys.modules.clear()
-        sys.modules.update(saved_modules)
+    return importlib.import_module("ComfyUI_KEEP.src.keep_model_configs")
 
 
 @pytest.mark.unit
@@ -166,7 +130,7 @@ def test_audit_doc_records_the_diffusers_decision():
 @pytest.mark.xfail(
     strict=False,
     reason=(
-        "flownet_path is not wired yet (modules/utils.py sets it to None) - "
+        "flownet_path is not wired yet (src/keep_model_configs.py sets it to None) - "
         "flip owner: P5.5, which resolves the GMFlow manifest entry and sets "
         "architecture['flownet_path'] before the arch is built"
     ),

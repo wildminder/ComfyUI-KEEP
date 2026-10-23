@@ -1,3 +1,10 @@
+"""The face processor of the KEEP pack (P3.2).
+
+The engine that detects, aligns, restores and pastes the faces of an image
+or an image sequence.  It moved here from ``modules/keep_processor.py`` in
+P3.2.
+"""
+
 import torch
 import cv2
 import numpy as np
@@ -5,7 +12,7 @@ from scipy.ndimage import gaussian_filter1d
 from torchvision.transforms.functional import normalize
 import os
 from tqdm import tqdm # Import tqdm for console progress bars
-from .utils import comfy_image_to_cv2, cv2_to_comfy_image
+from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
 from comfy.utils import ProgressBar, tiled_scale
 
 # Imports from vendored basicsr and facelib
@@ -23,8 +30,12 @@ from comfy.utils import ProgressBar, tiled_scale
 #
 # P2.7: the dummy image helpers are gone - a broken vendored dependency must
 # fail loudly instead of returning ``None`` images.
-from .deps.basicsr.utils.img_util import img2tensor, tensor2img
-from .deps.facelib.utils.misc import is_gray
+try:  # the package import (the node package is the parent package)
+    from ..modules.deps.basicsr.utils.img_util import img2tensor, tensor2img
+    from ..modules.deps.facelib.utils.misc import is_gray
+except ImportError:  # the flat import (the repository root on sys.path)
+    from modules.deps.basicsr.utils.img_util import img2tensor, tensor2img
+    from modules.deps.facelib.utils.misc import is_gray
 
 
 def interpolate_sequence(sequence):
