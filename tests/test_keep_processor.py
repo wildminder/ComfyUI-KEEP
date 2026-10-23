@@ -161,3 +161,27 @@ def test_without_an_upscaler_the_image_is_untouched(processor_module):
     )
     image = np.full((4, 4, 3), 7, dtype=np.uint8)
     assert processor._run_upscaler(None, image) is image
+
+
+@pytest.mark.unit
+def test_thirty_frames_are_split_into_clips_of_twenty(processor_module):
+    """The chunk math of the sequence path for 30 frames / ``max_clip_length=20``."""
+    keep_net = _StubKeepNet()
+    face_helper = _StubFaceHelper()
+    processor = processor_module.KEEPFaceProcessor(_make_pack(keep_net, face_helper))
+
+    frames = torch.rand((30, 16, 16, 3), dtype=torch.float32)
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=True,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    # 30 frames, clips of 20 -> one call of 20 frames and one of 10
+    assert len(keep_net.calls) == 2, keep_net.calls
+    shapes = [shape for shape, _ in keep_net.calls]
+    assert shapes == [(1, 20, 3, 512, 512), (1, 10, 3, 512, 512)], shapes
+    assert tuple(output.shape) == (30, 512, 512, 3), output.shape

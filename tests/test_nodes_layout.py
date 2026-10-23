@@ -181,7 +181,11 @@ NODE_CLASS_NAMES = {
 #: with the migration steps (P4.1 the loader, P4.2 the single image node,
 #: P4.3 the sequence node); the contract test below works with both
 #: representations, so it stays meaningful in every step.
-V3_NODE_IDS = ("KEEP_ModelLoader", "KEEP_FaceUpscaleImage")
+V3_NODE_IDS = (
+    "KEEP_ModelLoader",
+    "KEEP_FaceUpscaleImage",
+    "KEEP_ProcessImageSequence",
+)
 
 
 def _pack_nodes(nodes_package) -> dict:

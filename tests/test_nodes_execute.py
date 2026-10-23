@@ -31,6 +31,11 @@ def loader_node_module():
     return importlib.import_module("ComfyUI_KEEP.nodes.keep_model_loader")
 
 
+@pytest.fixture(scope="module")
+def sequence_node_module():
+    return importlib.import_module("ComfyUI_KEEP.nodes.keep_process_image_sequence")
+
+
 @pytest.fixture
 def stub_pack(loader_module, monkeypatch):
     """A real ``KEEPModelPack`` (the node checks the type) with stubs."""
@@ -44,6 +49,7 @@ def stub_pack(loader_module, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(pack, "load_device", lambda: calls.append("load_device"))
     monkeypatch.setattr(pack, "offload", lambda: calls.append("offload"))
+    monkeypatch.setattr(pack, "ensure_flow", lambda: calls.append("ensure_flow"))
     pack.calls = calls
     return pack
 
@@ -332,3 +338,147 @@ def test_upscale_face_image_reports_the_progress(node_module, stub_pack, monkeyp
     )
 
     assert api.execution.calls == [(0.0, 1.0), (1.0, 1.0)], api.execution.calls
+
+
+# ---------------------------------------------------------------------------
+# P4.3 - the image sequence node
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_sequence_node_refuses_a_foreign_pack(sequence_node_module):
+    """A pack of the wrong type is refused with an actionable message."""
+    message = sequence_node_module.KEEP_ProcessImageSequenceNode.validate_inputs(
+        images=torch.rand((2, 4, 4, 3), dtype=torch.float32),
+        keep_model=object(),
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_bounding_box=False,
+        max_clip_length=20,
+    )
+    assert isinstance(message, str), message
+    assert "KEEPModelPack" in message, message
+
+
+@pytest.mark.mock_integration
+def test_the_sequence_node_calls_the_processor_once(
+    sequence_node_module, stub_pack, monkeypatch
+):
+    """30 frames with ``max_clip_length=20`` - the processor is called once."""
+    from comfy_api.latest import io
+
+    calls: list[dict] = []
+
+    class _StubProcessor:
+        def __init__(self, model_pack):
+            calls.append({"pack": model_pack})
+
+        def process_image_sequence(self, **kwargs):
+            calls.append({"kwargs": kwargs})
+            return kwargs["image_sequence_tensor"]
+
+    monkeypatch.setattr(sequence_node_module, "KEEPFaceProcessor", _StubProcessor)
+
+    frames = torch.rand((30, 4, 6, 3), dtype=torch.float32)
+    output = sequence_node_module.KEEP_ProcessImageSequenceNode.execute(
+        frames,
+        stub_pack,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_bounding_box=False,
+        max_clip_length=20,
+    )
+
+    assert isinstance(output, io.NodeOutput)
+    assert len(output.result) == 1
+    assert output.result[0].shape == frames.shape
+    # the processor was built once and called once
+    assert len(calls) == 2, calls
+    assert calls[0]["pack"] is stub_pack
+    assert calls[1]["kwargs"]["max_clip_length"] == 20
+    assert calls[1]["kwargs"]["image_sequence_tensor"] is frames
+
+
+@pytest.mark.mock_integration
+def test_the_sequence_node_calls_ensure_flow_on_a_multi_frame_run(
+    sequence_node_module, stub_pack, monkeypatch
+):
+    """The flow hook is called exactly once - between load and offload."""
+
+    class _StubProcessor:
+        def __init__(self, model_pack):
+            pass
+
+        def process_image_sequence(self, **kwargs):
+            return kwargs["image_sequence_tensor"]
+
+    monkeypatch.setattr(sequence_node_module, "KEEPFaceProcessor", _StubProcessor)
+
+    sequence_node_module.KEEP_ProcessImageSequenceNode.execute(
+        torch.rand((30, 4, 6, 3), dtype=torch.float32),
+        stub_pack,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_bounding_box=False,
+        max_clip_length=20,
+    )
+
+    assert stub_pack.calls == ["load_device", "ensure_flow", "offload"], stub_pack.calls
+
+
+@pytest.mark.mock_integration
+def test_the_sequence_node_skips_ensure_flow_for_a_single_frame(
+    sequence_node_module, stub_pack, monkeypatch
+):
+    """A single frame needs no optical flow - the hook is not called."""
+
+    class _StubProcessor:
+        def __init__(self, model_pack):
+            pass
+
+        def process_image_sequence(self, **kwargs):
+            return kwargs["image_sequence_tensor"]
+
+    monkeypatch.setattr(sequence_node_module, "KEEPFaceProcessor", _StubProcessor)
+
+    sequence_node_module.KEEP_ProcessImageSequenceNode.execute(
+        torch.rand((1, 4, 6, 3), dtype=torch.float32),
+        stub_pack,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_bounding_box=False,
+        max_clip_length=20,
+    )
+
+    assert stub_pack.calls == ["load_device", "offload"], stub_pack.calls
+
+
+@pytest.mark.mock_integration
+def test_the_sequence_node_raises_on_a_failure(
+    sequence_node_module, stub_pack, monkeypatch
+):
+    """A failing processing raises and the pack is offloaded anyway."""
+
+    class _FailingProcessor:
+        def __init__(self, model_pack):
+            pass
+
+        def process_image_sequence(self, **kwargs):
+            raise RuntimeError("the sequence failed")
+
+    monkeypatch.setattr(sequence_node_module, "KEEPFaceProcessor", _FailingProcessor)
+
+    with pytest.raises(RuntimeError, match="the sequence failed"):
+        sequence_node_module.KEEP_ProcessImageSequenceNode.execute(
+            torch.rand((2, 4, 6, 3), dtype=torch.float32),
+            stub_pack,
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_bounding_box=False,
+            max_clip_length=20,
+        )
+
+    assert stub_pack.calls == ["load_device", "ensure_flow", "offload"], stub_pack.calls

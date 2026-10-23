@@ -97,6 +97,18 @@ class KEEPModelPack:
                 
         model_management.soft_empty_cache()
 
+    def ensure_flow(self) -> bool:
+        """Make sure the optical flow net of the KEEP net is usable.
+
+        The method is **idempotent** - it may be called before every
+        sequence run.  P5.5 implements the conditional resolution of the
+        GMFlow checkpoint behind it: the checkpoint is only downloaded when
+        the loaded KEEP checkpoint carries no ``flownet.*`` keys.  Until then
+        the hook is a no-op that reports ``False`` (nothing was resolved).
+        """
+        return False
+
+
 class KEEPModelLoader:
     def __init__(self):
         from comfy import model_management  # lazy: the pack imports without ComfyUI
