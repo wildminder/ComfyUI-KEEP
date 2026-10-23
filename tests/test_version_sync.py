@@ -1,9 +1,10 @@
 """P6.4 - the version of the pack and the README changelog agree.
 
 The test is **installed** with P3.7 (the metadata of the pack is written
-there), but it is not strict yet: the README gets its changelog with the
-README rewrite of P6.2.  The flip owner is **P6.4**, which asserts the
-version sync strictly.
+there) and was not strict until the README rewrite of **P6.2** gave the
+changelog its ``### v2.0.0`` entry.  Since **P6.4** the assertion is
+**strict**: a version bump without a changelog entry (or the other way
+round) fails the test.
 
 The file is runnable standalone (``python tests/test_version_sync.py``) and
 parses ``pyproject.toml`` with ``tomllib`` when it is available, otherwise
@@ -50,10 +51,6 @@ def readme_changelog_version() -> str | None:
     return matches[0] if matches else None
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="flip owner: P6.4 - the README changelog gets its v2.0.0 entry",
-)
 @pytest.mark.unit
 def test_the_version_matches_the_readme_changelog():
     """The pyproject version is the latest entry of the README changelog."""
@@ -62,6 +59,25 @@ def test_the_version_matches_the_readme_changelog():
     assert changelog is not None, "the README has no changelog entry yet"
     assert changelog == version, (
         f"pyproject.toml says {version}, the README changelog says {changelog}"
+    )
+
+
+@pytest.mark.unit
+def test_the_changelog_entry_carries_a_date():
+    """The latest changelog entry has a date (``### vX.Y.Z — YYYY-MM-DD``)."""
+    text = README.read_text(encoding="utf-8")
+    match = re.search(
+        r"^###\s*v(\d+\.\d+\.\d+)\s+—\s+(\d{4}-\d{2}-\d{2})\s*$",
+        text,
+        re.MULTILINE,
+    )
+    assert match, (
+        "the README has no changelog entry of the form "
+        "'### vX.Y.Z — YYYY-MM-DD'"
+    )
+    assert match.group(1) == pyproject_version(), (
+        f"the dated changelog entry is {match.group(1)}, the pack is "
+        f"{pyproject_version()}"
     )
 
 
