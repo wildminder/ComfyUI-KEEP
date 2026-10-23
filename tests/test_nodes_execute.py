@@ -168,11 +168,45 @@ def test_the_loader_node_passes_the_widgets_to_the_loader(
 
 
 # ---------------------------------------------------------------------------
-# P3.2 - the single image node (V1 until P4.2)
+# P4.2 - the single image node
 # ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_validate_inputs_refuses_a_foreign_pack(node_module):
+    """A pack of the wrong type is refused with an actionable message."""
+    message = node_module.KEEP_FaceUpscaleImageNode.validate_inputs(
+        image=torch.rand((1, 4, 4, 3), dtype=torch.float32),
+        keep_model=object(),
+        final_upscale_factor=1.0,
+        has_aligned_face=True,
+        only_center_face=True,
+        draw_bounding_box=False,
+    )
+    assert isinstance(message, str), message
+    assert "KEEPModelPack" in message, message
+    assert "Load KEEP Models" in message, message
+
+
+@pytest.mark.unit
+def test_validate_inputs_accepts_a_real_pack(node_module, stub_pack):
+    """A real pack passes the validation."""
+    assert (
+        node_module.KEEP_FaceUpscaleImageNode.validate_inputs(
+            image=torch.rand((1, 4, 4, 3), dtype=torch.float32),
+            keep_model=stub_pack,
+            final_upscale_factor=1.0,
+            has_aligned_face=True,
+            only_center_face=True,
+            draw_bounding_box=False,
+        )
+        is True
+    )
+
+
 @pytest.mark.mock_integration
 def test_upscale_face_image_returns_the_processed_image(node_module, stub_pack, monkeypatch):
     """The node returns the processed image and uses the pack once."""
+    from comfy_api.latest import io
+
     processed = np.full((4, 6, 3), 128, dtype=np.uint8)
     processor_calls: list[dict] = []
 
@@ -187,7 +221,7 @@ def test_upscale_face_image_returns_the_processed_image(node_module, stub_pack, 
     monkeypatch.setattr(node_module, "KEEPFaceProcessor", _StubProcessor)
 
     image = torch.rand((1, 4, 6, 3), dtype=torch.float32)
-    result = node_module.KEEP_FaceUpscaleImageNode().upscale_face_image(
+    result = node_module.KEEP_FaceUpscaleImageNode.execute(
         image,
         stub_pack,
         final_upscale_factor=1.0,
@@ -196,8 +230,9 @@ def test_upscale_face_image_returns_the_processed_image(node_module, stub_pack, 
         draw_bounding_box=False,
     )
 
-    assert len(result) == 1
-    output = result[0]
+    assert isinstance(result, io.NodeOutput)
+    assert len(result.result) == 1
+    output = result.result[0]
     assert tuple(output.shape) == (1, 4, 6, 3), output.shape
     # the stub's image (128/255) came back
     assert torch.allclose(output, torch.full((1, 4, 6, 3), 128 / 255), atol=1e-3), output
@@ -211,14 +246,89 @@ def test_upscale_face_image_returns_the_processed_image(node_module, stub_pack, 
 
 
 @pytest.mark.mock_integration
-def test_upscale_face_image_rejects_a_foreign_pack(node_module):
-    """A pack of the wrong type is refused (and the error is logged)."""
-    result = node_module.KEEP_FaceUpscaleImageNode().upscale_face_image(
-        torch.rand((1, 4, 4, 3), dtype=torch.float32),
-        object(),
+def test_upscale_face_image_scales_the_output(node_module, stub_pack, monkeypatch):
+    """The output of the node has the scaled shape ``(1, H*f, W*f, 3)``."""
+    factor = 2.0
+
+    class _StubProcessor:
+        def __init__(self, model_pack):
+            pass
+
+        def process_image(self, cv2_image_orig, final_upscale_factor, **kwargs):
+            height, width = cv2_image_orig.shape[:2]
+            return np.full(
+                (int(height * final_upscale_factor), int(width * final_upscale_factor), 3),
+                64,
+                dtype=np.uint8,
+            )
+
+    monkeypatch.setattr(node_module, "KEEPFaceProcessor", _StubProcessor)
+
+    result = node_module.KEEP_FaceUpscaleImageNode.execute(
+        torch.rand((1, 4, 6, 3), dtype=torch.float32),
+        stub_pack,
+        final_upscale_factor=factor,
+        has_aligned_face=True,
+        only_center_face=True,
+        draw_bounding_box=False,
+    )
+
+    output = result.result[0]
+    assert tuple(output.shape) == (1, 8, 12, 3), output.shape
+
+
+@pytest.mark.mock_integration
+def test_upscale_face_image_raises_on_a_failure(node_module, stub_pack, monkeypatch):
+    """A failing processing raises (B8: no ``(None,)`` behind an IMAGE socket)."""
+
+    class _FailingProcessor:
+        def __init__(self, model_pack):
+            pass
+
+        def process_image(self, **kwargs):
+            raise RuntimeError("the restoration failed")
+
+    monkeypatch.setattr(node_module, "KEEPFaceProcessor", _FailingProcessor)
+
+    with pytest.raises(RuntimeError, match="the restoration failed"):
+        node_module.KEEP_FaceUpscaleImageNode.execute(
+            torch.rand((1, 4, 6, 3), dtype=torch.float32),
+            stub_pack,
+            final_upscale_factor=1.0,
+            has_aligned_face=True,
+            only_center_face=True,
+            draw_bounding_box=False,
+        )
+
+    # the pack is offloaded even when the processing fails
+    assert stub_pack.calls == ["load_device", "offload"], stub_pack.calls
+
+
+@pytest.mark.mock_integration
+def test_upscale_face_image_reports_the_progress(node_module, stub_pack, monkeypatch):
+    """The node reports its progress through the ComfyUI execution API."""
+    progress_module = importlib.import_module("ComfyUI_KEEP.src.keep_progress")
+
+    class _StubProcessor:
+        def __init__(self, model_pack):
+            pass
+
+        def process_image(self, **kwargs):
+            return np.zeros((4, 6, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(node_module, "KEEPFaceProcessor", _StubProcessor)
+
+    # the cached API instance of the engine (built on the first report)
+    api = progress_module.get_api_sync()
+    api.execution.calls.clear()
+
+    node_module.KEEP_FaceUpscaleImageNode.execute(
+        torch.rand((1, 4, 6, 3), dtype=torch.float32),
+        stub_pack,
         final_upscale_factor=1.0,
         has_aligned_face=True,
         only_center_face=True,
         draw_bounding_box=False,
     )
-    assert result == (None,)
+
+    assert api.execution.calls == [(0.0, 1.0), (1.0, 1.0)], api.execution.calls

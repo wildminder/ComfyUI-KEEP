@@ -1,65 +1,142 @@
-"""KEEP single image node (V1 schema - P3.1).
+"""KEEP single image node (V3 schema - P4.2).
 
-The class body is the V1 class of the former root ``nodes.py``, moved
-**verbatim**: the socket types, the widget names, their defaults and their
-order are compatibility guarantees of the pack.
+The node id (``KEEP_FaceUpscaleImage``), the display name ("KEEP Single
+Image"), the category (``ComfyUI-KEEP``), the socket types and every widget
+(name, default, min/max/step and order) are compatibility guarantees of the
+pack - the V3 schema below carries exactly the contract of the former V1
+``INPUT_TYPES``.
+
+Two behaviour changes come with the V3 migration (they fix the breakages
+B8 of the plan):
+
+* a foreign model pack is refused by ``validate_inputs`` with a **message**
+  (the V1 node logged the problem and returned ``(None,)``),
+* ``execute`` **raises** when the processing fails - the node never returns
+  a ``None`` image behind an ``IMAGE`` socket.
 """
 
-import torch
-import traceback
+from comfy_api.latest import io
 
 try:  # the package import (ComfyUI loads the node package)
     from ..src.keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
     from ..src.keep_model_loader import KEEPModelPack
     from ..src.keep_processor import KEEPFaceProcessor
-    from ..src.keep_logger import logger
+    from ..src.keep_progress import report_progress
 except ImportError:  # the flat import (the repository root on sys.path)
     from src.keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
     from src.keep_model_loader import KEEPModelPack
     from src.keep_processor import KEEPFaceProcessor
-    from src.keep_logger import logger
+    from src.keep_progress import report_progress
 
 
-class KEEP_FaceUpscaleImageNode:
+class KEEP_FaceUpscaleImageNode(io.ComfyNode):
+    """Restore the faces of a single image with KEEP."""
+
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "keep_model": ("KEEP_MODEL_PACK",),
-                "final_upscale_factor": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 4.0, "step": 0.1, "tooltip": "The final upscaling factor for the output image. The image will be resized to this scale after processing."}),
-                "has_aligned_face": ("BOOLEAN", {"default": False, "tooltip": "Check if the input image is an already aligned 512x512 face."}),
-                "only_center_face": ("BOOLEAN", {"default": True, "tooltip": "If the image has multiple faces, only process the one closest to the center."}),
-                "draw_bounding_box": ("BOOLEAN", {"default": False, "tooltip": "Draw a bounding box around the detected face on the output image."}),
-            }
-        }
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "upscale_face_image"
-    CATEGORY = "ComfyUI-KEEP"
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="KEEP_FaceUpscaleImage",
+            display_name="KEEP Single Image",
+            category="ComfyUI-KEEP",
+            description=(
+                "Restore and enhance the faces of a single image with the KEEP "
+                "face restoration model."
+            ),
+            inputs=[
+                io.Image.Input(
+                    "image",
+                    tooltip="The image whose faces are restored.",
+                ),
+                io.Custom("KEEP_MODEL_PACK").Input(
+                    "keep_model",
+                    tooltip="The model pack of the 'Load KEEP Models' node.",
+                ),
+                io.Float.Input(
+                    "final_upscale_factor",
+                    default=1.0,
+                    min=0.5,
+                    max=4.0,
+                    step=0.1,
+                    tooltip=(
+                        "The final upscaling factor for the output image. The "
+                        "image will be resized to this scale after processing."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "has_aligned_face",
+                    default=False,
+                    tooltip="Check if the input image is an already aligned 512x512 face.",
+                ),
+                io.Boolean.Input(
+                    "only_center_face",
+                    default=True,
+                    tooltip=(
+                        "If the image has multiple faces, only process the one "
+                        "closest to the center."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "draw_bounding_box",
+                    default=False,
+                    tooltip=(
+                        "Draw a bounding box around the detected face on the "
+                        "output image."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Image.Output(
+                    id="IMAGE",
+                    tooltip="The restored image.",
+                ),
+            ],
+        )
 
-    def upscale_face_image(self, image: torch.Tensor, keep_model: KEEPModelPack,
-                           final_upscale_factor, has_aligned_face, only_center_face, draw_bounding_box):
+    @classmethod
+    def validate_inputs(cls, **kwargs) -> bool | str:
+        """Refuse a model pack that is not a ``KEEPModelPack``.
+
+        The returned string is the error message ComfyUI shows to the user.
+        """
+        keep_model = kwargs.get("keep_model")
         if not isinstance(keep_model, KEEPModelPack):
-            logger.error(f"Invalid KEEP Model Pack provided. Expected KEEPModelPack, got {type(keep_model)}")
-            return (None,)
+            return (
+                "Invalid KEEP Model Pack provided: expected a KEEPModelPack, "
+                f"got {type(keep_model).__name__}. Connect the output of the "
+                "'Load KEEP Models' node."
+            )
+        return True
 
+    @classmethod
+    def execute(
+        cls,
+        image,
+        keep_model,
+        final_upscale_factor,
+        has_aligned_face,
+        only_center_face,
+        draw_bounding_box,
+    ) -> io.NodeOutput:
+        """Restore the image.
+
+        The pack is always offloaded - also when the processing fails (the
+        exception is **not** swallowed: a failed node must fail loudly).
+        """
         try:
             keep_model.load_device()
-            cv2_img_single = comfy_image_to_cv2(image[0].unsqueeze(0))
+            report_progress(0.0, 1.0)
 
+            cv2_img_single = comfy_image_to_cv2(image[0].unsqueeze(0))
             processor = KEEPFaceProcessor(keep_model)
             processed_cv2_img = processor.process_image(
                 cv2_image_orig=cv2_img_single,
                 final_upscale_factor=final_upscale_factor,
                 has_aligned=has_aligned_face,
                 only_center_face=only_center_face,
-                draw_box=draw_bounding_box
+                draw_box=draw_bounding_box,
             )
             output_image_single = cv2_to_comfy_image(processed_cv2_img)
-            return (output_image_single,)
-        except Exception as e:
-            logger.error(f"Error processing single image: {e}")
-            traceback.print_exc()
-            return (None,)
+            report_progress(1.0, 1.0)
+            return io.NodeOutput(output_image_single)
         finally:
             keep_model.offload()

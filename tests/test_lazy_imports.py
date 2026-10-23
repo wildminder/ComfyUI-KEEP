@@ -55,6 +55,7 @@ for name in (
     "keep_model_configs",
     "keep_paths",
     "keep_image_utils",
+    "keep_progress",
     "keep_processor",
     "keep_model_loader",
 ):
@@ -68,6 +69,7 @@ ENGINE_MODULES = (
     "keep_model_configs",
     "keep_paths",
     "keep_image_utils",
+    "keep_progress",
     "keep_processor",
     "keep_model_loader",
 )
