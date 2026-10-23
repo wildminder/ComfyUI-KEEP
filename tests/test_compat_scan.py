@@ -9,6 +9,9 @@ against the audit document that lists the fix list.
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCANNER = REPO_ROOT / "tools" / "scan_compat.py"
 AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-compat-scan.md"
+DEPS_DIR = REPO_ROOT / "modules" / "deps"
 
 KNOWN_BAD = '''\
 import pdb
@@ -131,10 +135,10 @@ def test_finding_line_numbers_are_exact(scanner):
 
 @pytest.mark.unit
 def test_real_tree_findings(scanner):
-    """The live tree must only contain the findings that are still open.
+    """The live tree must not contain any finding any more.
 
     P2.1 removed ``from re import T``, the ``pdb`` imports, the
-    ``torch.profiler`` import and the pip shim module; P2.3 removes the
+    ``torch.profiler`` import and the pip shim module; P2.3 removed the
     remaining ``distutils`` import.  The list below is therefore the
     *expected* state of the tree - a new finding fails this test.
     """
@@ -143,12 +147,9 @@ def test_real_tree_findings(scanner):
     assert report["closure_file_count"] > 0
     located = {(f["path"], f["line"], f["pattern"]) for f in findings}
 
-    expected = {
-        ("modules/deps/basicsr/archs/arch_util.py", 6, "distutils"),
-    }
-    assert located == expected, (
-        "the vendored closure must only contain the open findings "
-        f"({sorted(located)}); P2.1/P2.3 must have removed the others"
+    assert located == set(), (
+        "the vendored closure must be free of compatibility findings, "
+        f"got {sorted(located)}"
     )
 
 
@@ -201,8 +202,8 @@ def test_closure_contains_the_eagerly_scanned_modules(scanner):
 @pytest.mark.unit
 def test_exit_code_contract(scanner, monkeypatch):
     """Exit code 0 = no findings, 1 = findings found (a result, not a crash)."""
-    assert scanner.main(["--quiet"]) == 1, (
-        "the real tree has findings, so the scanner must exit 1"
+    assert scanner.main(["--quiet"]) == 0, (
+        "the real tree must be free of findings, so the scanner must exit 0"
     )
     monkeypatch.setattr(
         scanner,
@@ -228,3 +229,65 @@ def test_audit_doc_lists_every_finding(scanner):
     for finding in report["findings"]:
         location = f"{finding['path']}:{finding['line']}"
         assert location in text, f"{location} is not in the fix list"
+
+
+# ---------------------------------------------------------------------------
+# P2.3 - the mechanical Python 3.13 / numpy 2 fixes
+# ---------------------------------------------------------------------------
+
+#: Imports every module of the runtime closure in a **fresh** interpreter (the
+#: import must not leak into the pytest session) and reports the failures.
+_CLOSURE_IMPORT_SCRIPT = """\
+import importlib, json, sys
+
+sys.path.insert(0, sys.argv[1])
+failures = []
+for name in json.loads(sys.argv[2]):
+    try:
+        importlib.import_module(name)
+    except BaseException as exc:
+        failures.append({"module": name, "type": type(exc).__name__, "error": str(exc)})
+print("KEEP_CLOSURE_FAILURES:" + json.dumps(failures))
+"""
+
+
+def _closure_module_names(report):
+    """The importable module names of the vendored part of the closure."""
+    names = []
+    for rel in report["closure_files"]:
+        if not rel.startswith("modules/deps/"):
+            continue
+        dotted = rel[len("modules/deps/"):].replace("/", ".").removesuffix(".py")
+        if dotted.endswith(".__init__"):
+            dotted = dotted[: -len(".__init__")]
+        names.append(dotted)
+    return names
+
+
+@pytest.mark.unit
+def test_every_closure_module_imports(scanner):
+    """P2.3 acceptance: every module of the runtime closure still imports.
+
+    The imports run in a subprocess: the vendored packages register their
+    classes in global registries and must not pollute the pytest session.
+    """
+    report = scanner.scan_repo(REPO_ROOT)
+    names = _closure_module_names(report)
+    assert names, "the runtime closure is empty"
+
+    result = subprocess.run(
+        [sys.executable, "-c", _CLOSURE_IMPORT_SCRIPT, str(DEPS_DIR), json.dumps(names)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    sentinel = [
+        line for line in result.stdout.splitlines() if line.startswith("KEEP_CLOSURE_FAILURES:")
+    ]
+    assert sentinel, (
+        f"the closure import probe produced no result\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    failures = json.loads(sentinel[-1].split(":", 1)[1])
+    assert failures == [], f"closure modules failed to import: {failures}"

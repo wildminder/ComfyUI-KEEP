@@ -3,7 +3,6 @@ import math
 import torch
 import torchvision
 import warnings
-from distutils.version import LooseVersion
 from itertools import repeat
 from torch import nn as nn
 from torch.nn import functional as F
@@ -12,6 +11,21 @@ from torch.nn.modules.batchnorm import _BatchNorm
 
 from basicsr.ops.dcn import ModulatedDeformConvPack, modulated_deform_conv
 from basicsr.utils import get_root_logger
+
+
+def _version_tuple(version):
+    """Numeric version tuple of a version string.
+
+    P2.3: replaces the legacy ``LooseVersion`` helper - the standard library
+    module that provided it was removed in Python 3.12 and this package runs
+    on Python 3.13.  Only the numeric components are compared, which is all
+    the original call site needs.
+    """
+    parts = []
+    for chunk in version.split('+')[0].split('.'):
+        digits = ''.join(char for char in chunk if char.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
 
 
 @torch.no_grad()
@@ -223,7 +237,7 @@ class DCNv2Pack(ModulatedDeformConvPack):
             logger = get_root_logger()
             logger.warning(f'Offset abs mean is {offset_absmean}, larger than 50.')
 
-        if LooseVersion(torchvision.__version__) >= LooseVersion('0.9.0'):
+        if _version_tuple(torchvision.__version__) >= _version_tuple('0.9.0'):
             return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias, self.stride, self.padding,
                                                  self.dilation, mask)
         else:
