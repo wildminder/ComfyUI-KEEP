@@ -31,3 +31,19 @@ markers = [
     "headless: Requires the real ComfyUI source tree on sys.path (no server)",
     "gpu_acceptance: Opt-in real-weight run (RUN_KEEP_E2E=1 and KEEP_MODEL_DIR)",
 ]
+
+# P1.5 - the lint gate of .github/workflows/tests.yml.
+# Scope decision (same as the reference pack ComfyUI-DyPE): the gate covers the
+# *correctness* rules (pyflakes F + syntax errors E9).  The vendored
+# third-party tree (modules/deps) is excluded - it is upstream code, not ours.
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["modules/deps"]
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+# F401 (unused import) and F541 (f-string without placeholders) are style
+# findings in the *existing* production code; they are cleaned up in the
+# production phases (P4.7), not in the test-infrastructure phase.
+ignore = ["F401", "F541"]
