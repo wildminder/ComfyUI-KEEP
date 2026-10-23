@@ -774,6 +774,33 @@ def sample_image() -> torch.Tensor:
 
 
 @pytest.fixture(autouse=True)
+def no_weight_downloads():
+    """The test tiers must never download a weight.
+
+    The acceptance gate runs **offline** (and without the environment
+    variables of the opt-in tiers), so a test that reaches the transport
+    must fail loudly instead of pulling ~1 GB from upstream.  The seam is
+    the module attribute of the pack's own downloader (it binds
+    ``torch.hub.download_url_to_file`` at import time); a test that wants a
+    download patches it itself.
+    """
+    module = importlib.import_module("ComfyUI_KEEP.src.keep_download")
+
+    def _forbidden(*args, **kwargs):
+        raise RuntimeError(
+            "a test must not download a weight - patch "
+            "ComfyUI_KEEP.src.keep_download.download_url_to_file instead"
+        )
+
+    original = module.download_url_to_file
+    module.download_url_to_file = _forbidden
+    try:
+        yield
+    finally:
+        module.download_url_to_file = original
+
+
+@pytest.fixture(autouse=True)
 def mock_folder_paths(tmp_path):
     """Autouse: every test gets its own ``models_dir`` and folder registry.
 

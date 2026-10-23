@@ -127,21 +127,79 @@ def test_audit_doc_records_the_diffusers_decision():
     assert "0.11" in text, "the diffusers version must be recorded"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "flownet_path is not wired yet (src/keep_model_configs.py sets it to None) - "
-        "flip owner: P5.5, which resolves the GMFlow manifest entry and sets "
-        "architecture['flownet_path'] before the arch is built"
-    ),
-)
 @pytest.mark.unit
-def test_flownet_path_is_wired(utils_module):
-    """The arch config must resolve a real flownet path (flip owner: P5.5)."""
-    architecture = utils_module.KEEP_MODEL_CONFIGS["KEEP"]["architecture"]
-    assert architecture["flownet_path"] is not None, (
+def test_flownet_path_is_wired(monkeypatch, tmp_path):
+    """P5.5 flipped this guard: the flownet path is resolved before the arch.
+
+    The P0.4 guard asserted that the **config table** carries a non-``None``
+    ``flownet_path``.  That premise was disproved by P0.4 section 2: the
+    shipped KEEP checkpoint carries the trained flownet weights (123
+    ``flownet.*`` tensors), so the GMFlow file is only needed when a
+    checkpoint does **not** provide them - the resolution is conditional.
+
+    The guard now asserts the guarantee that actually matters: a checkpoint
+    **without** flownet weights gets a **resolved** (non-``None``)
+    ``flownet_path`` in the config that is handed to the arch - the flow net
+    must never keep its random weights.
+    """
+    import importlib
+
+    import torch
+
+    loader_module = importlib.import_module("ComfyUI_KEEP.src.keep_model_loader")
+    built: list[dict] = []
+
+    class _StubArch:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+        def to(self, device):
+            return self
+
+        def load_state_dict(self, state_dict, strict=True):
+            return self
+
+        def eval(self):
+            return self
+
+    class _StubHelper:
+        def __init__(self, **kwargs):
+            pass
+
+    gmflow = str(tmp_path / "gmflow_sintel-0c07dcb3.pth")
+    monkeypatch.setattr(loader_module, "ARCH_REGISTRY", {"KEEP": _StubArch})
+    monkeypatch.setattr(
+        loader_module.torch, "load", lambda *a, **k: {"params_ema": {"w": torch.zeros(1)}}
+    )
+    monkeypatch.setattr(loader_module, "_face_restore_helper", lambda: _StubHelper)
+    monkeypatch.setattr(
+        loader_module.keep_paths, "resolve_model_root", lambda *a, **k: str(tmp_path)
+    )
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_weight",
+        lambda entry, progress=True: str(tmp_path / "checkpoint.pth"),
+    )
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_required",
+        lambda entry, progress=True: str(tmp_path / "weight.pth"),
+    )
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_optional",
+        lambda entry, progress=True: gmflow,
+    )
+
+    loader_module.KEEPModelLoader().load_keep_model_pack(
+        "KEEP", "retinaface_resnet50"
+    )
+
+    assert built, "the architecture was never built"
+    assert built[0]["flownet_path"] is not None, (
         "flownet_path is None - the GMFlow net would keep its random weights"
     )
+    assert built[0]["flownet_path"] == gmflow
 
 
 @pytest.mark.unit

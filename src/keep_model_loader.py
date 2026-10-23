@@ -32,8 +32,12 @@ from .keep_model_configs import (
     FACELIB_DEST_FOLDER,
     KEEP_MODEL_CONFIGS,
     WEIGHT_MANIFEST,
+    WEIGHT_MANIFEST_BY_NAME,
     weight_entry_for,
 )
+
+#: The name of the GMFlow manifest entry (the defensive flow weights).
+GMFLOW_WEIGHT_NAME = "gmflow_sintel-0c07dcb3.pth"
 
 
 # P2.7: the swallow-and-stub fallback is gone - a broken vendored dependency
@@ -96,6 +100,21 @@ def _build_patchers(keep_net, face_helper, device, offload_device) -> dict:
     return patchers
 
 
+def _load_flownet_weights(flownet, path: str) -> None:
+    """Load the trained GMFlow weights into a flownet (``strict=True``).
+
+    The vendored ``FlowGenerator`` loads the checkpoint itself when it is
+    built with a path (``modules/deps/basicsr/archs/gmflow_arch.py:25-28``);
+    this helper does the same for a net that was built **without** a path -
+    the weights are then loaded with ``strict=True``, so a mismatching file
+    fails loudly instead of leaving random weights behind.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    weights = checkpoint.get("model", checkpoint)
+    target = getattr(flownet, "model", flownet)
+    target.load_state_dict(weights, strict=True)
+
+
 class KEEPModelPack:
     """The models of the pack and their residency (P4.5).
 
@@ -107,7 +126,8 @@ class KEEPModelPack:
     """
 
     def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model,
-                 model_type_str, patchers=None):
+                 model_type_str, patchers=None, flownet_from_checkpoint=False,
+                 flownet_path=None):
         from comfy import model_management  # lazy: the pack imports without ComfyUI
 
         self.keep_net = keep_net
@@ -121,6 +141,12 @@ class KEEPModelPack:
         # the flownet is a submodule of the KEEP net - it belongs to the
         # patcher of the net (no second patcher, no double accounting)
         self.flownet = getattr(keep_net, "flownet", None)
+
+        # P5.5: where the flow weights come from.  A KEEP checkpoint that
+        # carries the ``flownet.*`` tensors restores them itself; otherwise
+        # the GMFlow file is resolved (``flownet_path``).
+        self.flownet_from_checkpoint = flownet_from_checkpoint
+        self.flownet_path = flownet_path
 
         if patchers is None:
             patchers = _build_patchers(
@@ -197,20 +223,53 @@ class KEEPModelPack:
             logger.debug(f"KEEP: a model could not be offloaded ({exc})")
 
     def ensure_flow(self) -> bool:
-        """Make sure the optical flow net of the KEEP net is usable.
+        """Make sure the optical flow net of the KEEP net has **trained** weights.
 
-        The method is **idempotent** - the resolution happens at most once
-        per pack.  P5.5 implements the conditional resolution of the GMFlow
-        checkpoint behind it: the checkpoint is only downloaded when the
-        loaded KEEP checkpoint carries no ``flownet.*`` keys.  Until then the
-        flownet comes from the KEEP checkpoint itself (it is a submodule of
-        the net) and nothing has to be resolved.
+        The resolution is **conditional** (P5.5) and **idempotent** - it
+        happens at most once per pack:
+
+        * a KEEP checkpoint that carries the ``flownet.*`` tensors restores
+          them with ``strict=True`` - there is nothing to resolve and the
+          method is a no-op;
+        * a checkpoint **without** them needs the GMFlow file: it is resolved
+          (downloaded when it is missing) and loaded into the flownet with
+          ``strict=True``.
+
+        The image path does not call this hook (the sequence path does); the
+        shipped checkpoint carries the flownet anyway, so the image path has
+        trained flow weights as well (P0.4 section 1).
         """
         if self._flow_checked:
             return self._flow_available
         self._flow_checked = True
-        self._flow_available = self.flownet is not None
-        return self._flow_available
+
+        if self.flownet_from_checkpoint:
+            # the checkpoint restored the flownet - nothing to resolve
+            self._flow_available = self.flownet is not None
+            return self._flow_available
+
+        if self.flownet is None:
+            self._flow_available = False
+            return False
+
+        # the net was built without the GMFlow weights - resolve them now
+        entry = WEIGHT_MANIFEST_BY_NAME[GMFLOW_WEIGHT_NAME]
+        path = self.flownet_path or keep_download.ensure_optional(entry)
+        if path is None:
+            logger.warning(
+                f"KEEP: the optical flow weights ({entry.name}) could not be "
+                "resolved - the flow net keeps its initial weights. Download "
+                f"the file to {keep_download.target_path(entry)} and run again."
+            )
+            self._flow_available = False
+            return False
+
+        if not self.flownet_path:
+            # the net was built without them - load the trained weights now
+            _load_flownet_weights(self.flownet, path)
+        self.flownet_path = path
+        self._flow_available = True
+        return True
 
 
 class KEEPModelLoader:
@@ -240,6 +299,9 @@ class KEEPModelLoader:
                 # P4.5: the patchers belong to the models - they are built
                 # once and shared by every pack that uses these models.
                 patchers=cached_pack.patchers_by_role,
+                # P5.5: the flow resolution belongs to the models as well
+                flownet_from_checkpoint=cached_pack.flownet_from_checkpoint,
+                flownet_path=cached_pack.flownet_path,
             )
             return model_pack
 
@@ -271,7 +333,32 @@ class KEEPModelLoader:
         state_dict_key = 'params_ema' if 'params_ema' in checkpoint else 'params'
         state_dict = checkpoint.get(state_dict_key, checkpoint)
 
-        net = keep_model_arch_class(**config_entry['architecture']).to(self.offload_device)
+        # P5.5: does the checkpoint carry the trained flownet weights?  The
+        # shipped KEEP checkpoint does (123 ``flownet.*`` tensors - P0.4
+        # section 2); the GMFlow file is only resolved when it does not.
+        flownet_from_checkpoint = any(
+            key.startswith('flownet.') for key in state_dict.keys()
+        )
+
+        # the architecture config of this build - a **copy**, so the global
+        # config table is never mutated
+        architecture = dict(config_entry['architecture'])
+        if flownet_from_checkpoint:
+            architecture['flownet_path'] = None
+            flownet_path = None
+        else:
+            flownet_path = keep_download.ensure_optional(
+                WEIGHT_MANIFEST_BY_NAME[GMFLOW_WEIGHT_NAME]
+            )
+            architecture['flownet_path'] = flownet_path
+            if flownet_path is None:
+                logger.warning(
+                    "KEEP: the checkpoint does not carry the flownet weights "
+                    "and the GMFlow checkpoint could not be resolved - the flow "
+                    "net keeps its initial weights."
+                )
+
+        net = keep_model_arch_class(**architecture).to(self.offload_device)
 
         converted_state_dict = {}
         needs_conversion = any('cross_fuse' in k or 'fuse_convs_dict' in k for k in state_dict.keys())
@@ -309,12 +396,18 @@ class KEEPModelLoader:
         # P4.5: the patchers are built once (with the base pack) and shared
         # with the returned pack - a second set of patchers for the same
         # models would confuse the VRAM accounting of ComfyUI.
-        base_pack_for_cache = KEEPModelPack(net, face_helper, None, None, model_type_str)
+        base_pack_for_cache = KEEPModelPack(
+            net, face_helper, None, None, model_type_str,
+            flownet_from_checkpoint=flownet_from_checkpoint,
+            flownet_path=flownet_path,
+        )
         self.loaded_models[cache_key] = base_pack_for_cache
 
         model_pack = KEEPModelPack(
             net, face_helper, bg_upscale_model, face_upscale_model, model_type_str,
             patchers=base_pack_for_cache.patchers_by_role,
+            flownet_from_checkpoint=flownet_from_checkpoint,
+            flownet_path=flownet_path,
         )
 
         return model_pack

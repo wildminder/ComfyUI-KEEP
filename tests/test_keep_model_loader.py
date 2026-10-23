@@ -291,8 +291,16 @@ def test_the_node_gives_the_vram_back_when_the_processing_fails(
 # ensure_flow
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_ensure_flow_is_idempotent(pack):
-    """``ensure_flow`` resolves once per pack - the second call is a no-op."""
+def test_ensure_flow_is_idempotent(loader_module, stub_models):
+    """``ensure_flow`` resolves once per pack - the second call is a no-op.
+
+    A checkpoint that carries the flownet weights (the shipped one, P0.4
+    section 2) needs no resolution at all.
+    """
+    net, helper = stub_models
+    pack = loader_module.KEEPModelPack(
+        net, helper, None, None, "KEEP", flownet_from_checkpoint=True
+    )
     assert pack.ensure_flow() is True, "the flownet comes with the KEEP net"
     # the flownet is gone -> the cached result is still returned
     pack.flownet = None
@@ -344,6 +352,7 @@ def synthetic_manifest(loader_module, configs_module, monkeypatch):
     )
     by_name = {entry.name: entry for entry in entries}
     monkeypatch.setattr(loader_module, "WEIGHT_MANIFEST", entries)
+    monkeypatch.setattr(loader_module, "WEIGHT_MANIFEST_BY_NAME", by_name)
     monkeypatch.setattr(
         loader_module,
         "weight_entry_for",
@@ -380,6 +389,8 @@ def loader(loader_module, monkeypatch, tmp_path, synthetic_manifest, transport):
     class _StubArch:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            # the real arch owns the flownet as a submodule (keep_arch.py:882)
+            self.flownet = _StubModule("flownet")
 
         def to(self, device):
             return self
@@ -448,14 +459,24 @@ def test_a_failed_download_raises_the_actionable_message(
 
 
 @pytest.mark.unit
-def test_the_optional_gmflow_weight_is_not_resolved_at_pack_construction(
-    loader, transport
+def test_an_unresolvable_optional_gmflow_weight_does_not_raise(
+    loader_module, loader, monkeypatch
 ):
-    """The GMFlow checkpoint is deferred to ``ensure_flow()``."""
-    loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+    """The GMFlow checkpoint is optional - its absence never breaks the pack.
 
-    urls = [url.rsplit("/", 1)[-1] for url in transport]
-    assert "gmflow_sintel-0c07dcb3.pth" not in urls, urls
+    The flow weights are only *needed* when the checkpoint does not carry
+    them; the resolution is deferred to ``ensure_flow()`` (P5.5).
+    """
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_optional",
+        lambda entry, progress=True: None,
+    )
+
+    pack = loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    assert pack is not None
+    assert pack.keep_net.kwargs["flownet_path"] is None
 
 
 @pytest.mark.unit
@@ -479,3 +500,130 @@ def test_selecting_the_asian_model_raises_an_actionable_error(loader):
     assert "not published upstream" in message
     assert "KEEP_Asian-4765ebe0.pth" in message
     assert "keep_models" in message
+
+
+# ---------------------------------------------------------------------------
+# P5.5 - the flownet wiring
+# ---------------------------------------------------------------------------
+def _downloaded(transport) -> list[str]:
+    return [url.rsplit("/", 1)[-1] for url in transport]
+
+
+@pytest.mark.unit
+def test_the_arch_gets_a_resolved_flownet_path_without_flownet_weights(loader, transport):
+    """A checkpoint **without** flownet weights -> the GMFlow file is resolved.
+
+    The resolved path is put into the architecture config **before** the net
+    is built, so the vendored arch loads the trained weights instead of
+    random ones.
+    """
+    pack = loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    flownet_path = pack.keep_net.kwargs["flownet_path"]
+    assert flownet_path is not None, "the GMFlow checkpoint was not resolved"
+    assert flownet_path.endswith("gmflow_sintel-0c07dcb3.pth"), flownet_path
+    assert "gmflow_sintel-0c07dcb3.pth" in _downloaded(transport)
+
+
+@pytest.mark.unit
+def test_a_checkpoint_with_flownet_weights_downloads_no_gmflow(
+    loader_module, loader, transport, monkeypatch
+):
+    """The shipped checkpoint carries the flownet -> nothing is downloaded."""
+    monkeypatch.setattr(
+        loader_module.torch,
+        "load",
+        lambda *args, **kwargs: {
+            "params_ema": {
+                "flownet.model.conv1.weight": torch.zeros(1),
+                "weight": torch.zeros(1),
+            }
+        },
+    )
+
+    pack = loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    assert pack.keep_net.kwargs["flownet_path"] is None
+    assert "gmflow_sintel-0c07dcb3.pth" not in _downloaded(transport)
+    # the flownet is restored from the checkpoint (the strict load)
+    assert "flownet.model.conv1.weight" in pack.keep_net.loaded
+    assert pack.flownet_from_checkpoint is True
+    # the hook is a no-op - the weights are already there
+    assert pack.ensure_flow() is True
+    assert "gmflow_sintel-0c07dcb3.pth" not in _downloaded(transport)
+
+
+class _RecordingInner:
+    """The inner module of the flownet (it records the strict load)."""
+
+    def __init__(self) -> None:
+        self.loaded: tuple | None = None
+
+    def load_state_dict(self, weights, strict=True):
+        self.loaded = (weights, strict)
+        return self
+
+
+class _RecordingFlownet:
+    """A flownet that records the weights it receives."""
+
+    def __init__(self) -> None:
+        self.model = _RecordingInner()
+
+
+@pytest.mark.unit
+def test_ensure_flow_loads_the_gmflow_weights_strictly(
+    loader_module, stub_models, monkeypatch, tmp_path
+):
+    """A net without flow weights gets them from the GMFlow file."""
+    net, helper = stub_models
+    net.flownet = _RecordingFlownet()
+    pack = loader_module.KEEPModelPack(
+        net, helper, None, None, "KEEP",
+        flownet_from_checkpoint=False, flownet_path=None,
+    )
+
+    gmflow_path = tmp_path / "gmflow_sintel-0c07dcb3.pth"
+    gmflow_path.write_bytes(b"weights")
+    monkeypatch.setattr(
+        loader_module.keep_download,
+        "ensure_optional",
+        lambda entry, progress=True: str(gmflow_path),
+    )
+    monkeypatch.setattr(
+        loader_module.torch,
+        "load",
+        lambda *args, **kwargs: {"model": {"w": torch.zeros(1)}},
+    )
+
+    assert pack.ensure_flow() is True
+    weights, strict = net.flownet.model.loaded
+    assert strict is True, "the flow weights must be loaded with strict=True"
+    assert "w" in weights
+    # the resolution is cached - a second call does nothing
+    assert pack.ensure_flow() is True
+
+
+@pytest.mark.mock_integration
+def test_the_image_node_does_not_call_ensure_flow(
+    loader_module, node_module, monkeypatch
+):
+    """The image path leaves the flow resolution deferred."""
+    net = _StubKeepNet()
+    pack = loader_module.KEEPModelPack(
+        net, _StubFaceHelper(), None, None, "KEEP"
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(pack, "ensure_flow", lambda: calls.append("ensure_flow"))
+    _patch_the_node(monkeypatch, node_module, _StubProcessor)
+
+    node_module.KEEP_FaceUpscaleImageNode.execute(
+        image=torch.zeros((1, 8, 8, 3)),
+        keep_model=pack,
+        final_upscale_factor=1.0,
+        has_aligned_face=False,
+        only_center_face=True,
+        draw_bounding_box=False,
+    )
+
+    assert calls == [], "the image path must not resolve the flow weights"
