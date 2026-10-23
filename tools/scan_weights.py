@@ -32,6 +32,13 @@ DEFAULT_MODELS_ROOTS = (
 
 #: The 8 weights the node needs (plan section 5 / P5.1 manifest scope).
 #: ``dest_folder`` / ``subdir`` reproduce the legacy on-disk layout exactly.
+#:
+#: ``required`` mirrors the manifest decision of P0.4
+#: (``docs/audit/2026-10-22-dependency-decisions.md`` §4.1): only the GMFlow
+#: entry (defensive) and the ``Asian`` entry (not published upstream, HTTP 404)
+#: are optional - the latter because a *required* entry that can never be
+#: downloaded would make the fail-fast rule of P5.3 break the **default** KEEP
+#: model as well.
 EXPECTED_WEIGHTS = (
     {
         "name": "KEEP-b76feb75.pth",
@@ -44,7 +51,7 @@ EXPECTED_WEIGHTS = (
         "name": "KEEP_Asian-4765ebe0.pth",
         "dest_folder": "keep_models",
         "subdir": "KEEP",
-        "required": True,
+        "required": False,
         "url": "https://github.com/jnjaby/KEEP/releases/download/v1.0.0/KEEP_Asian-4765ebe0.pth",
     },
     {

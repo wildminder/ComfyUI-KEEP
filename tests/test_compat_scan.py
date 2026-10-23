@@ -179,6 +179,59 @@ def test_closure_contains_the_runtime_files(scanner):
 
 
 @pytest.mark.unit
+def test_closure_contains_the_eagerly_scanned_modules(scanner):
+    """The four eager folder scans of the vendored ``basicsr`` belong to the closure.
+
+    ``basicsr/__init__.py`` imports ``.data`` / ``.losses`` / ``.models``, and each of
+    those packages imports its whole folder eagerly - so those modules are loaded by
+    ``import basicsr`` even though no static import statement mentions them.
+    """
+    report = scanner.scan_repo(REPO_ROOT)
+    closure = set(report["closure_files"])
+    for expected in (
+        # models/__init__.py:13-15  -> *_model.py
+        "modules/deps/basicsr/models/keep_model.py",
+        "modules/deps/basicsr/models/keep_gan_model.py",
+        "modules/deps/basicsr/models/base_model.py",
+        # data/__init__.py:20-22  -> *_dataset.py
+        "modules/deps/basicsr/data/reds_dataset.py",
+        "modules/deps/basicsr/data/single_image_dataset.py",
+        # losses/__init__.py:14-16  -> *_loss.py
+        "modules/deps/basicsr/losses/basic_loss.py",
+        # reached through 'from <package> import <submodule>'
+        "modules/deps/basicsr/models/lr_scheduler.py",
+        "modules/deps/basicsr/utils/flow_util.py",
+    ):
+        assert expected in closure, (
+            f"{expected} is not in the runtime closure - the eager folder scans of "
+            "basicsr are not modelled"
+        )
+
+
+@pytest.mark.unit
+def test_exit_code_contract(scanner, monkeypatch):
+    """Exit code 0 = no findings, 1 = findings found (a result, not a crash)."""
+    assert scanner.main(["--quiet"]) == 1, (
+        "the real tree has findings, so the scanner must exit 1"
+    )
+    monkeypatch.setattr(
+        scanner,
+        "scan_repo",
+        lambda *args, **kwargs: {
+            "entry_points": [],
+            "closure_file_count": 0,
+            "closure_files": [],
+            "finding_count": 0,
+            "findings_by_pattern": {},
+            "findings": [],
+        },
+    )
+    assert scanner.main(["--quiet"]) == 0, (
+        "a clean scan must exit 0"
+    )
+
+
+@pytest.mark.unit
 def test_audit_doc_lists_every_finding(scanner):
     report = scanner.scan_repo(REPO_ROOT)
     text = AUDIT_DOC.read_text(encoding="utf-8")

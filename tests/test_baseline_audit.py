@@ -17,6 +17,7 @@ Recorded baseline (docs/audit/2026-10-22-baseline-import.md):
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -38,6 +39,11 @@ def _run_probe(tmp_path: Path, *extra: str) -> dict:
     behaviour of the package (including the ``sys.path`` mutation of B4 and the
     partially imported ``basicsr`` package), which must not leak into the
     pytest session.
+
+    The probe exits with ``2`` **only** when it could not find a ComfyUI tree
+    (``tools/baseline_probe.py:329``); that case is reported in the JSON report
+    under ``"fatal"`` and must lead to a *skip*, not to a failed assertion -
+    see :func:`_skip_if_fatal`.
     """
     report_path = tmp_path / "baseline-report.json"
     result = subprocess.run(
@@ -47,23 +53,37 @@ def _run_probe(tmp_path: Path, *extra: str) -> dict:
         text=True,
         timeout=600,
     )
+    assert report_path.is_file(), "baseline probe did not write its report"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if "fatal" in report:
+        # no ComfyUI tree: the probe exits 2 on purpose, the caller skips.
+        assert result.returncode == 2, (
+            f"baseline probe reported a fatal error but exited "
+            f"rc={result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        return report
     assert result.returncode == 0, (
         f"baseline probe failed (rc={result.returncode})\n"
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
-    assert report_path.is_file(), "baseline probe did not write its report"
-    return json.loads(report_path.read_text(encoding="utf-8"))
+    return report
+
+
+def _skip_if_fatal(report: dict) -> None:
+    """Skip the test when the probe had no ComfyUI tree to work with."""
+    if "fatal" in report:
+        pytest.skip(
+            "baseline probe could not locate a ComfyUI source tree: "
+            f"{report['fatal']} (set COMFYUI_ROOT to point at one)"
+        )
 
 
 @pytest.fixture(scope="module")
 def baseline_report(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("baseline")
     report = _run_probe(tmp_path)
-    if "fatal" in report:
-        pytest.skip(
-            "baseline probe could not locate a ComfyUI source tree: "
-            f"{report['fatal']} (set COMFYUI_ROOT to point at one)"
-        )
+    _skip_if_fatal(report)
     return report
 
 
@@ -171,6 +191,7 @@ def test_pip_shim_is_reachable_and_fires_without_ffmpeg(tmp_path):
     probe records the ``pip.main([...])`` call instead of performing it.
     """
     report = _run_probe(tmp_path, "--simulate-missing-ffmpeg")
+    _skip_if_fatal(report)
     pip_shim = report["pip_shim"]
     assert pip_shim["pip_main_calls"] == [["install", "--user", "ffmpeg-python"]], (
         pip_shim
@@ -184,6 +205,31 @@ def test_vendored_deps_are_shadowed_globally(baseline_report):
     shadowing = baseline_report["sys_path_shadowing"]
     assert shadowing["deps_path_on_sys_path"] is True, shadowing
     assert shadowing["facelib_in_sys_modules"] is True, shadowing
+
+
+@pytest.mark.unit
+def test_fatal_probe_report_leads_to_a_skip_not_a_failure(monkeypatch):
+    """On a host without a ComfyUI tree the probe exits 2 with a 'fatal' report.
+
+    The fixture must then **skip** with a reason (the documented behaviour);
+    before the fix the helper asserted ``rc == 0`` first, so the skip was
+    unreachable and the P0.1 tests failed hard on such a host.
+    """
+    spec = importlib.util.spec_from_file_location("keep_baseline_probe", PROBE)
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+    # no ComfyUI tree at all: neither the fallback roots nor COMFYUI_ROOT exist
+    monkeypatch.setattr(probe, "DEFAULT_COMFYUI_ROOTS", ())
+    monkeypatch.setenv("COMFYUI_ROOT", "C:/definitely-not-a-comfyui-tree")
+    report = probe.probe()
+    assert "fatal" in report, report
+    assert probe.main([]) == 2, "the probe must exit 2 when it has no ComfyUI tree"
+
+    # the fixture helper turns that report into a skip
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        _skip_if_fatal(report)
+    assert "ComfyUI source tree" in str(excinfo.value)
 
 
 @pytest.mark.unit

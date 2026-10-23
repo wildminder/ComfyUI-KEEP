@@ -15,14 +15,22 @@ The closure is computed with a static import tracer:
   (that is where ``modules/utils.py:16-19`` puts them on ``sys.path``);
 * relative imports resolve inside the current package;
 * importing a package also imports its parent packages' ``__init__.py``;
-* the **eager arch scan** of ``basicsr/archs/__init__.py:13-15`` is a dynamic
-  ``importlib.import_module`` loop - it is modelled explicitly, so every
-  ``*_arch.py`` in that folder belongs to the closure.
+* the **eager folder scans** of the vendored ``basicsr`` packages are dynamic
+  ``importlib.import_module`` loops - they are modelled explicitly (see
+  :data:`EAGER_SCAN_PACKAGES`), so every matching module of those folders
+  belongs to the closure.
 
 Usage (embedded python):
 
     C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/scan_compat.py
     C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/scan_compat.py --json out.json
+
+Exit codes:
+
+* ``0`` - the scan ran and found **no** incompatible pattern in the closure;
+* ``1`` - the scan ran and found **at least one** incompatible pattern
+  (``finding_count > 0``).  This is a *result*, not a tool crash: the fix list
+  is in ``docs/audit/2026-10-22-compat-scan.md``.
 """
 
 from __future__ import annotations
@@ -45,6 +53,28 @@ ENTRY_POINTS = (
 #: Top-level packages that are vendored and therefore resolved inside
 #: ``modules/deps`` (they are put on ``sys.path`` by ``modules/utils.py``).
 VENDORED_ROOTS = ("basicsr", "facelib")
+
+#: The vendored ``basicsr`` packages whose ``__init__.py`` scans its own folder
+#: at import time and imports every matching module **eagerly** through
+#: ``importlib.import_module``.  Each of those modules is therefore part of the
+#: runtime closure, even though no static import statement mentions it.
+#:
+#: package folder -> (file suffix, source of the scan in the vendored tree)
+#:
+#: * ``archs``  - ``basicsr/archs/__init__.py:13-15``  (``*_arch.py``)
+#: * ``data``   - ``basicsr/data/__init__.py:20-22``   (``*_dataset.py``)
+#: * ``losses`` - ``basicsr/losses/__init__.py:14-16`` (``*_loss.py``)
+#: * ``models`` - ``basicsr/models/__init__.py:13-15`` (``*_model.py``)
+#:
+#: Omitting one of these scans understates the closure: ``basicsr/__init__.py``
+#: imports every one of those packages, so the whole ``models/`` / ``data/`` /
+#: ``losses/`` folders are loaded by ``import basicsr``.
+EAGER_SCAN_PACKAGES: dict[str, str] = {
+    "archs": "_arch.py",
+    "data": "_dataset.py",
+    "losses": "_loss.py",
+    "models": "_model.py",
+}
 
 #: (pattern id, human description, regex)
 PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
@@ -178,7 +208,16 @@ def _imported_module_names(tree: ast.AST, current_file: Path) -> list[tuple[int,
                 imports.append((0, alias.name.split(".")))
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            imports.append((node.level or 0, module.split(".") if module else []))
+            base = module.split(".") if module else []
+            imports.append((node.level or 0, base))
+            # ``from <package> import <submodule>`` loads the submodule file as
+            # well (e.g. ``from basicsr.models import lr_scheduler`` in
+            # ``basicsr/models/base_model.py:8``).  The resolver drops the
+            # candidates that are not files, so plain symbol imports cost
+            # nothing.
+            for alias in node.names:
+                if alias.name != "*":
+                    imports.append((node.level or 0, base + [alias.name]))
     return imports
 
 
@@ -226,11 +265,13 @@ def find_import_closure(entry_points: list[Path]) -> list[Path]:
             for dependency in _resolve(level, parts, current):
                 if dependency.resolve() not in closure:
                     queue.append(dependency.resolve())
-        # the eager arch scan of basicsr/archs/__init__.py
-        if current.name == "__init__.py" and current.parent.name == "archs":
-            for arch in sorted(current.parent.glob("*_arch.py")):
-                if arch.resolve() not in closure:
-                    queue.append(arch.resolve())
+        # the eager folder scans of basicsr/archs|data|losses|models/__init__.py
+        if current.name == "__init__.py":
+            suffix = EAGER_SCAN_PACKAGES.get(current.parent.name)
+            if suffix:
+                for module in sorted(current.parent.glob(f"*{suffix}")):
+                    if module.resolve() not in closure:
+                        queue.append(module.resolve())
     return sorted(closure, key=lambda p: str(p).lower())
 
 
