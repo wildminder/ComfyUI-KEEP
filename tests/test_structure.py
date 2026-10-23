@@ -25,7 +25,8 @@ guard  what it checks                                  flip owner
        in ``src/**`` (the plan's §3 rule: the pack
        imports without a ComfyUI server)
 (g)    no ``torch.cuda.empty_cache()`` in the            **P4.6**
-       runtime closure (the pack's code **and** the
+       runtime closure (the pack's code - entry point,
+       node layer and ``src/`` - **and** the
        vendored tree - the known upstream occurrences
        are allowlisted by file and count)
 (h)    the dead video path (``process_video`` /          **P4.7**
@@ -55,6 +56,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: therefore out of scope - the guard is about the shipped package.
 PACKAGE_SOURCE_ROOTS = ("__init__.py", "nodes.py", "nodes", "src", "modules")
 
+#: The production sources of the pack **itself** - the vendored tree
+#: (``modules/``) is not part of it.  These are the files ComfyUI executes:
+#: the root entry point, the node layer (``nodes/``) and ``src/``.
+PACKAGE_OWN_SOURCE_ROOTS = ("__init__.py", "nodes.py", "nodes", "src")
+
 #: The patterns of guard (e).  They are the ``pdb``/``torch_profiler``/
 #: ``import_pip``/``pip_main`` patterns of the P0.3 scanner, so the guard and
 #: the scanner never drift apart.
@@ -77,7 +83,7 @@ def _relative(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
-def _package_files(root: Path) -> list[Path]:
+def _package_files(root: Path, roots: tuple[str, ...] = PACKAGE_SOURCE_ROOTS) -> list[Path]:
     """Every production python file of the package (the vendored tree included).
 
     The vendored tree used to be exempt from guard (d): it was a plain folder
@@ -85,9 +91,13 @@ def _package_files(root: Path) -> list[Path]:
     of the package, so the plan's §3 rule ("no ``sys.path`` mutation anywhere
     in the package") applies to it as well - the last vendored mutation was
     removed in the P2 review fix.
+
+    ``roots`` selects the trees to walk: the whole package by default, the
+    pack's own code without the vendored tree for the guards that scan the
+    vendored part through the import closure instead.
     """
     files: list[Path] = []
-    for entry in PACKAGE_SOURCE_ROOTS:
+    for entry in roots:
         target = root / entry
         if target.is_file():
             files.append(target)
@@ -359,9 +369,11 @@ def _code_text(path: Path) -> str:
 def empty_cache_violations(root: Path) -> list[str]:
     """No ``torch.cuda.empty_cache()`` in the surviving runtime closure.
 
-    The scan covers the pack's own ``src/**`` **and** the vendored
-    ``modules/deps`` closure (not just ``src/``).  The vendored occurrences
-    are allowlisted by file and count (see
+    The scan covers the pack's **own** code - the root entry point, the node
+    layer (``nodes/**``) and ``src/**`` - **and** the vendored ``modules/deps``
+    closure (not just ``src/``).  The node layer is the code ComfyUI
+    actually executes, so it is guarded like ``src/`` (P4 review fix).  The
+    vendored occurrences are allowlisted by file and count (see
     ``VENDORED_EMPTY_CACHE_ALLOWLIST``); every other occurrence is a
     violation.
     """
@@ -369,10 +381,8 @@ def empty_cache_violations(root: Path) -> list[str]:
     for path in _closure_files(root):
         if path.is_file():
             files[_relative(path, root)] = path
-    src_dir = root / "src"
-    if src_dir.is_dir():
-        for path in sorted(src_dir.rglob("*.py")):
-            files[_relative(path, root)] = path
+    for path in _package_files(root, PACKAGE_OWN_SOURCE_ROOTS):
+        files[_relative(path, root)] = path
 
     counts: dict[str, int] = {}
     for relative, path in files.items():
@@ -661,6 +671,44 @@ def test_self_test_guard_g_detects_an_empty_cache_call(repo_copy):
     violations = empty_cache_violations(repo_copy)
     assert any("keep_processor.py" in violation for violation in violations), (
         f"the guard did not catch the empty_cache call: {violations}"
+    )
+
+
+@pytest.mark.unit
+def test_self_test_guard_g_detects_an_empty_cache_call_in_the_node_layer(repo_copy):
+    """The guard covers the node layer - the code ComfyUI executes."""
+    target = repo_copy / "nodes" / "keep_process_image_sequence.py"
+    assert empty_cache_violations(repo_copy) == [], (
+        "a clean package must not be reported"
+    )
+
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + "\n\ndef _probe():\n    torch.cuda.empty_cache()\n",
+        encoding="utf-8",
+    )
+    violations = empty_cache_violations(repo_copy)
+    assert any("keep_process_image_sequence.py" in violation for violation in violations), (
+        f"the guard did not catch the empty_cache call in the node layer: {violations}"
+    )
+
+
+@pytest.mark.unit
+def test_self_test_guard_g_detects_an_empty_cache_call_in_the_entry_point(repo_copy):
+    """The guard covers the root ``__init__.py`` - the entry point."""
+    target = repo_copy / "__init__.py"
+    assert empty_cache_violations(repo_copy) == [], (
+        "a clean package must not be reported"
+    )
+
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + "\n\ndef _probe():\n    torch.cuda.empty_cache()\n",
+        encoding="utf-8",
+    )
+    violations = empty_cache_violations(repo_copy)
+    assert any("__init__.py" in violation for violation in violations), (
+        f"the guard did not catch the empty_cache call in the entry point: {violations}"
     )
 
 

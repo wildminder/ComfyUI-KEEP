@@ -158,23 +158,41 @@ def test_offload_moves_the_models_back_and_frees_the_vram(pack, model_management
 def test_the_cpu_mode_makes_the_same_calls(
     loader_module, model_management, monkeypatch
 ):
-    """``get_torch_device()`` -> cpu: the same residency calls are made."""
-    monkeypatch.setattr(
-        model_management, "get_torch_device", lambda: torch.device("cpu")
-    )
+    """``get_torch_device()`` -> cpu: the same residency calls are made.
 
-    pack = loader_module.KEEPModelPack(
-        _StubKeepNet(), _StubFaceHelper(), None, None, "KEEP"
-    )
-    assert pack.device == torch.device("cpu")
+    The conftest mock answers ``cpu`` by default (``conftest.py``: the
+    ``get_torch_device`` / ``unet_offload_device`` of the mocked
+    ``comfy.model_management``), so patching the device to ``cpu`` alone
+    would exercise the default path and prove nothing.  The CPU leg is
+    therefore compared with a **GPU leg**: both devices must produce the
+    same residency calls - the pack must not branch on the device.  A
+    device dependent path is exactly the B7 CPU crash (the pack called
+    ``torch.cuda.empty_cache()`` and crashed on a CPU-only host).
+    """
 
-    pack.load_device()
-    pack.offload()
+    def residency_calls(device):
+        monkeypatch.setattr(model_management, "get_torch_device", lambda: device)
+        monkeypatch.setattr(model_management, "unet_offload_device", lambda: device)
+        model_management.calls.clear()
 
-    names = [call[0] for call in model_management.calls]
-    assert names.count("load_models_gpu") == 1, model_management.calls
-    assert names.count("unload_all_models") == 1, model_management.calls
-    assert names.count("soft_empty_cache") == 1, model_management.calls
+        pack = loader_module.KEEPModelPack(
+            _StubKeepNet(), _StubFaceHelper(), None, None, "KEEP"
+        )
+        # the patched device really reaches the pack - the leg is not a no-op
+        assert pack.device == device
+        assert pack.offload_device == device
+
+        pack.load_device()
+        pack.offload()
+        return [call[0] for call in model_management.calls]
+
+    gpu_calls = residency_calls(torch.device("cuda"))
+    cpu_calls = residency_calls(torch.device("cpu"))
+
+    assert cpu_calls == gpu_calls, (cpu_calls, gpu_calls)
+    assert cpu_calls.count("load_models_gpu") == 1, cpu_calls
+    assert cpu_calls.count("unload_all_models") == 1, cpu_calls
+    assert cpu_calls.count("soft_empty_cache") == 1, cpu_calls
 
 
 # ---------------------------------------------------------------------------
