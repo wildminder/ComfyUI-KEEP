@@ -10,23 +10,18 @@ import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from torchvision.transforms.functional import normalize
-import os
 from tqdm import tqdm # Import tqdm for console progress bars
 from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
 from .keep_logger import logger
+from .keep_progress import ProgressReporter
 
 # Imports from vendored basicsr and facelib
 #
-# P2.1: the vendored ``basicsr.utils.video_util`` module is deleted (it
-# ran a pip install of ``ffmpeg-python`` at import time), so its
-# ``VideoReader`` / ``VideoWriter`` are not importable any more.
-# ``process_video`` is the only user and it is dead code (nothing in
-# the package calls it; P4.7 removes it), so it now fails loudly instead of
-# silently importing a stub.  The image / image-sequence paths are unaffected.
-#
-# P2 review fix: the unreachable body of ``process_video`` (it still called
-# the deleted ``VideoReader`` / ``VideoWriter``) is gone - the method is now
-# the raise and nothing else.
+# P2.1: the vendored ``basicsr.utils.video_util`` module is deleted (it ran
+# a pip install of ``ffmpeg-python`` at import time).  Its video helpers are
+# not importable any more and the dead video path of the processor that used
+# them was removed with it (P4.7).  The image / image-sequence paths are
+# unaffected.
 #
 # P2.7: the dummy image helpers are gone - a broken vendored dependency must
 # fail loudly instead of returning ``None`` images.
@@ -192,25 +187,6 @@ class KEEPFaceProcessor:
         return final_restored_image
 
     @torch.no_grad()
-    def process_video(self, video_path: str, output_video_path: str,
-                      final_upscale_factor: float, has_aligned: bool, only_center_face: bool, draw_box: bool,
-                      max_clip_length: int = 20, target_fps: float = None):
-        """Removed in P2.1 - the vendored ffmpeg shim is gone.
-
-        The vendored ``basicsr.utils.video_util`` module executed a pip
-        install at import time; it was deleted in P2.1 and this dead code
-        path was disabled with it.  The unreachable body that still used the
-        deleted ``VideoReader`` / ``VideoWriter`` was removed in the P2
-        review fix.  Use ``KEEP_ProcessImageSequence`` for sequences (P4.7
-        removes this method entirely).
-        """
-        raise NotImplementedError(
-            "process_video is not supported any more: the vendored "
-            "ffmpeg-python shim was removed in P2.1. Use the "
-            "KEEP_ProcessImageSequence node for image sequences."
-        )
-
-    @torch.no_grad()
     def process_image_sequence(self,
                                image_sequence_tensor: torch.Tensor,
                                final_upscale_factor: float,
@@ -218,19 +194,19 @@ class KEEPFaceProcessor:
                                only_center_face: bool,
                                draw_box: bool,
                                max_clip_length: int = 20):
-        from comfy.utils import ProgressBar  # lazy: the pack imports without ComfyUI
-
         num_input_frames = image_sequence_tensor.shape[0]
         if num_input_frames == 0:
             return image_sequence_tensor
 
-        pbar_comfy = ProgressBar(num_input_frames * 4)
+        # P4.7: the V3 progress API replaces the V1 ``comfy.utils.ProgressBar``
+        # (``src/keep_progress.py`` reports through the execution API).
+        progress = ProgressReporter(num_input_frames * 4)
 
         input_frames_bgr = []
         for i in range(num_input_frames):
             frame_tensor = image_sequence_tensor[i].unsqueeze(0) 
             input_frames_bgr.append(comfy_image_to_cv2(frame_tensor))
-            pbar_comfy.update(1)
+            progress.update(1)
         
         avg_landmarks_sequence = None
         if not has_aligned_frames:
@@ -252,9 +228,9 @@ class KEEPFaceProcessor:
             for i_lm_coord in range(raw_landmarks_np_video.shape[1]):
                 raw_landmarks_np_video[:, i_lm_coord] = interpolate_sequence(raw_landmarks_np_video[:, i_lm_coord])
             avg_landmarks_sequence = gaussian_filter1d(raw_landmarks_np_video, sigma=5, axis=0).reshape(num_input_frames, 5, 2)
-            pbar_comfy.update(num_input_frames)
+            progress.update(num_input_frames)
         else:
-             pbar_comfy.update(num_input_frames)
+             progress.update(num_input_frames)
 
         all_cropped_face_tensors = []
         for i in tqdm(range(num_input_frames), desc="Cropping and aligning faces"):
@@ -295,7 +271,7 @@ class KEEPFaceProcessor:
             else:
                  clip_output_tensor = self.keep_net(current_clip_faces, need_upscale=False)
                  temp_restored_face_tensors.append(clip_output_tensor)
-            pbar_comfy.update(end_idx - start_idx)
+            progress.update(end_idx - start_idx)
             # P4.6: the chunk boundary - the cached blocks of the finished
             # chunk are released before the next chunk is allocated.
             _soft_empty_cache()
@@ -358,7 +334,7 @@ class KEEPFaceProcessor:
                     final_pasted_frame = cv2.cvtColor(final_pasted_frame, cv2.COLOR_GRAY2BGR)
 
             output_frames_cv2.append(final_pasted_frame)
-            pbar_comfy.update(1)
+            progress.update(1)
             
         output_tensors = [cv2_to_comfy_image(frame) for frame in output_frames_cv2]
         if not output_tensors:

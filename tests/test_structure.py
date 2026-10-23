@@ -465,9 +465,6 @@ def test_guard_no_unconditional_empty_cache_in_the_closure():
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=False, reason="flip owner: P4.7 removes the dead video path"
-)
 def test_guard_the_dead_video_path_is_gone():
     """Guard (h) - flipped to strict in P4.7 (its flip owner)."""
     assert dead_video_violations(REPO_ROOT) == []

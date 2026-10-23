@@ -772,9 +772,9 @@ def test_the_stub_sites_yield_the_real_vendored_symbols():
     assert utils.ARCH_REGISTRY.__module__.endswith(
         ".modules.deps.basicsr.utils.registry"
     )
-    assert utils.load_file_from_url.__module__.endswith(
-        ".modules.deps.basicsr.utils.download_util"
-    )
+    # P4.7: the ``load_file_from_url`` import of the config module was dead
+    # (the downloads run through ``src/keep_paths.py``) - it is gone.
+    assert not hasattr(utils, "load_file_from_url")
     assert processor.img2tensor.__module__.endswith(
         ".modules.deps.basicsr.utils.img_util"
     )

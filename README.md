@@ -90,6 +90,15 @@ This package includes the following custom nodes:
 
 4.  **Restart ComfyUI.**
 
+## Future work
+
+*   **A video node:** a node that takes a video file, restores the faces of
+    every frame with KEEP and writes the result back as a video.  The pack
+    deliberately ships **no** video code path - the vendored ffmpeg shim was
+    removed (it installed `ffmpeg-python` at import time).  Until such a node
+    exists, feed the frames of a video into the **KEEP Image Sequence** node
+    (e.g. with the *Video Helper Suite* nodes) and write them back there.
+
 ## Citation for Original KEEP
 
 If you use the core KEEP algorithm or models in your research, please cite the original paper:

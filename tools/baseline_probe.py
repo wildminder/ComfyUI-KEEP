@@ -241,7 +241,10 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
     report["stubs"] = {
         "utils_arch_registry_dummy": registry_type == "DummyArchRegistry",
         "utils_load_file_from_url_fallback": (
-            getattr(utils_mod, "load_file_from_url").__module__ == utils_mod.__name__
+            # P4.7: the dead import is gone - an absent symbol is not a stub.
+            getattr(utils_mod, "load_file_from_url", None) is not None
+            and getattr(utils_mod, "load_file_from_url").__module__
+            == utils_mod.__name__
         ),
         "processor_img2tensor_is_dummy": (
             getattr(processor_mod, "img2tensor").__module__ == processor_mod.__name__

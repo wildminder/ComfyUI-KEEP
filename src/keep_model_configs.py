@@ -9,19 +9,18 @@ P5.1 turns the config table into the ``WEIGHT_MANIFEST`` (the ``dest_folder``
 download helper into ``src/keep_download.py``.
 """
 
-from .keep_logger import logger
-
 # directly import from the vendored basicsr
 #
 # P2.7: the swallow-and-stub fallback is gone.  A broken vendored dependency
 # must fail loudly - the dummy registry hid the missing KEEP architecture and
 # the node kept loading without it.
+#
+# P4.7: the unused ``load_file_from_url`` import is gone - the downloads run
+# through ``src/keep_paths.py`` (``load_file_from_url_comfy``).
 try:  # the package import (the node package is the parent package)
     from ..modules.deps.basicsr.utils.registry import ARCH_REGISTRY
-    from ..modules.deps.basicsr.utils.download_util import load_file_from_url
 except ImportError:  # the flat import (the repository root on sys.path)
     from modules.deps.basicsr.utils.registry import ARCH_REGISTRY
-    from modules.deps.basicsr.utils.download_util import load_file_from_url
 
 KEEP_MODEL_CONFIGS = {
     'KEEP': {
