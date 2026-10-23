@@ -1,4 +1,8 @@
 # Modified from https://github.com/open-mmlab/mmcv/blob/master/mmcv/fileio/file_client.py  # noqa: E501
+#
+# The optional ``sys_path`` parameter of ``MemcachedBackend`` (it appended to
+# ``sys.path``) is removed: the package must never mutate ``sys.path``
+# (plan §3, import rules).  Nothing in the closure passes it.
 from abc import ABCMeta, abstractmethod
 
 
@@ -25,14 +29,9 @@ class MemcachedBackend(BaseStorageBackend):
     Attributes:
         server_list_cfg (str): Config file for memcached server list.
         client_cfg (str): Config file for memcached client.
-        sys_path (str | None): Additional path to be appended to `sys.path`.
-            Default: None.
     """
 
-    def __init__(self, server_list_cfg, client_cfg, sys_path=None):
-        if sys_path is not None:
-            import sys
-            sys.path.append(sys_path)
+    def __init__(self, server_list_cfg, client_cfg):
         try:
             import mc
         except ImportError:

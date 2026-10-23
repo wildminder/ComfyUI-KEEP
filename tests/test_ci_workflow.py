@@ -317,6 +317,63 @@ def test_test_job_installs_the_real_dependencies(workflow):
     assert '"3.10"' in text, "the 3.10-only installs must be conditional"
 
 
+#: The distributions of ``requirements.txt`` that the CI may satisfy with a
+#: different build - the headless OpenCV wheel has no GUI dependencies.
+_CI_INSTALL_ALIASES = {
+    "opencv-python": ("opencv-python", "opencv-python-headless"),
+}
+
+
+def _runtime_requirements() -> list[str]:
+    """The distributions of ``requirements.txt`` (the true runtime set)."""
+    text = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _installed_distributions(run_text: str) -> set[str]:
+    """Every distribution the job installs (the tokens of its pip calls)."""
+    installed: set[str] = set()
+    for line in run_text.splitlines():
+        parts = line.split()
+        if "pip" not in parts or "install" not in parts:
+            continue
+        for token in parts[parts.index("install") + 1 :]:
+            token = token.strip().strip('"').strip("'").lower()
+            if not token or token.startswith("-"):
+                continue
+            for separator in ("<", ">", "=", "["):
+                token = token.split(separator)[0]
+            installed.add(token)
+    return installed
+
+
+@pytest.mark.unit
+def test_the_ci_installs_every_runtime_requirement(workflow):
+    """The CI job installs every distribution of ``requirements.txt``.
+
+    ``requirements.txt`` is the true runtime set of the package (P2.6).  A
+    distribution that is missing from the install list kills the unit tier
+    on a clean runner with a ``ModuleNotFoundError`` - ``requests`` is
+    imported **eagerly** by ``modules/deps/basicsr/utils/download_util.py``
+    (which the package imports in ``modules/utils.py``).
+    """
+    installed = _installed_distributions(_run_text(workflow["jobs"]["test"]))
+    missing = []
+    for requirement in _runtime_requirements():
+        name = requirement.lower().replace("_", "-")
+        aliases = _CI_INSTALL_ALIASES.get(name, (name,))
+        if not any(alias in installed for alias in aliases):
+            missing.append(requirement)
+    assert not missing, (
+        f"the CI job does not install {missing} - requirements.txt is the "
+        f"true runtime set (P2.6)"
+    )
+
+
 @pytest.mark.unit
 def test_test_job_runs_the_local_gate_command(workflow):
     """The CI command is exactly the local gate command."""

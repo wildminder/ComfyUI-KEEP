@@ -17,7 +17,8 @@ guard  what it checks                                  flip owner
 (c)    the root ``__init__.py`` exposes exactly          **P4.4**
        ``comfy_entrypoint`` (no V1 mapping names)
 (d)    no ``sys.path.insert`` / ``sys.path.append``      **P2.5**
-       outside ``modules/deps/**``
+       anywhere in the package (the vendored tree
+       included - it was exempt only until P2.5)
 (e)    no ``pdb`` / ``torch.profiler`` / ``import pip``  **P2.1**
        / ``pip.main`` in the vendored runtime closure
 ===== ================================================ ==================
@@ -45,9 +46,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: therefore out of scope - the guard is about the shipped package.
 PACKAGE_SOURCE_ROOTS = ("__init__.py", "nodes.py", "nodes", "src", "modules")
 
-#: The vendored tree - exempt from guard (d) until P2.5 package-izes it.
-VENDORED_PREFIX = ("modules", "deps")
-
 #: The patterns of guard (e).  They are the ``pdb``/``torch_profiler``/
 #: ``import_pip``/``pip_main`` patterns of the P0.3 scanner, so the guard and
 #: the scanner never drift apart.
@@ -71,7 +69,14 @@ def _relative(path: Path, root: Path) -> str:
 
 
 def _package_files(root: Path) -> list[Path]:
-    """Every production python file of the package (vendored tree excluded)."""
+    """Every production python file of the package (the vendored tree included).
+
+    The vendored tree used to be exempt from guard (d): it was a plain folder
+    on ``sys.path`` until P2.5 package-ized it.  Since P2.5 it is a real part
+    of the package, so the plan's §3 rule ("no ``sys.path`` mutation anywhere
+    in the package") applies to it as well - the last vendored mutation was
+    removed in the P2 review fix.
+    """
     files: list[Path] = []
     for entry in PACKAGE_SOURCE_ROOTS:
         target = root / entry
@@ -79,13 +84,7 @@ def _package_files(root: Path) -> list[Path]:
             files.append(target)
         elif target.is_dir():
             files.extend(sorted(target.rglob("*.py")))
-    result = []
-    for path in files:
-        parts = path.relative_to(root).parts
-        if parts[: len(VENDORED_PREFIX)] == VENDORED_PREFIX:
-            continue
-        result.append(path)
-    return result
+    return files
 
 
 def _closure_files(root: Path) -> list[Path]:
@@ -193,7 +192,7 @@ def entrypoint_violations(root: Path) -> list[str]:
 # guard (d) - no sys.path mutation
 # ---------------------------------------------------------------------------
 def sys_path_violations(root: Path) -> list[str]:
-    """No ``sys.path.insert``/``append`` outside the vendored tree."""
+    """No ``sys.path.insert``/``append`` anywhere in the package."""
     violations: list[str] = []
     for path in _package_files(root):
         for number, line in enumerate(_read(path).splitlines(), 1):

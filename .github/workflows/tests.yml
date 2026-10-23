@@ -80,7 +80,10 @@ jobs:
           # PyYAML: the vendored tree imports it eagerly
           # (modules/deps/basicsr/utils/options.py:5 -> basicsr/utils/__init__.py:8),
           # so the unit tier fails with "No module named 'yaml'" without it.
-          python -m pip install opencv-python-headless einops scipy Pillow tqdm pytest pyyaml
+          # requests: the vendored download utility imports it eagerly
+          # (modules/deps/basicsr/utils/download_util.py:3 -> modules/utils.py:19),
+          # so the unit tier fails with "No module named 'requests'" without it.
+          python -m pip install opencv-python-headless einops scipy Pillow tqdm pytest pyyaml requests
 
       - name: Run the unit, mock_integration and headless tiers
         run: python -m pytest -q -m "unit or mock_integration or headless"

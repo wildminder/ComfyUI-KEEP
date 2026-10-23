@@ -11,6 +11,7 @@ Tiers:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -114,37 +115,64 @@ def test_importing_the_vendored_utils_never_calls_pip():
     )
 
 
-@pytest.mark.unit
-def test_the_next_failure_after_p21_is_the_diffusers_import():
-    """P2.1 (c): the eager arch scan now fails **exactly** at the diffusers import.
+#: The probe of the P2.1 (c) progression.  The vendored architecture is
+#: imported through the **packaged** layout (P2.5): the top-level ``basicsr``
+#: of ``modules/deps`` does not exist any more, so a probe that put
+#: ``modules/deps`` on ``sys.path`` would exercise a *second* copy of the
+#: vendored tree instead of the shipped one.
+_ARCH_PROBE = """
+import importlib, json, sys
+from pathlib import Path
 
-    The plan's documented progression: B1 (``from re import T``) is gone, so
-    B2 (the diffusers import) is the next failure.
-    """
-    code = (
-        "import importlib, sys\n"
-        f"sys.path.insert(0, {str(DEPS_DIR)!r})\n"
-        "try:\n"
-        "    importlib.import_module('basicsr.archs.keep_arch')\n"
-        "    print('IMPORTED')\n"
-        "except BaseException as exc:\n"
-        "    import traceback\n"
-        "    print(type(exc).__name__)\n"
-        "    print(str(exc)[:300])\n"
-        "    print('TB_HAS_DIFFUSERS', 'diffusers' in traceback.format_exc())\n"
-        "    print('TB_HAS_RE_T', \"cannot import name 'T' from 're'\" in traceback.format_exc())\n"
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+import conftest  # registers the package alias and the ComfyUI mocks
+
+report = {}
+try:
+    module = importlib.import_module(
+        "ComfyUI_KEEP.modules.deps.basicsr.archs.keep_arch"
     )
-    result = _run_python(code)
-    assert result.returncode == 0, result.stderr
-    out = result.stdout
-    if "IMPORTED" in out:
-        # P2.2 vendored the diffusers symbols: the arch imports cleanly now
-        return
-    # P2.1 state: the failure is exactly the diffusers import (B2)
-    assert "ImportError" in out, out
-    assert "cached_download" in out, out
-    assert "TB_HAS_DIFFUSERS True" in out, out
-    assert "TB_HAS_RE_T False" in out, out
+except BaseException as exc:  # noqa: BLE001 - the probe records everything
+    import traceback
+    report["error"] = type(exc).__name__ + ": " + str(exc)[:300]
+    report["traceback"] = traceback.format_exc()
+else:
+    report["module"] = module.__name__
+    report["feedforward"] = module.FeedForward.__module__
+    report["ada_layer_norm"] = module.AdaLayerNorm.__module__
+report["basicsr_in_sys_modules"] = "basicsr" in sys.modules
+print(json.dumps(report))
+"""
+
+
+@pytest.mark.unit
+def test_the_next_failure_after_p21_is_resolved_by_the_vendored_diffusers():
+    """P2.1 (c): the documented next-failure progression is **complete**.
+
+    The plan's progression: B1 (``from re import T``) is gone, so B2 (the
+    diffusers import) had to be the next failure.  P2.2 vendored the two
+    diffusers classes, so the architecture imports now - the test has to
+    *prove* that instead of returning early (a test that returns before its
+    assertions verifies nothing).
+    """
+    result = _run_python(_ARCH_PROBE, str(REPO_ROOT))
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert "error" not in report, report
+    # the architecture imports through the package of the node
+    assert report["module"] == (
+        "ComfyUI_KEEP.modules.deps.basicsr.archs.keep_arch"
+    ), report
+    # B2 is resolved by the vendored copy, not by a hidden fallback
+    assert report["feedforward"] == (
+        "ComfyUI_KEEP.modules.deps.basicsr.archs._diffusers_compat"
+    ), report
+    assert report["ada_layer_norm"] == (
+        "ComfyUI_KEEP.modules.deps.basicsr.archs._diffusers_compat"
+    ), report
+    # no top-level ``basicsr`` shadows an installed one (P2.5)
+    assert report["basicsr_in_sys_modules"] is False, report
 
 
 @pytest.mark.unit
@@ -486,18 +514,48 @@ def test_importing_the_package_does_not_change_sys_path():
 # P2.6 - requirements.txt is the true runtime set
 # ---------------------------------------------------------------------------
 
-#: The third-party modules the closure imports -> their distribution name.
+#: The third-party module names of the closure -> their **distribution** name.
+#: Only the names whose distribution differs from the module name are listed;
+#: every other module is its own distribution name (``torch`` -> ``torch``,
+#: ``numpy`` -> ``numpy``, ...).
+#:
+#: This map is a **rename** map, not an allowlist: a module that is not in it
+#: is *not* dropped, it is mapped to its own name - and therefore shows up as
+#: an undeclared dependency (that was the hole of the first version of this
+#: guard: it filtered the imports through this map, so every module outside
+#: of it was silently ignored).
 _DISTRIBUTIONS = {
-    "torch": "torch",
-    "torchvision": "torchvision",
-    "numpy": "numpy",
-    "scipy": "scipy",
     "cv2": "opencv-python",
     "PIL": "Pillow",
-    "einops": "einops",
-    "tqdm": "tqdm",
     "yaml": "pyyaml",
-    "requests": "requests",
+}
+
+#: The modules the **ComfyUI host** provides - they are not dependencies of
+#: this package and therefore not part of ``requirements.txt``.
+_HOST_MODULES = ("comfy", "comfy_api", "folder_paths")
+
+#: The vendored packages - imported relatively (P2.5), never a dependency.
+_VENDORED_MODULES = ("basicsr", "facelib")
+
+#: The third-party modules the closure imports **lazily** (inside a
+#: function).  They are not runtime dependencies of the node, so they are not
+#: declared - but every one of them has to be listed here with a reason, so
+#: that a new lazy import cannot slip through unnoticed either.
+_OPTIONAL_LAZY_IMPORTS = {
+    "dlib": (
+        "facelib FaceRestoreHelper.init_dlib_from_paths - only reached with "
+        "det_model='dlib'; the node offers retinaface / YOLOv5 only"
+    ),
+    "gdown": (
+        "facelib misc.download_pretrained_models - never called by the node"
+    ),
+    "mc": (
+        "basicsr MemcachedBackend - only with FileClient(backend='memcached'); "
+        "the node reads from the disk backend"
+    ),
+    "wandb": (
+        "basicsr logger.init_wandb_logger - training only (basicsr/train.py)"
+    ),
 }
 
 #: The dependency set of the pruned closure (plan P2.6 + the two packages the
@@ -525,20 +583,96 @@ def _requirement_entries():
     }
 
 
-def _closure_imports():
-    """The third-party module names imported by the runtime closure."""
-    import ast
+class _ImportCollector(ast.NodeVisitor):
+    """Collects the imported module names, split by *import time* and *lazy*.
 
-    report = _scan_report()
-    names = set()
-    for rel in report["closure_files"]:
+    An import at module level (or in a class body - it runs when the class
+    is created) is a dependency of the package: it runs on every import.
+    An import inside a function is **lazy**: it only runs when that function
+    is called, so it is not a dependency of the package itself.
+    """
+
+    def __init__(self) -> None:
+        self.module_level: set[str] = set()
+        self.lazy: set[str] = set()
+        self._function_depth = 0
+
+    # -- the scope handling ------------------------------------------------
+    def _visit_defaults(self, arguments) -> None:
+        """The default arguments are evaluated at import time."""
+        defaults = list(arguments.defaults)
+        defaults += [value for value in arguments.kw_defaults if value]
+        for default in defaults:
+            self.visit(default)
+
+    def _visit_function(self, node) -> None:
+        # decorators and default arguments are evaluated at import time
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self._visit_defaults(node.args)
+        # the body runs when the function is called
+        self._function_depth += 1
+        for statement in node.body:
+            self.visit(statement)
+        self._function_depth -= 1
+
+    def visit_FunctionDef(self, node) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node) -> None:
+        self._visit_function(node)
+
+    def visit_Lambda(self, node) -> None:
+        self._visit_defaults(node.args)
+        self._function_depth += 1
+        self.visit(node.body)
+        self._function_depth -= 1
+
+    # -- the imports -------------------------------------------------------
+    def visit_Import(self, node) -> None:
+        for alias in node.names:
+            self._add(alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node) -> None:
+        # a relative import (level > 0) stays inside the vendored tree
+        if node.level == 0 and node.module:
+            self._add(node.module.split(".")[0])
+
+    def _add(self, name: str) -> None:
+        if self._function_depth:
+            self.lazy.add(name)
+        else:
+            self.module_level.add(name)
+
+
+def _closure_import_collector() -> _ImportCollector:
+    """The import collector of the whole runtime closure."""
+    collector = _ImportCollector()
+    for rel in _scan_report()["closure_files"]:
         tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names.update(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names.add(node.module.split(".")[0])
-    return names
+        collector.visit(tree)
+    return collector
+
+
+def _closure_imports() -> set[str]:
+    """Every absolute module name imported by the runtime closure."""
+    collector = _closure_import_collector()
+    return collector.module_level | collector.lazy
+
+
+def _closure_third_party_imports() -> tuple[set[str], set[str]]:
+    """The third-party imports of the closure: (at import time, lazy only).
+
+    Excluded are the stdlib, the vendored packages (they are imported
+    relatively, P2.5) and the modules the ComfyUI host provides.
+    """
+    collector = _closure_import_collector()
+    excluded = (
+        set(sys.stdlib_module_names) | set(_VENDORED_MODULES) | set(_HOST_MODULES)
+    )
+    module_level = collector.module_level - excluded
+    lazy = (collector.lazy - excluded) - module_level
+    return module_level, lazy
 
 
 @pytest.mark.unit
@@ -560,15 +694,45 @@ def test_no_phantom_package_is_imported_in_the_closure():
 
 @pytest.mark.unit
 def test_every_third_party_import_of_the_closure_is_declared():
-    """P2.6: every third-party import of the closure is a declared dependency."""
-    imported = _closure_imports()
-    declared = {
-        _DISTRIBUTIONS[name] for name in imported if name in _DISTRIBUTIONS
-    }
+    """P2.6: every third-party import of the closure is a declared dependency.
+
+    The check is **exhaustive**: every third-party module the closure
+    imports at import time is mapped to a distribution name (identity,
+    unless ``_DISTRIBUTIONS`` says otherwise) and that distribution has to
+    be declared in ``requirements.txt``.  A module that is not in
+    ``_DISTRIBUTIONS`` is therefore *not* dropped - it shows up as an
+    undeclared dependency.
+    """
+    module_level, _lazy = _closure_third_party_imports()
     entries = _requirement_entries()
+    declared = {_DISTRIBUTIONS.get(name, name) for name in module_level}
     assert declared == entries, (
-        f"the closure imports {sorted(declared)}, requirements.txt declares "
-        f"{sorted(entries)}"
+        f"the closure imports {sorted(declared)} at import time, "
+        f"requirements.txt declares {sorted(entries)}; "
+        f"undeclared: {sorted(declared - entries)}; "
+        f"declared but unused: {sorted(entries - declared)}"
+    )
+
+
+@pytest.mark.unit
+def test_every_lazy_third_party_import_is_explicitly_allowed():
+    """P2.6: a lazy third-party import is listed with a reason.
+
+    A lazy import (inside a function) is not a dependency of the package,
+    so it is not declared in ``requirements.txt``.  It is still tracked:
+    an unlisted one fails this test, so a new third-party import cannot
+    slip through unnoticed - neither at import time nor inside a function.
+    """
+    _module_level, lazy = _closure_third_party_imports()
+    unlisted = sorted(lazy - set(_OPTIONAL_LAZY_IMPORTS))
+    assert unlisted == [], (
+        f"the closure imports {unlisted} lazily; either declare them in "
+        f"requirements.txt or list them in _OPTIONAL_LAZY_IMPORTS with a reason"
+    )
+    stale = sorted(set(_OPTIONAL_LAZY_IMPORTS) - lazy)
+    assert stale == [], (
+        f"_OPTIONAL_LAZY_IMPORTS lists {stale}, which the closure does not "
+        f"import lazily any more"
     )
 
 
@@ -620,6 +784,28 @@ def test_the_stub_sites_yield_the_real_vendored_symbols():
 
 
 @pytest.mark.unit
+def test_the_dead_video_path_references_no_deleted_symbol():
+    """P2.1/P2.7: the disabled ``process_video`` references no deleted symbol.
+
+    The vendored ``video_util`` module (with ``VideoReader`` /
+    ``VideoWriter``) is deleted in P2.1.  The unreachable body of
+    ``process_video`` still called them - it is gone now, so the method is
+    the raise and nothing else (the AST is checked, so the docstrings that
+    *mention* the deleted symbols are not offenders).
+    """
+    source = (REPO_ROOT / "modules" / "keep_processor.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    offenders = [
+        f"{node.lineno}: {node.id}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in ("VideoReader", "VideoWriter")
+    ]
+    assert offenders == [], offenders
+
+
+@pytest.mark.unit
 def test_a_broken_vendored_import_fails_loudly(tmp_path):
     """P2.7 (b): a broken vendored dependency makes the import fail.
 
@@ -657,3 +843,80 @@ def test_a_broken_vendored_import_fails_loudly(tmp_path):
     control = _run_python(_IMPORT_PACKAGE_SCRIPT, str(REPO_ROOT))
     assert control.returncode == 0, control.stdout + control.stderr
     assert "KEEP_IMPORT_OK" in control.stdout, control.stdout
+
+
+@pytest.mark.unit
+def test_no_import_fallback_stub_remains_in_the_vendored_tree():
+    """P2.7: the vendored tree has no swallow-and-stub fallback any more.
+
+    A fallback stub is an ``except ImportError`` handler that defines a
+    function or a class: the import failure is swallowed and the caller
+    gets a local substitute instead of the vendored symbol.  The two sites
+    that still had one (``facelib/detection`` and ``facelib/parsing``) were
+    removed in the P2 review fix - a broken vendored dependency has to fail
+    loudly, not degrade into a (broken) local stub.
+    """
+    offenders = []
+    for path in sorted(DEPS_DIR.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for handler in node.handlers:
+                caught = handler.type
+                if isinstance(caught, ast.Tuple):
+                    caught_names = {
+                        element.id
+                        for element in caught.elts
+                        if isinstance(element, ast.Name)
+                    }
+                elif isinstance(caught, ast.Name):
+                    caught_names = {caught.id}
+                else:
+                    caught_names = set()
+                if not caught_names & {"ImportError", "ModuleNotFoundError"}:
+                    continue
+                for statement in handler.body:
+                    if isinstance(
+                        statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                    ):
+                        offenders.append(
+                            f"{path.relative_to(REPO_ROOT).as_posix()}:"
+                            f"{statement.lineno}: fallback stub "
+                            f"{statement.name}"
+                        )
+    assert offenders == [], offenders
+
+
+@pytest.mark.unit
+def test_the_facelib_model_helpers_use_the_vendored_download_util():
+    """P2.7: the facelib detection / parsing helpers use the vendored symbol."""
+    import importlib
+
+    for name in ("detection", "parsing"):
+        module = importlib.import_module(f"ComfyUI_KEEP.modules.deps.facelib.{name}")
+        assert module.load_file_from_url.__module__ == (
+            "ComfyUI_KEEP.modules.deps.basicsr.utils.download_util"
+        ), module.load_file_from_url
+
+
+@pytest.mark.unit
+def test_the_vendored_tree_never_mutates_sys_path():
+    """P2.5: the vendored tree must not mutate ``sys.path``.
+
+    The plan's §3 import rule forbids a ``sys.path`` mutation **anywhere**
+    in the package.  The last one (``basicsr/utils/file_client.py``, the
+    optional ``sys_path`` of the memcached backend) was removed in the P2
+    review fix - the structure guard (d) now covers the vendored tree as
+    well.
+    """
+    offenders = []
+    for path in sorted(DEPS_DIR.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), 1):
+            if re.search(r"sys\.path\s*\.\s*(insert|append|extend)\s*\(", line):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT).as_posix()}:{number}: "
+                    f"{line.strip()}"
+                )
+    assert offenders == [], offenders
