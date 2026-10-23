@@ -3,11 +3,14 @@
 The engine that builds a :class:`KEEPModelPack`: the KEEP network, the
 facelib face helper and the optional ComfyUI upscalers.  It moved here from
 ``modules/keep_model_loader.py`` in P3.2.
+
+The ``comfy`` imports are **lazy** (function level): the plan's §3 import
+rule wants the pack to import without a ComfyUI server.  The vendored
+facelib helper imports ``comfy`` as well, so it is imported lazily too.
 """
 
 import torch
 import os
-from comfy import model_management
 
 from . import keep_paths
 from .keep_logger import logger
@@ -16,15 +19,39 @@ from .keep_model_configs import (
 )
 from .keep_paths import load_file_from_url_comfy
 
+
 # P2.7: the swallow-and-stub fallback is gone - a broken vendored dependency
 # must fail loudly instead of silently producing an unusable model pack.
-try:  # the package import (the node package is the parent package)
-    from ..modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
-except ImportError:  # the flat import (the repository root on sys.path)
-    from modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
+def _face_restore_helper():
+    """The vendored ``FaceRestoreHelper`` - imported **lazily**.
+
+    The vendored facelib imports ``comfy`` at module level, so the import
+    must not run while ``src.keep_model_loader`` is imported.
+    """
+    try:  # the package import (the node package is the parent package)
+        from ..modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
+    except ImportError:  # the flat import (the repository root on sys.path)
+        from modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
+    return FaceRestoreHelper
+
+
+def __getattr__(name: str):
+    """The lazy module attributes (PEP 562).
+
+    ``FaceRestoreHelper`` stays reachable as an attribute of the module (the
+    P2.5 / P2.7 tests assert that the vendored class is the one that is
+    used), but the import that pulls in ``comfy`` only happens when the
+    attribute is really read.
+    """
+    if name == "FaceRestoreHelper":
+        return _face_restore_helper()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 class KEEPModelPack:
     def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model, model_type_str):
+        from comfy import model_management  # lazy: the pack imports without ComfyUI
+
         self.keep_net = keep_net
         self.face_helper = face_helper
         self.bg_upscale_model = bg_upscale_model
@@ -52,6 +79,8 @@ class KEEPModelPack:
 
     def offload(self):
         """Move all models to the offload device (CPU)."""
+        from comfy import model_management  # lazy: the pack imports without ComfyUI
+
         if self.keep_net is not None:
             self.keep_net.to(self.offload_device)
         if self.bg_upscale_model is not None:
@@ -70,6 +99,8 @@ class KEEPModelPack:
 
 class KEEPModelLoader:
     def __init__(self):
+        from comfy import model_management  # lazy: the pack imports without ComfyUI
+
         self.device = model_management.get_torch_device()
         self.offload_device = model_management.unet_offload_device()
         self.loaded_models = {}
@@ -134,9 +165,14 @@ class KEEPModelLoader:
             load_file_from_url_comfy(url=url, folder_name=FACELIB_DEST_FOLDER, file_name=fname, sha256=sha)
 
         # P3.5: the facelib root comes from the registered model folders -
-        # the raw ``folder_paths.models_dir`` concatenation is gone.
-        facelib_actual_paths = keep_paths.get_primary_folder(FACELIB_DEST_FOLDER)
-        
+        # the raw ``folder_paths.models_dir`` concatenation is gone.  It is
+        # the root the facelib weights really live in (an extra model root
+        # included), because facelib builds the weight paths from it.
+        facelib_actual_paths = keep_paths.resolve_model_root(
+            FACELIB_DEST_FOLDER, FACELIB_MODEL_URLS.keys()
+        )
+
+        FaceRestoreHelper = _face_restore_helper()
         try:
             face_helper = FaceRestoreHelper(
                 upscale_factor=1, face_size=512, crop_ratio=(1, 1),

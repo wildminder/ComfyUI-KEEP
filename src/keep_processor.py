@@ -13,7 +13,6 @@ from torchvision.transforms.functional import normalize
 import os
 from tqdm import tqdm # Import tqdm for console progress bars
 from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
-from comfy.utils import ProgressBar, tiled_scale
 
 # Imports from vendored basicsr and facelib
 #
@@ -60,6 +59,8 @@ class KEEPFaceProcessor:
 
     def _run_upscaler(self, model, cv2_image):
         """Helper to run a comfy-native upscaler on a cv2 image."""
+        from comfy.utils import tiled_scale  # lazy: the pack imports without ComfyUI
+
         if model is None:
             return cv2_image
 
@@ -195,6 +196,7 @@ class KEEPFaceProcessor:
                                only_center_face: bool,
                                draw_box: bool,
                                max_clip_length: int = 20):
+        from comfy.utils import ProgressBar  # lazy: the pack imports without ComfyUI
 
         num_input_frames = image_sequence_tensor.shape[0]
         if num_input_frames == 0:

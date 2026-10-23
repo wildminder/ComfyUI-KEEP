@@ -124,6 +124,98 @@ def test_a_missing_weight_names_the_file(keep_paths, mock_folder_paths):
     assert "does-not-exist.pth" in str(excinfo.value)
 
 
+#: A URL that cannot be downloaded - a test that expects **no** download
+#: fails fast (and loudly) when the lookup does not find the weight.
+UNREACHABLE_URL = "http://127.0.0.1:1/never-downloaded.pth"
+
+
+def _extra_model_root(mock_folder_paths) -> str:
+    """A second model root next to the (temporary) primary one."""
+    root = str(Path(mock_folder_paths.models_dir).parent / "extra-models")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _write_weight(path: str, content: bytes = b"not a real checkpoint") -> str:
+    """A weight file at ``path`` (the parent directories are created)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(content)
+    return path
+
+
+@pytest.mark.unit
+def test_the_loader_uses_a_weight_from_an_extra_model_root(keep_paths, mock_folder_paths):
+    """The **production** path finds a weight in an extra model root.
+
+    The plan (P3.5) wants the multi-root handling in the load path, not
+    only in a helper the product never calls: a weight that lives in an
+    extra model root is used where it is instead of being downloaded into
+    the primary root again.
+    """
+    keep_paths.register_model_folders()
+    extra = _extra_model_root(mock_folder_paths)
+    mock_folder_paths.add_model_folder_path("keep_models", extra)
+    weight = _write_weight(os.path.join(extra, "KEEP", "KEEP-b76feb75.pth"))
+
+    resolved = keep_paths.load_file_from_url_comfy(
+        url=UNREACHABLE_URL,
+        folder_name="keep_models",
+        file_name="KEEP-b76feb75.pth",
+        subdir="KEEP",
+    )
+    assert resolved == weight, resolved
+    # nothing was downloaded into the primary root
+    primary = os.path.join(
+        mock_folder_paths.models_dir, "keep_models", "KEEP", "KEEP-b76feb75.pth"
+    )
+    assert not os.path.exists(primary), primary
+
+
+@pytest.mark.unit
+def test_the_primary_root_wins_over_an_extra_model_root(keep_paths, mock_folder_paths):
+    """The primary root is searched first."""
+    keep_paths.register_model_folders()
+    extra = _extra_model_root(mock_folder_paths)
+    mock_folder_paths.add_model_folder_path("keep_models", extra)
+    primary_weight = _write_weight(
+        os.path.join(
+            mock_folder_paths.models_dir, "keep_models", "KEEP", "KEEP-b76feb75.pth"
+        )
+    )
+    _write_weight(os.path.join(extra, "KEEP", "KEEP-b76feb75.pth"))
+
+    resolved = keep_paths.load_file_from_url_comfy(
+        url=UNREACHABLE_URL,
+        folder_name="keep_models",
+        file_name="KEEP-b76feb75.pth",
+        subdir="KEEP",
+    )
+    assert resolved == primary_weight, resolved
+
+
+@pytest.mark.unit
+def test_the_model_root_follows_the_weights(keep_paths, mock_folder_paths):
+    """The root of a folder is the one the weights really live in.
+
+    The facelib helper builds the weight paths from a **single** root, so
+    the root has to be the one that holds the weights - an extra model root
+    included.
+    """
+    keep_paths.register_model_folders()
+    names = ["parsing_parsenet.pth", "detection_Resnet50_Final.pth"]
+    extra = _extra_model_root(mock_folder_paths)
+    mock_folder_paths.add_model_folder_path("facedetection", extra)
+    for name in names:
+        _write_weight(os.path.join(extra, name))
+
+    assert keep_paths.resolve_model_root("facedetection", names) == extra
+    # a weight that is nowhere is downloaded to the primary root
+    assert keep_paths.resolve_model_root("facedetection", ["missing.pth"]) == os.path.join(
+        mock_folder_paths.models_dir, "facedetection"
+    )
+
+
 @pytest.mark.unit
 def test_the_facedetection_folder_has_no_subdir(keep_paths, mock_folder_paths):
     """The facelib weights stay directly in ``models/facedetection``."""
@@ -139,24 +231,41 @@ def test_the_facedetection_folder_has_no_subdir(keep_paths, mock_folder_paths):
 
 @pytest.mark.unit
 def test_no_engine_concatenates_the_models_dir():
-    """The grep guard: only ``src/keep_paths.py`` knows ``models_dir``.
+    """The grep guard: only the registration knows ``models_dir``.
 
     The registration needs the primary root, but no engine may build a
-    weight path from ``folder_paths.models_dir`` itself.
+    weight path from ``folder_paths.models_dir`` itself.  Even inside
+    ``src/keep_paths.py`` the attribute may only be used by the
+    registration - never to build the path of a weight file.
     """
     offenders: list[str] = []
     for path in sorted(SRC_DIR.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        registration = _function_line_range(tree, "register_model_folders")
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr == "models_dir"
-                and path.name != "keep_paths.py"
-            ):
+            if not (isinstance(node, ast.Attribute) and node.attr == "models_dir"):
+                continue
+            if path.name != "keep_paths.py":
                 offenders.append(f"{path.name}:{node.lineno}")
+                continue
+            if registration is None or not (
+                registration[0] <= node.lineno <= registration[1]
+            ):
+                offenders.append(
+                    f"{path.name}:{node.lineno} (outside the registration)"
+                )
     assert offenders == [], (
-        f"only src/keep_paths.py may use folder_paths.models_dir: {offenders}"
+        f"only the registration in src/keep_paths.py may use "
+        f"folder_paths.models_dir: {offenders}"
     )
+
+
+def _function_line_range(tree: ast.Module, name: str) -> tuple[int, int] | None:
+    """The line range of a function of the module (``None`` when absent)."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node.lineno, node.end_lineno or node.lineno
+    return None
 
 
 @pytest.mark.unit
@@ -173,7 +282,8 @@ def test_the_loader_resolves_the_facelib_root_through_keep_paths():
     assert offenders == [], (
         f"the loader must not use folder_paths.models_dir (lines {offenders})"
     )
-    assert "keep_paths.get_primary_folder" in source
+    # the root comes from keep_paths - and it is the root the weights are in
+    assert "keep_paths.resolve_model_root" in source
 
 
 @pytest.mark.headless

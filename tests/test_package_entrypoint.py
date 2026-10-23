@@ -9,6 +9,10 @@ registers as **V1** (P4.4 switches it to the V3 ``comfy_entrypoint``):
 The tests assert the entry point is *boring* (one mapping style, no side
 effects beyond the logger) and that the P1.2 logger constraint is **lifted**:
 the engines import without the package entry point being executed.
+
+The assertions do **not** hard-code the phase: they hold for the V1 entry
+point of P3 and for the V3 entry point of P4.4 (the strict "V3 only" check
+is structure guard (c), which P4.4 flips).
 """
 
 from __future__ import annotations
@@ -58,9 +62,18 @@ print("KEEP_CONSTRAINT_LIFTED True")
 
 @pytest.mark.mock_integration
 def test_the_package_imports_under_the_mocks():
-    """The entry point executes and exports the three node mappings."""
+    """The entry point executes and exports the node mappings.
+
+    The pack registers as **V1** until P4.4 and as **V3**
+    (``comfy_entrypoint``) afterwards - the test follows the entry point
+    that is really there.
+    """
     conftest = importlib.import_module("conftest")
     package = conftest.execute_package_init()
+    if hasattr(package, "comfy_entrypoint"):
+        # V3 (P4.4): the entry point is the only registration surface
+        assert callable(package.comfy_entrypoint)
+        return
     assert sorted(package.NODE_CLASS_MAPPINGS) == PACK_NODE_IDS
     assert package.NODE_DISPLAY_NAME_MAPPINGS["KEEP_FaceUpscaleImage"] == (
         "KEEP Single Image"
@@ -80,7 +93,13 @@ def test_the_logger_has_exactly_one_handler():
 
 @pytest.mark.mock_integration
 def test_the_entry_point_defines_exactly_one_mapping_style():
-    """Either the V1 mappings or the V3 entry point - never both."""
+    """Either the V1 mappings or the V3 entry point - never both.
+
+    The test does **not** hard-code the phase: P4.4 flips the root
+    ``__init__.py`` to the V3 ``comfy_entrypoint`` and removes the V1
+    exports, and this test has to stay green on both sides of that flip.
+    The strict "V3 only" check is structure guard (c) - P4.4 flips it.
+    """
     import ast
 
     tree = ast.parse(INIT_FILE.read_text(encoding="utf-8"), filename=str(INIT_FILE))
@@ -89,18 +108,27 @@ def test_the_entry_point_defines_exactly_one_mapping_style():
         and node.name == "comfy_entrypoint"
         for node in tree.body
     )
-    assert not defines_entrypoint, (
-        "the V3 entry point arrives with P4.4 - until then the package "
-        "registers as V1"
-    )
     imported = {
         alias.name
         for node in tree.body
         if isinstance(node, ast.ImportFrom)
         for alias in node.names
     }
-    assert "NODE_CLASS_MAPPINGS" in imported
-    assert "NODE_DISPLAY_NAME_MAPPINGS" in imported
+    assigned = {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    v1_names = {"NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"}
+    defines_v1 = bool((imported | assigned) & v1_names)
+
+    assert defines_v1 != defines_entrypoint, (
+        "the entry point must define exactly one mapping style - the V1 "
+        f"mappings (defined={defines_v1}) or the V3 entry point "
+        f"(defined={defines_entrypoint}), never both and never neither"
+    )
 
 
 @pytest.mark.unit

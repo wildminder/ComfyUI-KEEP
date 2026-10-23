@@ -21,6 +21,9 @@ guard  what it checks                                  flip owner
        included - it was exempt only until P2.5)
 (e)    no ``pdb`` / ``torch.profiler`` / ``import pip``  **P2.1**
        / ``pip.main`` in the vendored runtime closure
+(f)    no module-level ``comfy`` / ``comfy_api`` import  **P3** (flipped)
+       in ``src/**`` (the plan's §3 rule: the pack
+       imports without a ComfyUI server)
 ===== ================================================ ==================
 
 Every guard is ``xfail(strict=False)`` until its owner step lands; the reason
@@ -244,6 +247,63 @@ def vendored_breakage_violations(root: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# guard (f) - no module-level comfy import in src/
+# ---------------------------------------------------------------------------
+#: The module roots ComfyUI provides.  Inside ``src/`` they must only be
+#: imported **lazily** (function level), so the pack imports without a
+#: ComfyUI server (the plan's §3 import rule).
+COMFY_MODULE_ROOTS = ("comfy", "comfy_api")
+
+
+def _module_level_imports(tree: ast.Module):
+    """Every import that runs while the module is imported.
+
+    Function and class bodies are **not** module level: an import there is
+    lazy by definition.  The body of a module level ``try`` / ``if`` is.
+    """
+    def walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # a function / class body runs later
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                yield child
+            yield from walk(child)
+
+    yield from walk(tree)
+
+
+def _imported_roots(node) -> set[str]:
+    """The top level module names an import statement pulls in."""
+    if isinstance(node, ast.Import):
+        return {alias.name.split(".")[0] for alias in node.names}
+    if isinstance(node, ast.ImportFrom):
+        if node.level:  # a relative import - never a comfy import
+            return set()
+        module = node.module or ""
+        return {module.split(".")[0]} if module else set()
+    return set()
+
+
+def comfy_import_violations(root: Path) -> list[str]:
+    """``src/**`` must not import ``comfy.*`` at module level."""
+    src_dir = root / "src"
+    if not src_dir.is_dir():
+        return ["src/ does not exist yet (P3.2 creates it)"]
+
+    violations: list[str] = []
+    for path in sorted(src_dir.rglob("*.py")):
+        tree = ast.parse(_read(path), filename=str(path))
+        for node in _module_level_imports(tree):
+            roots = _imported_roots(node) & set(COMFY_MODULE_ROOTS)
+            if roots:
+                violations.append(
+                    f"{_relative(path, root)}:{node.lineno}: module-level "
+                    f"{sorted(roots)} import"
+                )
+    return violations
+
+
+# ---------------------------------------------------------------------------
 # the guards (xfail until their owner step lands)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
@@ -277,6 +337,12 @@ def test_guard_no_sys_path_mutation():
 def test_guard_vendored_tree_has_no_debug_or_pip_leftovers():
     """Guard (e) - flipped to strict in P2.1 (its flip owner)."""
     assert vendored_breakage_violations(REPO_ROOT) == []
+
+
+@pytest.mark.unit
+def test_guard_src_has_no_module_level_comfy_import():
+    """Guard (f) - flipped to strict in P3 (the plan's §3 import rule)."""
+    assert comfy_import_violations(REPO_ROOT) == []
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +489,35 @@ def test_self_test_guard_e_detects_a_debug_import_in_the_closure(repo_copy):
     # The pre-existing findings are unchanged: the guard reports exactly the
     # baseline plus the injected file.
     assert [violation for violation in after if "zz_guard_arch.py" not in violation] == before
+
+
+@pytest.mark.unit
+def test_self_test_guard_f_detects_a_module_level_comfy_import(repo_copy):
+    """Guard (f) reports a ``comfy`` import that runs at import time."""
+    src_dir = repo_copy / "src"
+    src_dir.mkdir(exist_ok=True)
+    target = src_dir / "keep_lazy_probe.py"
+    target.write_text(
+        "from comfy.utils import ProgressBar\n\n"
+        "def build():\n"
+        "    from comfy import model_management\n"
+        "    return ProgressBar, model_management\n",
+        encoding="utf-8",
+    )
+    violations = comfy_import_violations(repo_copy)
+    assert any("keep_lazy_probe.py" in violation for violation in violations), (
+        f"the guard did not catch the module-level comfy import: {violations}"
+    )
+    # the function-level import of the same module is **not** a violation
+    target.write_text(
+        "def build():\n"
+        "    from comfy.utils import ProgressBar\n"
+        "    return ProgressBar\n",
+        encoding="utf-8",
+    )
+    assert comfy_import_violations(repo_copy) == [], (
+        "a lazy comfy import must not be reported"
+    )
 
 
 @pytest.mark.unit

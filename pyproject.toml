@@ -8,6 +8,12 @@ requires-python = ">=3.10"
 # runtime closure of the vendored tree and matches requirements.txt.
 dependencies = ["torch", "torchvision", "numpy", "opencv-python", "Pillow", "einops", "scipy", "tqdm", "pyyaml", "requests"]
 
+# The test-only dependencies.  ``tomli`` is the ``tomllib`` parser of
+# Python 3.10 (the minimum of ``requires-python``) - the metadata test
+# imports it when the standard library has no ``tomllib`` yet.
+[project.optional-dependencies]
+test = ["tomli>=2.0; python_version < '3.11'"]
+
 [project.urls]
 Repository = "https://github.com/wildminder/ComfyUI-KEEP"
 #  Used by Comfy Registry https://comfyregistry.org
@@ -15,8 +21,10 @@ Repository = "https://github.com/wildminder/ComfyUI-KEEP"
 [tool.comfy]
 PublisherId = "wildai"
 DisplayName = "KEEP"
-# P6.5 restores the preview asset and points the Icon at the committed file.
-Icon = ""
+# The preview asset of the registry entry.  The file is committed in the
+# repository (``assets/keep-preview.png``); P6.5 may replace the image, but
+# the key must keep pointing at a file that exists.
+Icon = "assets/keep-preview.png"
 requires-comfyui = ">=0.28.0"
 
 # P1.1 - pytest harness configuration.

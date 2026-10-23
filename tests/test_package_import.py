@@ -87,9 +87,15 @@ def test_the_package_imports_for_real_under_the_mocks():
 
     This is the strict version of the import smoke test: the root
     ``__init__.py`` is executed and the three node mappings are exported.
+    The test follows the entry point that is really there (V1 today, the V3
+    ``comfy_entrypoint`` from P4.4 on).
     """
     conftest = importlib.import_module("conftest")
     package = conftest.execute_package_init()
+    if hasattr(package, "comfy_entrypoint"):
+        # V3 (P4.4): the entry point is the only registration surface
+        assert callable(package.comfy_entrypoint)
+        return
     assert sorted(package.NODE_CLASS_MAPPINGS) == PACK_NODE_IDS
     assert sorted(package.NODE_DISPLAY_NAME_MAPPINGS) == PACK_NODE_IDS
 

@@ -89,18 +89,64 @@ def model_relative_path(file_name: str, subdir: str | None = None) -> str:
     return os.path.join(subdir, file_name) if subdir else file_name
 
 
+def find_model_file(folder_name: str, file_name: str, subdir: str | None = None) -> str | None:
+    """An **existing** weight file in any registered root (primary first).
+
+    The lookup goes through ``folder_paths.get_full_path_or_raise``, so every
+    model root the host knows (the extra model paths of ``extra_model_paths``
+    included) is searched - the primary root first.  ``None`` when the file
+    is in none of the roots.
+    """
+    if folder_paths is None:
+        return None
+    relative = model_relative_path(file_name, subdir)
+    try:
+        # the registration puts the primary root into the search list
+        register_model_folders()
+        return folder_paths.get_full_path_or_raise(folder_name, relative)
+    except (FileNotFoundError, OSError, KeyError, ValueError):
+        # not in any root - the caller decides (download or fail)
+        return None
+
+
 def resolve_model_file(folder_name: str, file_name: str, subdir: str | None = None) -> str:
     """The path of an **existing** weight file (primary root first).
 
     Raises ``FileNotFoundError`` (with the searched roots) when the file is
     not in any of the registered roots.
     """
+    found = find_model_file(folder_name, file_name, subdir)
+    if found is not None:
+        return found
     if folder_paths is None:
         raise FileNotFoundError(
             f"cannot resolve {file_name!r}: ComfyUI's folder_paths is not available"
         )
-    relative = model_relative_path(file_name, subdir)
-    return folder_paths.get_full_path_or_raise(folder_name, relative)
+    raise FileNotFoundError(
+        f"the weight {file_name!r} is not in any root of the model folder "
+        f"{folder_name!r}: {get_model_folder_paths(folder_name)}"
+    )
+
+
+def resolve_model_root(folder_name: str, file_names) -> str:
+    """The registered root that holds the given weight files (primary first).
+
+    Some consumers (the facelib helper) build the weight paths from a
+    **single** root, so the root has to be the one the weights really live
+    in - an extra model root included.  The primary root is the fallback
+    (it is where the download puts a missing weight).
+    """
+    roots = get_model_folder_paths(folder_name)
+    if not roots:
+        raise FileNotFoundError(
+            f"the model folder {folder_name!r} is not registered - the pack "
+            "cannot resolve its weights without ComfyUI's folder_paths"
+        )
+    names = list(file_names)
+    for root in roots:
+        if all(os.path.isfile(os.path.join(root, name)) for name in names):
+            return root
+    return roots[0]
 
 
 def resolve_model_target(folder_name: str, file_name: str, subdir: str | None = None) -> str:
@@ -119,8 +165,11 @@ def load_file_from_url_comfy(url, folder_name, file_name=None, subdir=None, sha2
     """Download a weight file into a registered model folder.
 
     A file that is already there is kept - its hash is checked when one is
-    known (a mismatch triggers a re-download).  The destination is resolved
-    through :func:`resolve_model_target`, so the on-disk layout of the pack
+    known (a mismatch triggers a re-download).  The lookup covers **every**
+    registered root of the folder (the primary root first), so a weight that
+    lives in an extra model root is used where it is instead of being
+    downloaded again.  A missing weight is downloaded to the primary root
+    (:func:`resolve_model_target`), so the on-disk layout of the pack
     (including the ``keep_models/KEEP`` sub-directory) is preserved.
     """
     if file_name is None:
@@ -128,19 +177,35 @@ def load_file_from_url_comfy(url, folder_name, file_name=None, subdir=None, sha2
         if '?' in file_name:
             file_name = file_name.split('?')[0]
 
+    existing = find_model_file(folder_name, file_name, subdir)
+    if existing is not None:
+        if sha256:
+            with open(existing, "rb") as f:
+                file_hash = hashlib.sha256(f.read()).hexdigest()
+            if file_hash == sha256:
+                logger.debug(f"File {file_name} already exists and hash matches. Skipping download.")
+                return existing
+            logger.warning(f"File {file_name} exists but hash mismatch. Redownloading.")
+        else:
+            logger.debug(f"File {file_name} already exists. Skipping download (no hash check).")
+            return existing
+
     cached_file = resolve_model_target(folder_name, file_name, subdir)
 
-    if os.path.exists(cached_file) and sha256:
+    # The weight is not in any root - but the download target may exist
+    # anyway (a file the host does not know as a model file).  It is kept
+    # when its hash is not known, and re-downloaded when the hash does not
+    # match.
+    if os.path.exists(cached_file):
+        if not sha256:
+            logger.debug(f"File {file_name} already exists. Skipping download (no hash check).")
+            return cached_file
         with open(cached_file, "rb") as f:
             file_hash = hashlib.sha256(f.read()).hexdigest()
         if file_hash == sha256:
             logger.debug(f"File {file_name} already exists and hash matches. Skipping download.")
             return cached_file
-        else:
-            logger.warning(f"File {file_name} exists but hash mismatch. Redownloading.")
-    elif os.path.exists(cached_file) and not sha256:
-        logger.debug(f"File {file_name} already exists. Skipping download (no hash check).")
-        return cached_file
+        logger.warning(f"File {file_name} exists but hash mismatch. Redownloading.")
 
     logger.info(f'Downloading: "{file_name}" from {url} to {cached_file}')
 
