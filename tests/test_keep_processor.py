@@ -185,3 +185,57 @@ def test_thirty_frames_are_split_into_clips_of_twenty(processor_module):
     shapes = [shape for shape, _ in keep_net.calls]
     assert shapes == [(1, 20, 3, 512, 512), (1, 10, 3, 512, 512)], shapes
     assert tuple(output.shape) == (30, 512, 512, 3), output.shape
+
+
+# ---------------------------------------------------------------------------
+# P4.6 - the VRAM is released through ComfyUI
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_vram_is_released_through_comfyui(processor_module):
+    """``_soft_empty_cache`` goes through ``model_management`` (P4.6)."""
+    model_management = importlib.import_module("comfy.model_management")
+    model_management.calls.clear()
+
+    assert processor_module._soft_empty_cache() is True
+    assert ("soft_empty_cache",) in model_management.calls, model_management.calls
+
+
+@pytest.mark.mock_integration
+def test_the_sequence_releases_the_vram_at_every_chunk_boundary(
+    processor_module, monkeypatch
+):
+    """P4.6: every chunk boundary releases the cached VRAM.
+
+    30 frames with ``max_clip_length=20`` are two chunks - the release must
+    happen after each of them (the next chunk is allocated right after).
+    """
+    events: list[str] = []
+
+    class _RecordingKeepNet(_StubKeepNet):
+        def __call__(self, frames, need_upscale=False):
+            events.append("net")
+            return super().__call__(frames, need_upscale=need_upscale)
+
+    monkeypatch.setattr(
+        processor_module, "_soft_empty_cache", lambda: events.append("empty_cache")
+    )
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_RecordingKeepNet(), _StubFaceHelper())
+    )
+    frames = torch.rand((30, 16, 16, 3), dtype=torch.float32)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=True,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    net_positions = [index for index, event in enumerate(events) if event == "net"]
+    assert len(net_positions) == 2, events
+    for position in net_positions:
+        assert events[position + 1] == "empty_cache", (
+            f"the chunk boundary did not release the VRAM: {events}"
+        )

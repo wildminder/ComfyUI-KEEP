@@ -24,6 +24,12 @@ guard  what it checks                                  flip owner
 (f)    no module-level ``comfy`` / ``comfy_api`` import  **P3** (flipped)
        in ``src/**`` (the plan's §3 rule: the pack
        imports without a ComfyUI server)
+(g)    no ``torch.cuda.empty_cache()`` in the            **P4.6**
+       runtime closure (the pack's code **and** the
+       vendored tree - the known upstream occurrences
+       are allowlisted by file and count)
+(h)    the dead video path (``process_video`` /          **P4.7**
+       ``VideoReader`` / ``VideoWriter``) is gone
 ===== ================================================ ==================
 
 Every guard is ``xfail(strict=False)`` until its owner step lands; the reason
@@ -304,6 +310,116 @@ def comfy_import_violations(root: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# guard (g) - no unconditional torch.cuda.empty_cache in the runtime closure
+# ---------------------------------------------------------------------------
+#: The pattern of guard (g).  ``torch.cuda.empty_cache()`` is unconditional: it
+#: releases the cached blocks of **every** device, it fights with the VRAM
+#: arbitration of ComfyUI and it crashes without a GPU (the B7 breakage of
+#: the plan).  The pack releases the VRAM through
+#: ``model_management.soft_empty_cache()``.
+EMPTY_CACHE_PATTERN = re.compile(r"torch\.cuda\.empty_cache\s*\(")
+
+#: The known occurrences in the **vendored** BasicSR tree.  They are upstream
+#: code in training-only paths (``SRModel.test`` and the ``cpu_cache`` option
+#: of the BasicVSR++ arch) that the pack never executes - the pack calls the
+#: KEEP arch directly.  The allowlist is **exact** (file *and* count): a file
+#: that gains or loses an occurrence is reported, so the guard cannot go
+#: stale and a new occurrence is never silently tolerated.
+VENDORED_EMPTY_CACHE_ALLOWLIST = {
+    "modules/deps/basicsr/archs/basicvsrpp_arch.py": 4,
+    "modules/deps/basicsr/models/hifacegan_model.py": 1,
+    "modules/deps/basicsr/models/sr_model.py": 1,
+    "modules/deps/basicsr/models/video_base_model.py": 1,
+    "modules/deps/basicsr/models/video_recurrent_model.py": 1,
+}
+
+
+def _code_text(path: Path) -> str:
+    """The source of a file **without** the comments and the string literals.
+
+    The guard greps the **code**: the pack documents the breakage it fixed
+    (the pattern is named in the docstrings), and a docstring must not be
+    reported as a call.
+    """
+    import io
+    import tokenize
+
+    source = _read(path)
+    pieces: list[str] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            pieces.append(token.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return source
+    return "".join(pieces)
+
+
+def empty_cache_violations(root: Path) -> list[str]:
+    """No ``torch.cuda.empty_cache()`` in the surviving runtime closure.
+
+    The scan covers the pack's own ``src/**`` **and** the vendored
+    ``modules/deps`` closure (not just ``src/``).  The vendored occurrences
+    are allowlisted by file and count (see
+    ``VENDORED_EMPTY_CACHE_ALLOWLIST``); every other occurrence is a
+    violation.
+    """
+    files: dict[str, Path] = {}
+    for path in _closure_files(root):
+        if path.is_file():
+            files[_relative(path, root)] = path
+    src_dir = root / "src"
+    if src_dir.is_dir():
+        for path in sorted(src_dir.rglob("*.py")):
+            files[_relative(path, root)] = path
+
+    counts: dict[str, int] = {}
+    for relative, path in files.items():
+        found = len(EMPTY_CACHE_PATTERN.findall(_code_text(path)))
+        if found:
+            counts[relative] = found
+
+    violations: list[str] = []
+    for relative, found in sorted(counts.items()):
+        allowed = VENDORED_EMPTY_CACHE_ALLOWLIST.get(relative, 0)
+        if found != allowed:
+            violations.append(
+                f"{relative}: {found} occurrence(s) of torch.cuda.empty_cache() "
+                f"(allowlisted: {allowed})"
+            )
+    for relative in sorted(set(VENDORED_EMPTY_CACHE_ALLOWLIST) - set(counts)):
+        violations.append(
+            f"{relative}: the allowlist expects "
+            f"{VENDORED_EMPTY_CACHE_ALLOWLIST[relative]} occurrence(s) of "
+            f"torch.cuda.empty_cache() but the file has none"
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# guard (h) - the dead video path is gone
+# ---------------------------------------------------------------------------
+#: The symbols of the deleted video path (P4.7).  The vendored ffmpeg shim
+#: (``basicsr.utils.video_util``) was deleted in P2.1, so the video path of
+#: the processor was dead code - it is gone with P4.7.
+DEAD_VIDEO_SYMBOLS = ("process_video", "VideoReader", "VideoWriter")
+
+
+def dead_video_violations(root: Path) -> list[str]:
+    """The dead video path must not appear in the package any more."""
+    violations: list[str] = []
+    for path in _package_files(root):
+        for number, line in enumerate(_read(path).splitlines(), 1):
+            for symbol in DEAD_VIDEO_SYMBOLS:
+                if symbol in line:
+                    violations.append(
+                        f"{_relative(path, root)}:{number}: {symbol} ({line.strip()})"
+                    )
+    return violations
+
+
+# ---------------------------------------------------------------------------
 # the guards (xfail until their owner step lands)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
@@ -340,6 +456,21 @@ def test_guard_vendored_tree_has_no_debug_or_pip_leftovers():
 def test_guard_src_has_no_module_level_comfy_import():
     """Guard (f) - flipped to strict in P3 (the plan's §3 import rule)."""
     assert comfy_import_violations(REPO_ROOT) == []
+
+
+@pytest.mark.unit
+def test_guard_no_unconditional_empty_cache_in_the_closure():
+    """Guard (g) - flipped to strict in P4.6 (its flip owner)."""
+    assert empty_cache_violations(REPO_ROOT) == []
+
+
+@pytest.mark.unit
+@pytest.mark.xfail(
+    strict=False, reason="flip owner: P4.7 removes the dead video path"
+)
+def test_guard_the_dead_video_path_is_gone():
+    """Guard (h) - flipped to strict in P4.7 (its flip owner)."""
+    assert dead_video_violations(REPO_ROOT) == []
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +645,73 @@ def test_self_test_guard_f_detects_a_module_level_comfy_import(repo_copy):
     )
     assert comfy_import_violations(repo_copy) == [], (
         "a lazy comfy import must not be reported"
+    )
+
+
+@pytest.mark.unit
+def test_self_test_guard_g_detects_an_empty_cache_call(repo_copy):
+    """The guard reports a ``torch.cuda.empty_cache()`` in the pack's code."""
+    target = repo_copy / "src" / "keep_processor.py"
+    assert empty_cache_violations(repo_copy) == [], (
+        "a clean closure must not be reported"
+    )
+
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + "\n\ndef _probe():\n    torch.cuda.empty_cache()\n",
+        encoding="utf-8",
+    )
+    violations = empty_cache_violations(repo_copy)
+    assert any("keep_processor.py" in violation for violation in violations), (
+        f"the guard did not catch the empty_cache call: {violations}"
+    )
+
+
+@pytest.mark.unit
+def test_self_test_guard_g_detects_a_new_vendored_empty_cache_call(repo_copy):
+    """The guard covers the vendored closure too - not only ``src/``."""
+    vendored = repo_copy / "modules" / "deps" / "basicsr" / "models" / "sr_model.py"
+    vendored.write_text(
+        vendored.read_text(encoding="utf-8")
+        + "\n\ndef _probe():\n    torch.cuda.empty_cache()\n",
+        encoding="utf-8",
+    )
+    violations = empty_cache_violations(repo_copy)
+    assert any("sr_model.py" in violation for violation in violations), (
+        f"the guard did not catch the new vendored occurrence: {violations}"
+    )
+
+
+@pytest.mark.unit
+def test_self_test_guard_g_detects_a_stale_allowlist_entry(repo_copy):
+    """The allowlist is exact: a **removed** occurrence is reported, too."""
+    vendored = (
+        repo_copy / "modules" / "deps" / "basicsr" / "archs" / "basicvsrpp_arch.py"
+    )
+    vendored.write_text(
+        vendored.read_text(encoding="utf-8").replace(
+            "torch.cuda.empty_cache()", "pass", 1
+        ),
+        encoding="utf-8",
+    )
+    violations = empty_cache_violations(repo_copy)
+    assert any("basicvsrpp_arch.py" in violation for violation in violations), (
+        f"the guard did not catch the stale allowlist entry: {violations}"
+    )
+
+
+@pytest.mark.unit
+def test_self_test_guard_h_detects_the_dead_video_path(repo_copy):
+    """The guard reports a reference to the deleted video path."""
+    target = repo_copy / "src" / "keep_processor.py"
+    target.write_text(
+        target.read_text(encoding="utf-8")
+        + "\n\ndef _probe():\n    return VideoReader\n",
+        encoding="utf-8",
+    )
+    violations = dead_video_violations(repo_copy)
+    assert any("VideoReader" in violation for violation in violations), (
+        f"the guard did not catch the dead video symbol: {violations}"
     )
 
 

@@ -13,6 +13,7 @@ from torchvision.transforms.functional import normalize
 import os
 from tqdm import tqdm # Import tqdm for console progress bars
 from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
+from .keep_logger import logger
 
 # Imports from vendored basicsr and facelib
 #
@@ -35,6 +36,27 @@ try:  # the package import (the node package is the parent package)
 except ImportError:  # the flat import (the repository root on sys.path)
     from modules.deps.basicsr.utils.img_util import img2tensor, tensor2img
     from modules.deps.facelib.utils.misc import is_gray
+
+
+def _soft_empty_cache() -> bool:
+    """Release the cached VRAM through ComfyUI (P4.6).
+
+    ``torch.cuda.empty_cache()`` is **unconditional**: it releases the cached
+    blocks of every device, it fights with the VRAM arbitration of ComfyUI and
+    it crashes on a CPU-only machine (the B7 breakage of the plan).
+    ``model_management.soft_empty_cache()`` only releases what ComfyUI does
+    not need any more - and it is a no-op without a GPU.
+
+    The import is **lazy** (function level): the pack must import without a
+    ComfyUI server (the plan's §3 import rule).
+    """
+    try:
+        from comfy import model_management  # lazy: src/ imports without ComfyUI
+    except ImportError as exc:  # pragma: no cover - the nodes run inside ComfyUI
+        logger.debug(f"KEEP: the VRAM cache could not be released ({exc})")
+        return False
+    model_management.soft_empty_cache()
+    return True
 
 
 def interpolate_sequence(sequence):
@@ -121,7 +143,7 @@ class KEEPFaceProcessor:
         net_output = self.keep_net(duplicated_input_frames, need_upscale=False)
         final_output_tensor = net_output[:, 0:1, ...].squeeze(0)
         restored_faces_cv2 = [tensor2img(x, rgb2bgr=True, min_max=(-1, 1)) for x in final_output_tensor]
-        torch.cuda.empty_cache()
+        _soft_empty_cache()
 
         img_for_pasting = input_img_list[0]
         self.face_helper.clean_all()
@@ -274,13 +296,16 @@ class KEEPFaceProcessor:
                  clip_output_tensor = self.keep_net(current_clip_faces, need_upscale=False)
                  temp_restored_face_tensors.append(clip_output_tensor)
             pbar_comfy.update(end_idx - start_idx)
+            # P4.6: the chunk boundary - the cached blocks of the finished
+            # chunk are released before the next chunk is allocated.
+            _soft_empty_cache()
 
         if not temp_restored_face_tensors:
             return image_sequence_tensor
         all_restored_face_tensors = torch.cat(temp_restored_face_tensors, dim=1).squeeze(0)
         all_restored_faces_cv2 = [tensor2img(t, rgb2bgr=True, min_max=(-1, 1)) for t in all_restored_face_tensors]
         del batched_cropped_faces, all_restored_face_tensors, temp_restored_face_tensors
-        torch.cuda.empty_cache()
+        _soft_empty_cache()
 
         output_frames_cv2 = []
         for i in tqdm(range(num_input_frames), desc="Pasting faces and finalizing frames"):
