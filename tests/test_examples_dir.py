@@ -89,8 +89,8 @@ def test_workflow_foreign_types_are_whitelisted():
 @pytest.mark.unit
 def test_workflow_node_ids_match_the_registered_nodes():
     """The ids in the example must be the ids the node registers today."""
-    nodes_source = (REPO_ROOT / "nodes.py").read_text(encoding="utf-8")
+    nodes_source = (REPO_ROOT / "nodes" / "__init__.py").read_text(encoding="utf-8")
     for node_id in PACK_NODE_IDS:
         assert f'"{node_id}"' in nodes_source, (
-            f"{node_id} is used by the example but is not registered by nodes.py"
+            f"{node_id} is used by the example but is not registered by nodes/__init__.py"
         )

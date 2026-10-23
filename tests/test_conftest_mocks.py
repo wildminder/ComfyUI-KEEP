@@ -32,7 +32,9 @@ CONFTEST = REPO_ROOT / "conftest.py"
 
 #: The production modules whose ComfyUI imports the mocks have to satisfy.
 PRODUCTION_FILES = (
-    REPO_ROOT / "nodes.py",
+    REPO_ROOT / "nodes" / "keep_model_loader.py",
+    REPO_ROOT / "nodes" / "keep_face_upscale_image.py",
+    REPO_ROOT / "nodes" / "keep_process_image_sequence.py",
     REPO_ROOT / "modules" / "utils.py",
     REPO_ROOT / "modules" / "keep_model_loader.py",
     REPO_ROOT / "modules" / "keep_processor.py",

@@ -10,7 +10,7 @@ Five guards, each with the step that flips it from ``xfail`` to strict:
 ===== ================================================ ==================
 guard  what it checks                                  flip owner
 ===== ================================================ ==================
-(a)    every class under ``nodes/*.py`` is exported     **P3.1**
+(a)    every class under ``nodes/*.py`` is exported     **P3.1** (flipped)
        from ``nodes/__init__.py``
 (b)    ``src/**`` contains no ``io.Schema(`` /           **P3.2**
        ``define_schema``
@@ -225,11 +225,8 @@ def vendored_breakage_violations(root: Path) -> list[str]:
 # the guards (xfail until their owner step lands)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=False,
-    reason="flip owner: P3.1 - nodes/ classes must be exported by nodes/__init__.py",
-)
 def test_guard_nodes_classes_are_exported():
+    """Guard (a) - flipped to strict in P3.1 (its flip owner)."""
     assert nodes_export_violations(REPO_ROOT) == []
 
 
@@ -290,6 +287,12 @@ def repo_copy(tmp_path):
 def test_self_test_guard_a_detects_an_unexported_class(repo_copy):
     nodes_dir = repo_copy / "nodes"
     nodes_dir.mkdir(exist_ok=True)
+    # The self-test owns the whole ``nodes/`` folder of the copy: the other
+    # node modules of the repository would be reported as unexported (they
+    # are not part of this fixture) and the guard would fail for the wrong
+    # reason.
+    for stale in nodes_dir.glob("*.py"):
+        stale.unlink()
     (nodes_dir / "__init__.py").write_text(
         "from .keep_model_loader import KEEP_ModelLoaderNode\n"
         "__all__ = ['KEEP_ModelLoaderNode']\n",
