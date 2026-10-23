@@ -48,8 +48,50 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _build_patchers(keep_net, face_helper, device, offload_device) -> dict:
+    """The three patchers of a pack (P4.5).
+
+    * ``keep`` - the KEEP net; it **owns the flownet** as a submodule
+      (``keep_arch.py:882``), so the flownet must **not** get a patcher of
+      its own: it would be counted twice in the VRAM accounting.
+    * ``detector`` - the face detector of the facelib helper.
+    * ``parser`` - the face parser of the facelib helper.
+
+    The patchers are built **once** per model build and are shared by every
+    pack that uses these models (the loader caches them).
+    """
+    from comfy.model_patcher import ModelPatcher  # lazy: the pack imports without ComfyUI
+
+    patchers: dict = {}
+    if keep_net is not None:
+        patchers["keep"] = ModelPatcher(
+            keep_net, load_device=device, offload_device=offload_device
+        )
+    detector = getattr(face_helper, "face_detector", None)
+    if detector is not None:
+        patchers["detector"] = ModelPatcher(
+            detector, load_device=device, offload_device=offload_device
+        )
+    parser = getattr(face_helper, "face_parse", None)
+    if parser is not None:
+        patchers["parser"] = ModelPatcher(
+            parser, load_device=device, offload_device=offload_device
+        )
+    return patchers
+
+
 class KEEPModelPack:
-    def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model, model_type_str):
+    """The models of the pack and their residency (P4.5).
+
+    The models are wrapped in three ``ModelPatcher`` instances (the KEEP net
+    with its flownet, the face detector, the face parser) and ComfyUI
+    arbitrates the VRAM: :meth:`load_device` asks
+    ``model_management.load_models_gpu`` for the patchers, :meth:`offload`
+    gives the memory back.
+    """
+
+    def __init__(self, keep_net, face_helper, bg_upscale_model, face_upscale_model,
+                 model_type_str, patchers=None):
         from comfy import model_management  # lazy: the pack imports without ComfyUI
 
         self.keep_net = keep_net
@@ -60,53 +102,99 @@ class KEEPModelPack:
         self.device = model_management.get_torch_device()
         self.offload_device = model_management.unet_offload_device()
 
-    def load_device(self):
-        """Move all models to the main compute device."""
-        if self.keep_net is not None:
+        # the flownet is a submodule of the KEEP net - it belongs to the
+        # patcher of the net (no second patcher, no double accounting)
+        self.flownet = getattr(keep_net, "flownet", None)
+
+        if patchers is None:
+            patchers = _build_patchers(
+                keep_net, face_helper, self.device, self.offload_device
+            )
+        self.patchers_by_role = dict(patchers)
+        self.keep_patcher = self.patchers_by_role.get("keep")
+        self.detector_patcher = self.patchers_by_role.get("detector")
+        self.parser_patcher = self.patchers_by_role.get("parser")
+        self.patchers = list(self.patchers_by_role.values())
+
+        # P4.5 / P5.5: the state of the flow resolution (see ensure_flow)
+        self._flow_checked = False
+        self._flow_available = False
+
+    def load_device(self, memory_required: int = 0):
+        """Move the models to the main compute device.
+
+        ComfyUI arbitrates the VRAM: the patchers are handed to
+        ``model_management.load_models_gpu``, which decides what fits.
+        """
+        from comfy import model_management  # lazy: the pack imports without ComfyUI
+
+        if self.patchers:
+            model_management.load_models_gpu(
+                self.patchers, memory_required=memory_required
+            )
+        elif self.keep_net is not None:
+            # no patcher (a pack without models) - move the net directly
             self.keep_net.to(self.device)
-        # The spandrel model descriptor has a 'model' attribute that needs to be moved
+
+        # The optional ComfyUI upscalers are not patchers - they are moved
+        # directly (they are small and they are not part of the KEEP models).
         if self.bg_upscale_model is not None:
             self.bg_upscale_model.model.to(self.device)
         if self.face_upscale_model is not None:
             self.face_upscale_model.model.to(self.device)
-        
+
         if self.face_helper is not None:
             self.face_helper.device = self.device
-            if hasattr(self.face_helper, 'face_detector'):
-                self.face_helper.face_detector.to(self.device)
-            if hasattr(self.face_helper, 'face_parse'):
-                self.face_helper.face_parse.to(self.device)
 
     def offload(self):
-        """Move all models to the offload device (CPU)."""
+        """Move the models back to the offload device and free the VRAM."""
         from comfy import model_management  # lazy: the pack imports without ComfyUI
 
-        if self.keep_net is not None:
-            self.keep_net.to(self.offload_device)
+        for patcher in self.patchers:
+            self._unload_patcher(patcher)
+
         if self.bg_upscale_model is not None:
             self.bg_upscale_model.model.to(self.offload_device)
         if self.face_upscale_model is not None:
             self.face_upscale_model.model.to(self.offload_device)
-            
+
         if self.face_helper is not None:
             self.face_helper.device = self.offload_device
-            if hasattr(self.face_helper, 'face_detector'):
-                self.face_helper.face_detector.to(self.offload_device)
-            if hasattr(self.face_helper, 'face_parse'):
-                self.face_helper.face_parse.to(self.offload_device)
-                
+
+        model_management.unload_all_models()
         model_management.soft_empty_cache()
+
+    def _unload_patcher(self, patcher):
+        """Move the model of a patcher back to its offload device.
+
+        The real ``ModelPatcher`` has **no** ``unload()`` method (ComfyUI
+        v0.42.0) - the model is moved to the offload device of the patcher
+        and ComfyUI does the rest (``unload_all_models``).
+        """
+        model = getattr(patcher, "model", None)
+        if model is None:
+            return
+        offload_device = getattr(patcher, "offload_device", None) or self.offload_device
+        try:
+            model.to(offload_device)
+        except Exception as exc:  # noqa: BLE001 - the offload must not raise
+            logger.debug(f"KEEP: a model could not be offloaded ({exc})")
 
     def ensure_flow(self) -> bool:
         """Make sure the optical flow net of the KEEP net is usable.
 
-        The method is **idempotent** - it may be called before every
-        sequence run.  P5.5 implements the conditional resolution of the
-        GMFlow checkpoint behind it: the checkpoint is only downloaded when
-        the loaded KEEP checkpoint carries no ``flownet.*`` keys.  Until then
-        the hook is a no-op that reports ``False`` (nothing was resolved).
+        The method is **idempotent** - the resolution happens at most once
+        per pack.  P5.5 implements the conditional resolution of the GMFlow
+        checkpoint behind it: the checkpoint is only downloaded when the
+        loaded KEEP checkpoint carries no ``flownet.*`` keys.  Until then the
+        flownet comes from the KEEP checkpoint itself (it is a submodule of
+        the net) and nothing has to be resolved.
         """
-        return False
+        if self._flow_checked:
+            return self._flow_available
+        self._flow_checked = True
+        self._flow_available = self.flownet is not None
+        return self._flow_available
 
 
 class KEEPModelLoader:
@@ -132,7 +220,10 @@ class KEEPModelLoader:
                 cached_pack.face_helper, 
                 bg_upscale_model,
                 face_upscale_model,
-                model_type_str
+                model_type_str,
+                # P4.5: the patchers belong to the models - they are built
+                # once and shared by every pack that uses these models.
+                patchers=cached_pack.patchers_by_role,
             )
             return model_pack
 
@@ -195,9 +286,15 @@ class KEEPModelLoader:
             logger.error(f"Error initializing FaceRestoreHelper: {e}")
             raise
 
-        model_pack = KEEPModelPack(net, face_helper, bg_upscale_model, face_upscale_model, model_type_str)
-
+        # P4.5: the patchers are built once (with the base pack) and shared
+        # with the returned pack - a second set of patchers for the same
+        # models would confuse the VRAM accounting of ComfyUI.
         base_pack_for_cache = KEEPModelPack(net, face_helper, None, None, model_type_str)
         self.loaded_models[cache_key] = base_pack_for_cache
-        
+
+        model_pack = KEEPModelPack(
+            net, face_helper, bg_upscale_model, face_upscale_model, model_type_str,
+            patchers=base_pack_for_cache.patchers_by_role,
+        )
+
         return model_pack
