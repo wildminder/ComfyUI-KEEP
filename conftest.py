@@ -193,6 +193,11 @@ class _MockSchema:
 class _MockInput:
     """Mock of ``comfy_api.latest.io.Input``."""
 
+    #: The socket type of the input.  The real API reads it from the parent
+    #: type (``self.Parent.io_type``); the mock carries it on the class, so
+    #: ``get_io_type()`` answers the same question.
+    io_type: str | None = None
+
     def __init__(
         self,
         id: str,
@@ -222,10 +227,15 @@ class _MockInput:
             "optional": self.optional,
             "tooltip": self.tooltip,
             "lazy": self.lazy,
-            "rawLink": self.rawLink,
+            "rawLink": self.raw_link,
             "advanced": self.advanced,
             **self.extra_dict,
         }
+
+    def get_io_type(self) -> str | None:
+        """The socket type of this input (the real API has the same method)."""
+        return self.io_type
+
 
 
 class _MockWidgetInput(_MockInput):
@@ -268,6 +278,9 @@ class _MockWidgetInput(_MockInput):
 class _MockOutput:
     """Mock of ``comfy_api.latest.io.Output``."""
 
+    #: The socket type of the output (see :class:`_MockInput`).
+    io_type: str | None = None
+
     def __init__(
         self,
         display_name: str | None = None,
@@ -278,6 +291,10 @@ class _MockOutput:
         self.tooltip = tooltip
         for key, value in extra.items():
             setattr(self, key, value)
+
+    def get_io_type(self) -> str | None:
+        """The socket type of this output (the real API has the same method)."""
+        return self.io_type
 
 
 class _MockNodeOutput:
@@ -355,6 +372,25 @@ class _MockTypeIO:
     type_name: str = ""
 
 
+def _mock_socket_type(io_type: str, widget: bool = False):
+    """A mock socket type with its own ``Input`` / ``Output`` classes.
+
+    The real API builds a socket type per call (``io.Custom("X")``) and the
+    input / output classes answer their socket type through
+    ``get_io_type()``.  The mock does the same, so a schema snapshot can ask
+    an input for its type (the V3 schema is the only place the socket types
+    live after the V1 ``INPUT_TYPES`` are gone).
+    """
+    base_input = _MockWidgetInput if widget else _MockInput
+    input_cls = type(f"{io_type}_Input", (base_input,), {"io_type": io_type})
+    output_cls = type(f"{io_type}_Output", (_MockOutput,), {"io_type": io_type})
+    return type(
+        io_type,
+        (_MockTypeIO,),
+        {"type_name": io_type, "Input": input_cls, "Output": output_cls},
+    )
+
+
 class _MockIO:
     """Mock of ``comfy_api.latest.io`` (the *sibling* of ``ui``)."""
 
@@ -364,59 +400,23 @@ class _MockIO:
     NodeOutput = _MockNodeOutput
     ComfyNode = _MockComfyNode
 
-    class Boolean(_MockTypeIO):
-        type_name = "BOOLEAN"
-        Input = _MockWidgetInput
+    Boolean = _mock_socket_type("BOOLEAN", widget=True)
+    Int = _mock_socket_type("INT", widget=True)
+    Float = _mock_socket_type("FLOAT", widget=True)
+    String = _mock_socket_type("STRING", widget=True)
+    Combo = _mock_socket_type("COMBO", widget=True)
+    MultiCombo = _mock_socket_type("MULTICOMBO", widget=True)
 
-    class Int(_MockTypeIO):
-        type_name = "INT"
-        Input = _MockWidgetInput
-
-    class Float(_MockTypeIO):
-        type_name = "FLOAT"
-        Input = _MockWidgetInput
-
-    class String(_MockTypeIO):
-        type_name = "STRING"
-        Input = _MockWidgetInput
-
-    class Combo(_MockTypeIO):
-        type_name = "COMBO"
-        Input = _MockWidgetInput
-
-    class MultiCombo(_MockTypeIO):
-        type_name = "MULTICOMBO"
-        Input = _MockWidgetInput
-
-    class Image(_MockTypeIO):
-        type_name = "IMAGE"
-
-    class Mask(_MockTypeIO):
-        type_name = "MASK"
-
-    class Latent(_MockTypeIO):
-        type_name = "LATENT"
-
-    class Conditioning(_MockTypeIO):
-        type_name = "CONDITIONING"
-
-    class Model(_MockTypeIO):
-        type_name = "MODEL"
-
-    class ModelPatch(_MockTypeIO):
-        type_name = "MODEL_PATCH"
-
-    class Vae(_MockTypeIO):
-        type_name = "VAE"
-
-    class UpscaleModel(_MockTypeIO):
-        type_name = "UPSCALE_MODEL"
-
-    class Audio(_MockTypeIO):
-        type_name = "AUDIO"
-
-    class Video(_MockTypeIO):
-        type_name = "VIDEO"
+    Image = _mock_socket_type("IMAGE")
+    Mask = _mock_socket_type("MASK")
+    Latent = _mock_socket_type("LATENT")
+    Conditioning = _mock_socket_type("CONDITIONING")
+    Model = _mock_socket_type("MODEL")
+    ModelPatch = _mock_socket_type("MODEL_PATCH")
+    Vae = _mock_socket_type("VAE")
+    UpscaleModel = _mock_socket_type("UPSCALE_MODEL")
+    Audio = _mock_socket_type("AUDIO")
+    Video = _mock_socket_type("VIDEO")
 
     class Hidden:
         unique_id = "unique_id"
@@ -425,11 +425,7 @@ class _MockIO:
     @staticmethod
     def Custom(io_type: str):
         """Mock of ``io.Custom("TYPE")`` - a socket type by name."""
-        return type(
-            f"Custom_{io_type}",
-            (_MockTypeIO,),
-            {"type_name": io_type},
-        )
+        return _mock_socket_type(io_type)
 
 
 class _MockUI:
@@ -514,12 +510,16 @@ class _MockComfyAPISync:
 class _MockModelPatcher:
     """Mock of ``comfy.model_patcher.ModelPatcher``."""
 
-    def __init__(self, model=None, *args, **kwargs) -> None:
+    def __init__(self, model=None, load_device=None, offload_device=None, *args, **kwargs) -> None:
         self.model = model if model is not None else types.SimpleNamespace()
         if not hasattr(self.model, "diffusion_model"):
             self.model.diffusion_model = types.SimpleNamespace()
         self._object_patches: dict = {}
         self._unet_wrapper = None
+        # The real patcher knows the devices it moves the model between
+        # (``ModelPatcher(model, load_device, offload_device)``).
+        self.load_device = load_device
+        self.offload_device = offload_device
 
     def clone(self) -> "_MockModelPatcher":
         new = _MockModelPatcher()
@@ -527,6 +527,8 @@ class _MockModelPatcher:
         new.model.diffusion_model = copy.copy(self.model.diffusion_model)
         new._object_patches = dict(self._object_patches)
         new._unet_wrapper = self._unet_wrapper
+        new.load_device = self.load_device
+        new.offload_device = self.offload_device
         return new
 
     def add_object_patch(self, path: str, obj) -> None:

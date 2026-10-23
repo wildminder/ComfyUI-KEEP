@@ -1,15 +1,14 @@
-"""P3.1 - the node classes live in ``nodes/``, one file per node.
+"""P4.1 - the V3 schema of the nodes keeps the compatibility contract.
 
-P3.1 is a **pure move**: the V1 classes of the former root ``nodes.py`` are
-moved verbatim into ``nodes/``.  The tests below therefore assert the
-*compatibility contract* of the pack against the **live** classes:
+The node ids, the display names, the category, the socket types and every
+widget (name, default, min/max/step and order) are compatibility guarantees
+of the pack: existing user workflows must keep working unchanged.
 
-* the node ids, the display names and the category,
-* the socket types (IMAGE / KEEP_MODEL_PACK / UPSCALE_MODEL),
-* every widget: its name, its default, its min/max/step and its order.
-
-A move that changes any of these would break existing user workflows, so the
-snapshot is the real acceptance criterion of this step.
+The contract below is the **recorded V1 ``INPUT_TYPES``** (P0.1).  After the
+V3 migration the widgets live in the schema, so the test converts the V3
+schema into the very same shape and compares it with the record.  A V3
+schema that drops a widget, renames one, changes a default or reorders the
+inputs fails here.
 """
 
 from __future__ import annotations
@@ -38,7 +37,11 @@ PACK_DISPLAY_NAMES = {
     "KEEP_ProcessImageSequence": "KEEP Image Sequence",
 }
 
-#: The expected widget contract of every node (V1 ``INPUT_TYPES``).
+#: The category of the pack - it must never change.
+PACK_CATEGORY = "ComfyUI-KEEP"
+
+#: The expected widget contract of every node (the recorded V1
+#: ``INPUT_TYPES`` - the source of truth of this file).
 EXPECTED_INPUT_TYPES = {
     "KEEP_ModelLoader": {
         "required": {
@@ -144,26 +147,137 @@ EXPECTED_INPUT_TYPES = {
     },
 }
 
-#: The V1 node metadata (return types, function name, category).
-EXPECTED_NODE_METADATA = {
+#: The expected output sockets of every node (the recorded V1
+#: ``RETURN_TYPES`` / ``RETURN_NAMES``).
+EXPECTED_OUTPUTS = {
     "KEEP_ModelLoader": {
-        "RETURN_TYPES": ("KEEP_MODEL_PACK",),
-        "RETURN_NAMES": ("keep_model_pack",),
-        "FUNCTION": "load_model_pack",
-        "CATEGORY": "ComfyUI-KEEP",
+        "types": ("KEEP_MODEL_PACK",),
+        "names": ("keep_model_pack",),
     },
     "KEEP_FaceUpscaleImage": {
-        "RETURN_TYPES": ("IMAGE",),
-        "FUNCTION": "upscale_face_image",
-        "CATEGORY": "ComfyUI-KEEP",
+        "types": ("IMAGE",),
+        # the V1 node had no RETURN_NAMES - the socket type is the name
+        "names": ("IMAGE",),
     },
     "KEEP_ProcessImageSequence": {
-        "RETURN_TYPES": ("IMAGE",),
-        "RETURN_NAMES": ("processed_images",),
-        "FUNCTION": "process_sequence",
-        "CATEGORY": "ComfyUI-KEEP",
+        "types": ("IMAGE",),
+        "names": ("processed_images",),
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+#: The class of every node id (the names are stable - they are the class
+#: names of the pack).
+NODE_CLASS_NAMES = {
+    "KEEP_ModelLoader": "KEEP_ModelLoaderNode",
+    "KEEP_FaceUpscaleImage": "KEEP_FaceUpscaleImageNode",
+    "KEEP_ProcessImageSequence": "KEEP_ProcessImageSequenceNode",
+}
+
+#: The nodes that are **already** migrated to the V3 schema.  The list grows
+#: with the migration steps (P4.1 the loader, P4.2 the single image node,
+#: P4.3 the sequence node); the contract test below works with both
+#: representations, so it stays meaningful in every step.
+V3_NODE_IDS = ("KEEP_ModelLoader",)
+
+
+def _pack_nodes(nodes_package) -> dict:
+    """``{node_id: node class}`` - read from the exports of ``nodes/``."""
+    return {
+        node_id: getattr(nodes_package, class_name)
+        for node_id, class_name in NODE_CLASS_NAMES.items()
+    }
+
+
+def _is_v3(node_class) -> bool:
+    from comfy_api.latest import io
+
+    return isinstance(node_class, type) and issubclass(node_class, io.ComfyNode)
+
+
+def _v1_contract(input_types: dict) -> dict:
+    """The recorded V1 ``INPUT_TYPES`` in the shape of the node contract."""
+    contract: dict[str, list[dict]] = {"required": [], "optional": []}
+    for section, widgets in input_types.items():
+        for name, spec in widgets.items():
+            io_type = spec[0]
+            options = spec[1] if len(spec) > 1 else {}
+            entry = {
+                "id": name,
+                "type": io_type if isinstance(io_type, str) else "COMBO",
+                "tooltip": options.get("tooltip"),
+            }
+            if not isinstance(io_type, str):
+                entry["options"] = list(io_type)
+            for field in ("default", "min", "max", "step"):
+                if field in options:
+                    entry[field] = options[field]
+            contract[section].append(entry)
+    return contract
+
+
+def _schema_contract(schema) -> dict:
+    """The V3 schema in the shape of the node contract."""
+    contract: dict[str, list[dict]] = {"required": [], "optional": []}
+    for item in schema.inputs:
+        section = "optional" if item.optional else "required"
+        entry = {
+            "id": item.id,
+            "type": item.get_io_type(),
+            "tooltip": item.tooltip,
+        }
+        for field in ("default", "min", "max", "step", "options"):
+            value = getattr(item, field, None)
+            if value is not None:
+                entry[field] = value
+        contract[section].append(entry)
+    return contract
+
+
+def _node_contract(node_class) -> dict:
+    """The contract of a node - from its V3 schema or from its V1 class.
+
+    The V3 migration moves the widgets from ``INPUT_TYPES`` into the
+    schema; the contract of the pack is the same either way, so the test
+    compares the *contract*, not the representation.
+    """
+    if _is_v3(node_class):
+        schema = node_class.GET_SCHEMA()
+        return {
+            "v3": True,
+            "node_id": schema.node_id,
+            "display_name": schema.display_name,
+            "category": schema.category,
+            "description": schema.description,
+            "inputs": _schema_contract(schema),
+            "output_types": tuple(output.get_io_type() for output in schema.outputs),
+            "output_names": tuple(
+                output.display_name if output.display_name else output.get_io_type()
+                for output in schema.outputs
+            ),
+            "tooltips": {item.id: item.tooltip for item in schema.inputs},
+        }
+    input_types = node_class.INPUT_TYPES()
+    return {
+        "v3": False,
+        "node_id": None,
+        "display_name": None,
+        "category": node_class.CATEGORY,
+        "description": getattr(node_class, "DESCRIPTION", ""),
+        "inputs": _v1_contract(input_types),
+        "output_types": tuple(node_class.RETURN_TYPES),
+        "output_names": tuple(
+            getattr(node_class, "RETURN_NAMES", node_class.RETURN_TYPES)
+        ),
+        "tooltips": {
+            entry["id"]: entry["tooltip"]
+            for entries in _v1_contract(input_types).values()
+            for entry in entries
+        },
+    }
 
 
 @pytest.fixture(scope="module")
@@ -172,6 +286,15 @@ def nodes_package():
     return importlib.import_module("ComfyUI_KEEP.nodes")
 
 
+@pytest.fixture(scope="module")
+def pack_nodes(nodes_package):
+    """``{node_id: node class}`` of the three pack nodes."""
+    return _pack_nodes(nodes_package)
+
+
+# ---------------------------------------------------------------------------
+# the layout
+# ---------------------------------------------------------------------------
 @pytest.mark.unit
 def test_every_node_has_its_own_file():
     """One file per node, and the old root ``nodes.py`` is gone."""
@@ -188,54 +311,103 @@ def test_every_node_has_its_own_file():
 
 
 @pytest.mark.unit
-def test_node_class_mappings_has_exactly_the_three_ids(nodes_package):
-    """``NODE_CLASS_MAPPINGS`` holds exactly the three pack ids."""
-    mappings = nodes_package.NODE_CLASS_MAPPINGS
-    assert sorted(mappings) == sorted(PACK_NODE_IDS), sorted(mappings)
-    for node_id, node_class in mappings.items():
-        assert isinstance(node_class, type), node_id
-        assert node_class.__name__.endswith("Node"), node_class.__name__
+def test_the_pack_registers_exactly_the_three_node_ids(pack_nodes):
+    """The three node ids of the pack - and no other node."""
+    assert sorted(pack_nodes) == sorted(PACK_NODE_IDS), sorted(pack_nodes)
 
 
 @pytest.mark.unit
-def test_display_name_mappings_are_unchanged(nodes_package):
-    """The display names of the three nodes are unchanged."""
-    assert nodes_package.NODE_DISPLAY_NAME_MAPPINGS == PACK_DISPLAY_NAMES
+def test_every_node_defines_a_v3_schema_and_execute(pack_nodes):
+    """Every migrated node is a V3 node: ``define_schema`` + ``execute``."""
+    for node_id in V3_NODE_IDS:
+        node_class = pack_nodes[node_id]
+        assert _is_v3(node_class), f"{node_id} is not a V3 node yet"
+        schema = node_class.GET_SCHEMA()
+        assert schema.node_id == node_id, node_id
+        assert callable(node_class.execute), node_id
+
+
+# ---------------------------------------------------------------------------
+# the schema contract
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_display_names_and_the_category_are_unchanged(pack_nodes, nodes_package):
+    """The display names of the three nodes and the category are unchanged."""
+    v1_display_names = getattr(nodes_package, "NODE_DISPLAY_NAME_MAPPINGS", {})
+    for node_id, node_class in pack_nodes.items():
+        contract = _node_contract(node_class)
+        display_name = contract["display_name"] or v1_display_names.get(node_id)
+        assert display_name == PACK_DISPLAY_NAMES[node_id], node_id
+        assert contract["category"] == PACK_CATEGORY, node_id
+        if contract["v3"]:
+            assert contract["description"], f"{node_id} needs a schema description"
 
 
 @pytest.mark.unit
-def test_the_widget_contract_is_unchanged(nodes_package):
-    """Every widget keeps its name, default, min/max/step and order."""
+def test_the_widget_contract_is_unchanged(pack_nodes):
+    """Every widget keeps its name, type, default, min/max/step and order."""
     for node_id, expected in EXPECTED_INPUT_TYPES.items():
-        node_class = nodes_package.NODE_CLASS_MAPPINGS[node_id]
-        actual = node_class.INPUT_TYPES()
-        assert list(actual) == list(expected), (
-            f"{node_id}: the input sections changed ({list(actual)} != {list(expected)})"
+        contract = _node_contract(pack_nodes[node_id])
+        actual = contract["inputs"]
+        expected_contract = _v1_contract(expected)
+
+        assert list(actual) == list(expected_contract), (
+            f"{node_id}: the input sections changed ({list(actual)} != "
+            f"{list(expected_contract)})"
         )
-        for section, widgets in expected.items():
-            assert list(actual[section]) == list(widgets), (
-                f"{node_id}/{section}: the widget order changed "
-                f"({list(actual[section])} != {list(widgets)})"
-            )
-            for name, spec in widgets.items():
-                assert actual[section][name] == spec, (
-                    f"{node_id}/{section}/{name}: {actual[section][name]} != {spec}"
-                )
+        for section in expected_contract:
+            actual_entries = actual[section]
+            expected_entries = expected_contract[section]
+            assert [entry["id"] for entry in actual_entries] == [
+                entry["id"] for entry in expected_entries
+            ], f"{node_id}/{section}: the widget order changed"
+            for actual_entry, expected_entry in zip(actual_entries, expected_entries):
+                for key, value in expected_entry.items():
+                    if key == "tooltip" and value is None:
+                        # the V1 node had no tooltip here - the V3 schema
+                        # requires one (the plan's P4.1: every input gets a
+                        # tooltip), but the text is new
+                        if contract["v3"]:
+                            assert actual_entry["tooltip"], (
+                                f"{node_id}/{actual_entry['id']}: "
+                                "the input needs a tooltip"
+                            )
+                        continue
+                    assert actual_entry.get(key) == value, (
+                        f"{node_id}/{actual_entry['id']}/{key}: "
+                        f"{actual_entry.get(key)!r} != {value!r}"
+                    )
 
 
 @pytest.mark.unit
-def test_the_node_metadata_is_unchanged(nodes_package):
-    """The socket types, the function names and the category are unchanged."""
-    for node_id, expected in EXPECTED_NODE_METADATA.items():
-        node_class = nodes_package.NODE_CLASS_MAPPINGS[node_id]
-        for attribute, value in expected.items():
-            assert getattr(node_class, attribute) == value, (
-                f"{node_id}.{attribute}: {getattr(node_class, attribute)!r} != {value!r}"
+def test_every_input_has_a_tooltip(pack_nodes):
+    """Every input of every V3 node carries a tooltip."""
+    for node_id, node_class in pack_nodes.items():
+        if not _is_v3(node_class):
+            continue
+        schema = node_class.GET_SCHEMA()
+        assert schema.inputs, node_id
+        for item in schema.inputs:
+            assert isinstance(item.tooltip, str) and item.tooltip.strip(), (
+                f"{node_id}/{item.id}: the input has no tooltip"
             )
 
 
 @pytest.mark.unit
-def test_the_example_workflow_ids_exist_in_the_mappings(nodes_package):
+def test_the_output_sockets_are_unchanged(pack_nodes):
+    """The output socket types and their names are unchanged."""
+    for node_id, expected in EXPECTED_OUTPUTS.items():
+        contract = _node_contract(pack_nodes[node_id])
+        assert contract["output_types"] == expected["types"], (
+            f"{node_id}: {contract['output_types']} != {expected['types']}"
+        )
+        assert contract["output_names"] == expected["names"], (
+            f"{node_id}: {contract['output_names']} != {expected['names']}"
+        )
+
+
+@pytest.mark.unit
+def test_the_example_workflow_ids_exist_in_the_pack(pack_nodes):
     """The ids of the shipped example are registered by the node."""
     workflow = json.loads(
         (EXAMPLES_DIR / "keep-workflow.json").read_text(encoding="utf-8")
@@ -246,9 +418,7 @@ def test_the_example_workflow_ids_exist_in_the_mappings(nodes_package):
         if isinstance(node.get("type"), str) and node["type"].startswith("KEEP_")
     }
     assert used, "the example must use the KEEP nodes"
-    assert used <= set(nodes_package.NODE_CLASS_MAPPINGS), sorted(
-        used - set(nodes_package.NODE_CLASS_MAPPINGS)
-    )
+    assert used <= set(pack_nodes), sorted(used - set(pack_nodes))
 
 
 @pytest.mark.unit

@@ -1,10 +1,10 @@
-"""P3.2 - the mock-integration execution of the node classes.
+"""P3.2 / P4.1 - the mock-integration execution of the node classes.
 
-The nodes are still V1 classes in this phase (P4 migrates them to the V3
-schema), so their ``execute`` path is the plain method.  The tests drive it
-with a **stub pack** and a stubbed processor and assert the contract of the
-node: the image that goes in comes back out, and the pack is loaded and
-offloaded exactly once.
+The loader node is a V3 node (P4.1) - its ``execute`` is a classmethod that
+returns an ``io.NodeOutput``.  The tests drive it with a **stubbed loader**
+(the model build is stubbed out - no weights are needed) and assert the
+contract of the node: the pack comes back, the widgets reach the loader
+unchanged and the second call is served from the loader's cache.
 """
 
 from __future__ import annotations
@@ -26,6 +26,11 @@ def loader_module():
     return importlib.import_module("ComfyUI_KEEP.src.keep_model_loader")
 
 
+@pytest.fixture(scope="module")
+def loader_node_module():
+    return importlib.import_module("ComfyUI_KEEP.nodes.keep_model_loader")
+
+
 @pytest.fixture
 def stub_pack(loader_module, monkeypatch):
     """A real ``KEEPModelPack`` (the node checks the type) with stubs."""
@@ -43,6 +48,128 @@ def stub_pack(loader_module, monkeypatch):
     return pack
 
 
+@pytest.fixture
+def stubbed_loader(loader_module, monkeypatch, tmp_path):
+    """A real ``KEEPModelLoader`` whose model build is stubbed out.
+
+    The stub replaces the four heavy parts of the build (the architecture, the
+    checkpoint download, the checkpoint load and the face helper) - the cache
+    logic of the loader itself stays **real**.
+    """
+    class _StubArch:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.loaded = None
+
+        def to(self, device):
+            return self
+
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded = state_dict
+            return self
+
+        def eval(self):
+            return self
+
+    class _StubHelper:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(loader_module, "ARCH_REGISTRY", {"KEEP": _StubArch})
+    monkeypatch.setattr(
+        loader_module,
+        "load_file_from_url_comfy",
+        lambda **kwargs: str(tmp_path / "checkpoint.pth"),
+    )
+    monkeypatch.setattr(
+        loader_module.torch,
+        "load",
+        lambda *args, **kwargs: {"params_ema": {"weight": torch.zeros(1)}},
+    )
+    monkeypatch.setattr(loader_module, "_face_restore_helper", lambda: _StubHelper)
+    monkeypatch.setattr(
+        loader_module.keep_paths, "resolve_model_root", lambda *args, **kwargs: str(tmp_path)
+    )
+    return loader_module.KEEPModelLoader()
+
+
+# ---------------------------------------------------------------------------
+# P4.1 - the model loader node
+# ---------------------------------------------------------------------------
+@pytest.mark.mock_integration
+def test_the_loader_node_returns_the_pack(loader_node_module, stubbed_loader, monkeypatch):
+    """The node returns the pack of the loader as a ``NodeOutput``."""
+    from comfy_api.latest import io
+
+    monkeypatch.setattr(loader_node_module, "GLOBAL_KEEP_MODEL_LOADER", stubbed_loader)
+
+    output = loader_node_module.KEEP_ModelLoaderNode.execute(
+        model="KEEP",
+        detection_model="retinaface_resnet50",
+    )
+
+    assert isinstance(output, io.NodeOutput)
+    assert len(output.result) == 1
+    pack = output.result[0]
+    assert pack.model_type_str == "KEEP"
+    assert pack.keep_net is not None
+
+
+@pytest.mark.mock_integration
+def test_the_loader_node_serves_the_second_call_from_the_cache(
+    loader_node_module, stubbed_loader, monkeypatch
+):
+    """The second call with the same widgets reuses the cached models."""
+    monkeypatch.setattr(loader_node_module, "GLOBAL_KEEP_MODEL_LOADER", stubbed_loader)
+
+    first = loader_node_module.KEEP_ModelLoaderNode.execute(
+        model="KEEP", detection_model="retinaface_resnet50"
+    ).result[0]
+    second = loader_node_module.KEEP_ModelLoaderNode.execute(
+        model="KEEP", detection_model="retinaface_resnet50"
+    ).result[0]
+
+    assert first is not second, "every call returns its own pack"
+    assert first.keep_net is second.keep_net, "the models are cached"
+    assert first.face_helper is second.face_helper, "the models are cached"
+    assert len(stubbed_loader.loaded_models) == 1, stubbed_loader.loaded_models
+
+
+@pytest.mark.mock_integration
+def test_the_loader_node_passes_the_widgets_to_the_loader(
+    loader_node_module, monkeypatch
+):
+    """The widget values reach the loader unchanged."""
+    received: list[dict] = []
+
+    class _RecordingLoader:
+        def load_keep_model_pack(self, **kwargs):
+            received.append(kwargs)
+            return "pack"
+
+    monkeypatch.setattr(loader_node_module, "GLOBAL_KEEP_MODEL_LOADER", _RecordingLoader())
+
+    output = loader_node_module.KEEP_ModelLoaderNode.execute(
+        model="KEEP",
+        detection_model="retinaface_mobile0.25",
+        bg_upscale_model="bg",
+        face_upscale_model="face",
+    )
+
+    assert output.result == ("pack",)
+    assert received == [
+        {
+            "model_type_str": "KEEP",
+            "detection_model_str": "retinaface_mobile0.25",
+            "bg_upscale_model": "bg",
+            "face_upscale_model": "face",
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# P3.2 - the single image node (V1 until P4.2)
+# ---------------------------------------------------------------------------
 @pytest.mark.mock_integration
 def test_upscale_face_image_returns_the_processed_image(node_module, stub_pack, monkeypatch):
     """The node returns the processed image and uses the pack once."""
