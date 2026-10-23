@@ -14,6 +14,7 @@ collection.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,63 @@ def test_the_icon_points_at_the_preview_asset(pyproject):
     assert icon == EXPECTED_ICON, icon
     asset = REPO_ROOT / icon
     assert asset.is_file(), f"the icon {icon!r} is not in the repository"
+
+
+# ---------------------------------------------------------------------------
+# P6.5 - the preconditions of publish.yml
+# ---------------------------------------------------------------------------
+#: The four keys the Comfy Registry reads from ``[tool.comfy]``.
+REQUIRED_COMFY_KEYS = ("PublisherId", "DisplayName", "Icon", "requires-comfyui")
+
+#: The magic bytes of a png file.
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+#: A version range of the form ``>=1.2.3`` (the registry wants a range).
+VERSION_SPECIFIER_PATTERN = re.compile(r"^(>=|>|<=|<|==|!=)?\s*\d+(\.\d+)*$")
+
+
+@pytest.mark.unit
+def test_every_registry_key_has_a_non_empty_value(pyproject):
+    """Every key of ``[tool.comfy]`` carries a non-empty value.
+
+    P6.5: the key being present is not enough - the registry publishes an
+    entry with an empty publisher or an empty display name, so every value
+    must really say something.
+    """
+    comfy = pyproject.get("tool", {}).get("comfy") or {}
+    for key in REQUIRED_COMFY_KEYS:
+        assert key in comfy, f"[tool.comfy] has no {key}"
+        value = comfy[key]
+        assert isinstance(value, str) and value.strip(), (
+            f"[tool.comfy].{key} is empty - the registry entry would be incomplete"
+        )
+
+
+@pytest.mark.unit
+def test_the_icon_is_a_readable_png(pyproject):
+    """The ``Icon`` is a real png file of the repository.
+
+    The registry renders the icon; a file that is not a png (or an empty
+    one) breaks the entry - and the asset is committed, it must never be
+    deleted from the repository.
+    """
+    comfy = pyproject.get("tool", {}).get("comfy") or {}
+    icon = comfy.get("Icon", "")
+    asset = REPO_ROOT / icon
+    assert asset.is_file(), f"the icon {icon!r} is not in the repository"
+    data = asset.read_bytes()
+    assert data[:8] == PNG_MAGIC, f"the icon {icon!r} is not a png file"
+    assert len(data) > len(PNG_MAGIC), f"the icon {icon!r} is empty"
+
+
+@pytest.mark.unit
+def test_the_comfyui_requirement_is_a_version_range(pyproject):
+    """``requires-comfyui`` is a version range the registry understands."""
+    comfy = pyproject.get("tool", {}).get("comfy") or {}
+    requirement = str(comfy.get("requires-comfyui", ""))
+    assert VERSION_SPECIFIER_PATTERN.match(requirement), (
+        f"[tool.comfy].requires-comfyui is not a version range: {requirement!r}"
+    )
 
 
 @pytest.mark.unit
