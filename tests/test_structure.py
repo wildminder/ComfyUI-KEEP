@@ -173,18 +173,40 @@ def src_schema_violations(root: Path) -> list[str]:
 # guard (c) - exactly one entry point
 # ---------------------------------------------------------------------------
 def entrypoint_violations(root: Path) -> list[str]:
-    """The root ``__init__.py`` must expose exactly ``comfy_entrypoint``."""
+    """The root ``__init__.py`` must expose exactly ``comfy_entrypoint``.
+
+    The check is **AST based**: a mention of ``comfy_entrypoint`` in a
+    docstring is not a definition, and the V1 names are violations whether
+    they are assigned or imported.
+    """
     init_file = root / "__init__.py"
     if not init_file.is_file():
         return ["__init__.py does not exist"]
 
-    text = _read(init_file)
+    tree = ast.parse(_read(init_file), filename=str(init_file))
     violations: list[str] = []
-    if "comfy_entrypoint" not in text:
+
+    has_entrypoint = any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "comfy_entrypoint"
+        for node in tree.body
+    )
+    if not has_entrypoint:
         violations.append("__init__.py does not define comfy_entrypoint")
-    for v1_name in ("NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"):
-        if v1_name in text:
-            violations.append(f"__init__.py still exports the V1 name {v1_name}")
+
+    v1_names = ("NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS")
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in v1_names:
+                    violations.append(f"__init__.py still exports the V1 name {target.id}")
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id in v1_names:
+                violations.append(f"__init__.py still exports the V1 name {node.target.id}")
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in v1_names:
+                    violations.append(f"__init__.py still exports the V1 name {alias.name}")
     return violations
 
 

@@ -1,18 +1,16 @@
-import logging
-import sys
+"""The ComfyUI-KEEP custom node package.
 
-# Configure a logger for the entire custom node package
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+The entry point is deliberately minimal: it sets up the logger and exports
+the V1 node mappings.  P4.4 replaces the mappings with the V3
+``comfy_entrypoint`` (the node ids, the display names and the category stay
+the same either way).
+"""
 
-# Add a handler if none exist
-if not logger.hasHandlers():
-    handler = logging.StreamHandler(sys.stderr)
-    formatter = logging.Formatter(f"[%(levelname)s] %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-
+from .src.keep_logger import logger
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+# The model folders are registered with ComfyUI's ``folder_paths`` in P3.5
+# (``src/keep_paths.py``); the registration is wired into this entry point
+# there.
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "logger"]
