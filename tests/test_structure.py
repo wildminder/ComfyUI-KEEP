@@ -386,10 +386,17 @@ def test_self_test_guard_e_detects_a_debug_import_in_the_closure(repo_copy):
     """
     before = vendored_breakage_violations(repo_copy)
 
-    # A new ``*_arch.py`` file joins the closure through the eager arch scan
-    # of ``basicsr/archs/__init__.py``.
+    # A new ``*_arch.py`` file joins the closure through the explicit import
+    # list of ``basicsr/archs/__init__.py`` (P2.4 replaced the eager scan).
     arch_file = repo_copy / "modules" / "deps" / "basicsr" / "archs" / "zz_guard_arch.py"
     arch_file.write_text("import pdb\n\n\ndef f():\n    pdb.set_trace()\n", encoding="utf-8")
+    archs_init = repo_copy / "modules" / "deps" / "basicsr" / "archs" / "__init__.py"
+    init_text = archs_init.read_text(encoding="utf-8")
+    assert "from . import (" in init_text, init_text[:200]
+    archs_init.write_text(
+        init_text.replace("from . import (\n", "from . import (\n    zz_guard_arch,\n", 1),
+        encoding="utf-8",
+    )
 
     after = vendored_breakage_violations(repo_copy)
     assert any("zz_guard_arch.py" in violation for violation in after), (

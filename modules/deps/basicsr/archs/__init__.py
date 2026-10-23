@@ -1,18 +1,40 @@
-import importlib
+# https://github.com/xinntao/BasicSR
+# flake8: noqa
 from copy import deepcopy
-from os import path as osp
 
-from basicsr.utils import get_root_logger, scandir
+from basicsr.utils import get_root_logger
 from basicsr.utils.registry import ARCH_REGISTRY
 
-__all__ = ['build_network']
+# P2.4 - explicit import list; the eager folder scan is gone
+from . import (
+    arcface_arch,
+    basicvsr_arch,
+    basicvsrpp_arch,
+    dfdnet_arch,
+    discriminator_arch,
+    duf_arch,
+    ecbsr_arch,
+    edsr_arch,
+    edvr_arch,
+    gmflow_arch,
+    hifacegan_arch,
+    keep_arch,
+    rcan_arch,
+    ridnet_arch,
+    rrdbnet_arch,
+    spectral_norm_arch,
+    spynet_arch,
+    srresnet_arch,
+    srvgg_arch,
+    stylegan2_arch,
+    stylegan2_bilinear_arch,
+    swinir_arch,
+    tof_arch,
+    vgg_arch,
+    vqgan_arch,
+)
 
-# automatically scan and import arch modules for registry
-# scan all the files under the 'archs' folder and collect files ending with '_arch.py'
-arch_folder = osp.dirname(osp.abspath(__file__))
-arch_filenames = [osp.splitext(osp.basename(v))[0] for v in scandir(arch_folder) if v.endswith('_arch.py')]
-# import all the arch modules
-_arch_modules = [importlib.import_module(f'basicsr.archs.{file_name}') for file_name in arch_filenames]
+__all__ = ['build_network']
 
 
 def build_network(opt):

@@ -170,32 +170,33 @@ def test_closure_contains_the_runtime_files(scanner):
 
 
 @pytest.mark.unit
-def test_closure_contains_the_eagerly_scanned_modules(scanner):
-    """The four eager folder scans of the vendored ``basicsr`` belong to the closure.
+def test_closure_contains_the_explicitly_listed_modules(scanner):
+    """The modules of the explicit import lists belong to the closure.
 
-    ``basicsr/__init__.py`` imports ``.data`` / ``.losses`` / ``.models``, and each of
-    those packages imports its whole folder eagerly - so those modules are loaded by
-    ``import basicsr`` even though no static import statement mentions them.
+    P2.4 replaced the four eager folder scans of the vendored ``basicsr``
+    packages with explicit import lists - the same modules are loaded by
+    ``import basicsr``, but the closure computation no longer has to model a
+    dynamic scan.
     """
     report = scanner.scan_repo(REPO_ROOT)
     closure = set(report["closure_files"])
     for expected in (
-        # models/__init__.py:13-15  -> *_model.py
+        # models/__init__.py - explicit list
         "modules/deps/basicsr/models/keep_model.py",
         "modules/deps/basicsr/models/keep_gan_model.py",
         "modules/deps/basicsr/models/base_model.py",
-        # data/__init__.py:20-22  -> *_dataset.py
+        # data/__init__.py - explicit list
         "modules/deps/basicsr/data/reds_dataset.py",
         "modules/deps/basicsr/data/single_image_dataset.py",
-        # losses/__init__.py:14-16  -> *_loss.py
+        # losses/__init__.py - explicit list
         "modules/deps/basicsr/losses/basic_loss.py",
         # reached through 'from <package> import <submodule>'
         "modules/deps/basicsr/models/lr_scheduler.py",
         "modules/deps/basicsr/utils/flow_util.py",
     ):
         assert expected in closure, (
-            f"{expected} is not in the runtime closure - the eager folder scans of "
-            "basicsr are not modelled"
+            f"{expected} is not in the runtime closure - the explicit import "
+            "lists of the vendored basicsr are not resolved"
         )
 
 

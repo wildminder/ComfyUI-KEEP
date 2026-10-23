@@ -287,3 +287,98 @@ def test_the_diffusers_equivalence_run_is_recorded():
     )
     assert result.returncode == 0, result.stderr
     assert "EQUIVALENT True" in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# P2.4 - the pruned tree and the explicit import lists
+# ---------------------------------------------------------------------------
+
+#: Blocks every ``pip`` import - no import of the vendored tree may install
+#: anything (the deleted pip shim of P2.1 must not come back).
+_PIP_BLOCK = """
+import sys
+
+class _BlockPip:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "pip" or fullname.startswith("pip."):
+            raise AssertionError("pip was imported: " + fullname)
+        return None
+
+sys.meta_path.insert(0, _BlockPip())
+"""
+
+
+def _scan_report():
+    """The P0.3 scanner report of the repository."""
+    tools_dir = str(REPO_ROOT / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    import scan_compat  # noqa: PLC0415 - the tool is a script, not a package
+
+    return scan_compat.scan_repo(REPO_ROOT)
+
+
+@pytest.mark.unit
+def test_the_closure_equals_the_pruned_file_set():
+    """P2.4: the closure re-computation equals the pruned file set.
+
+    Missing-free (every file of the closure exists) and orphan-free (every
+    file of the vendored tree is part of the closure).
+    """
+    report = _scan_report()
+    closure = {
+        rel for rel in report["closure_files"] if rel.startswith("modules/deps/")
+    }
+    tree = {path.relative_to(REPO_ROOT).as_posix() for path in DEPS_DIR.rglob("*.py")}
+    assert closure, "the runtime closure is empty"
+    assert closure == tree, (
+        "the closure and the pruned tree must be identical; "
+        f"missing: {sorted(tree - closure)}; orphans: {sorted(closure - tree)}"
+    )
+
+
+@pytest.mark.unit
+def test_no_dynamic_folder_scan_remains_in_the_vendored_tree():
+    """P2.4: the eager ``importlib`` folder scans are gone."""
+    offenders = []
+    for path in sorted(DEPS_DIR.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "importlib.import_module" in text:
+            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+    assert offenders == [], offenders
+
+
+@pytest.mark.unit
+def test_import_basicsr_still_succeeds():
+    """P2.4: ``import basicsr`` (and its sub-packages) still works.
+
+    This is the guard against the silent breakage path: a deleted package
+    directory raises ``ModuleNotFoundError`` inside ``import basicsr``, which
+    ``modules/utils.py`` swallows into the ``DummyArchRegistry`` - the node
+    would keep loading and silently lose the KEEP architecture.
+    """
+    code = (
+        _PIP_BLOCK
+        + "import sys; sys.path.insert(0, sys.argv[1]);"
+        "import basicsr; import basicsr.archs; import basicsr.models;"
+        "import basicsr.data; import basicsr.losses; import basicsr.metrics;"
+        "print('KEEP_IMPORT_OK', basicsr.__version__)"
+    )
+    result = _run_python(code, str(DEPS_DIR))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "KEEP_IMPORT_OK" in result.stdout, result.stdout
+
+
+@pytest.mark.unit
+def test_the_keep_architecture_is_still_registered():
+    """P2.4: the explicit arch list still registers the KEEP architecture."""
+    code = (
+        _PIP_BLOCK
+        + "import sys; sys.path.insert(0, sys.argv[1]);"
+        "from basicsr.utils.registry import ARCH_REGISTRY;"
+        "import basicsr.archs;"
+        "print('KEEP_REGISTERED', ARCH_REGISTRY.get('KEEP').__name__)"
+    )
+    result = _run_python(code, str(DEPS_DIR))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "KEEP_REGISTERED KEEP" in result.stdout, result.stdout

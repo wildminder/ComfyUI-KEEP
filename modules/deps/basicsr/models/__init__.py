@@ -1,18 +1,31 @@
-import importlib
+# https://github.com/xinntao/BasicSR
+# flake8: noqa
 from copy import deepcopy
-from os import path as osp
 
-from basicsr.utils import get_root_logger, scandir
+from basicsr.utils import get_root_logger
 from basicsr.utils.registry import MODEL_REGISTRY
 
-__all__ = ['build_model']
+# P2.4 - explicit import list; the eager folder scan is gone
+from . import (
+    base_model,
+    edvr_model,
+    esrgan_model,
+    hifacegan_model,
+    keep_gan_model,
+    keep_model,
+    realesrgan_model,
+    realesrnet_model,
+    sr_model,
+    srgan_model,
+    stylegan2_model,
+    swinir_model,
+    video_base_model,
+    video_gan_model,
+    video_recurrent_gan_model,
+    video_recurrent_model,
+)
 
-# automatically scan and import model modules for registry
-# scan all the files under the 'models' folder and collect files ending with '_model.py'
-model_folder = osp.dirname(osp.abspath(__file__))
-model_filenames = [osp.splitext(osp.basename(v))[0] for v in scandir(model_folder) if v.endswith('_model.py')]
-# import all the model modules
-_model_modules = [importlib.import_module(f'basicsr.models.{file_name}') for file_name in model_filenames]
+__all__ = ['build_model']
 
 
 def build_model(opt):

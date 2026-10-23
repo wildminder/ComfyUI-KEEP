@@ -248,6 +248,21 @@ def _resolve(level: int, parts: list[str], current_file: Path) -> list[Path]:
     ] + [parent for parent in _package_inits(DEPS_DIR, parts) if parent.is_file()]
 
 
+def _has_dynamic_folder_scan(init_file: Path, suffix: str) -> bool:
+    """True if the package ``__init__.py`` really scans its own folder.
+
+    The vendored ``basicsr`` packages used to import every matching module of
+    their folder at import time (a dynamic ``importlib.import_module`` loop).
+    P2.4 replaced those loops with explicit import lists, so the closure
+    computation must only model the scan when it is still there.
+    """
+    try:
+        text = init_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return "importlib.import_module" in text and suffix in text
+
+
 def find_import_closure(entry_points: list[Path]) -> list[Path]:
     """Static runtime import closure of ``entry_points`` (sorted, de-duplicated)."""
     closure: set[Path] = set()
@@ -266,9 +281,11 @@ def find_import_closure(entry_points: list[Path]) -> list[Path]:
                 if dependency.resolve() not in closure:
                     queue.append(dependency.resolve())
         # the eager folder scans of basicsr/archs|data|losses|models/__init__.py
+        # (P2.4: only modelled when the package init really contains such a
+        # scan - the explicit import lists have none)
         if current.name == "__init__.py":
             suffix = EAGER_SCAN_PACKAGES.get(current.parent.name)
-            if suffix:
+            if suffix and _has_dynamic_folder_scan(current, suffix):
                 for module in sorted(current.parent.glob(f"*{suffix}")):
                     if module.resolve() not in closure:
                         queue.append(module.resolve())

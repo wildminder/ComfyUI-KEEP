@@ -1,25 +1,28 @@
-import importlib
 import numpy as np
 import random
 import torch
 import torch.utils.data
 from copy import deepcopy
 from functools import partial
-from os import path as osp
 
 from basicsr.data.prefetch_dataloader import PrefetchDataLoader
-from basicsr.utils import get_root_logger, scandir
+from basicsr.utils import get_root_logger
 from basicsr.utils.dist_util import get_dist_info
 from basicsr.utils.registry import DATASET_REGISTRY
 
 __all__ = ['build_dataset', 'build_dataloader']
 
-# automatically scan and import dataset modules for registry
-# scan all the files under the data folder with '_dataset' in file names
-data_folder = osp.dirname(osp.abspath(__file__))
-dataset_filenames = [osp.splitext(osp.basename(v))[0] for v in scandir(data_folder) if v.endswith('_dataset.py')]
-# import all the dataset modules
-_dataset_modules = [importlib.import_module(f'basicsr.data.{file_name}') for file_name in dataset_filenames]
+# P2.4 - explicit import list; the eager folder scan is gone
+from . import (
+    ffhq_dataset,
+    paired_image_dataset,
+    realesrgan_dataset,
+    realesrgan_paired_dataset,
+    reds_dataset,
+    single_image_dataset,
+    video_test_dataset,
+    vimeo90k_dataset,
+)
 
 
 def build_dataset(dataset_opt):
