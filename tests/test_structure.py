@@ -381,15 +381,48 @@ def test_self_test_guard_d_detects_a_sys_path_mutation(repo_copy):
 
 @pytest.mark.unit
 def test_self_test_guard_e_detects_a_debug_import_in_the_closure(repo_copy):
-    baseline = vendored_breakage_violations(repo_copy)
-    assert baseline, "the current closure is expected to contain the known breakage"
+    """The guard reports a ``pdb`` import in a file that joins the closure.
+
+    The self-test does **not** depend on the current tree still containing the
+    known breakage: after P2.1 the baseline is empty and the self-test must
+    keep working (it proves the guard, not the state of the tree).
+    """
+    before = vendored_breakage_violations(repo_copy)
 
     # A new ``*_arch.py`` file joins the closure through the eager arch scan
     # of ``basicsr/archs/__init__.py``.
     arch_file = repo_copy / "modules" / "deps" / "basicsr" / "archs" / "zz_guard_arch.py"
     arch_file.write_text("import pdb\n\n\ndef f():\n    pdb.set_trace()\n", encoding="utf-8")
 
-    violations = vendored_breakage_violations(repo_copy)
-    assert any("zz_guard_arch.py" in violation for violation in violations), (
-        f"the guard did not catch the new closure member: {violations}"
+    after = vendored_breakage_violations(repo_copy)
+    assert any("zz_guard_arch.py" in violation for violation in after), (
+        f"the guard did not catch the new closure member: {after}"
     )
+    # The pre-existing findings are unchanged: the guard reports exactly the
+    # baseline plus the injected file.
+    assert [violation for violation in after if "zz_guard_arch.py" not in violation] == before
+
+
+@pytest.mark.unit
+def test_guard_e_flip_owner_covers_every_current_finding():
+    """P2.1 must be able to clear every finding the guard reports.
+
+    Guard (e) is ``xfail(strict=False)``: nothing forces it to flip.  If the
+    flip owner's work list misses a file, the guard stays red forever and
+    nobody notices.  This test compares the P2.1 section of the plan with the
+    live scanner output - the plan's work list and the tree cannot drift.
+    """
+    plan = REPO_ROOT / "docs" / "plans" / "2026-10-22-comfyui-keep-v3-modernization.md"
+    if not plan.is_file():
+        pytest.skip("the modernization plan is not part of this checkout")
+
+    text = plan.read_text(encoding="utf-8")
+    section = re.search(r"\*\*P2\.1\b.*?(?=\n\*\*P2\.2)", text, re.DOTALL)
+    assert section, "the plan must have a P2.1 section"
+
+    for violation in vendored_breakage_violations(REPO_ROOT):
+        path = violation.split(":", 1)[0]
+        assert Path(path).name in section.group(0), (
+            f"{path} is not on the P2.1 work list: guard (e) cannot flip green "
+            f"while the file is not cleaned up"
+        )

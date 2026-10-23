@@ -21,6 +21,13 @@ things, in this order:
    **not** an attribute of ``io``, and ``execution`` is an instance attribute
    (class-level access raises ``AttributeError``), exactly like the real API.
 
+   The mocks can be switched **off** with ``KEEP_NO_COMFY_MOCKS=1``: the root
+   conftest is imported before any test module, so the mocks would otherwise
+   always win and the headless tier (plan section 4: *real* ``comfy`` /
+   ``comfy_api`` modules on ``sys.path``) could never import the real ones
+   in-process.  With the variable set, ``sys.modules`` is left alone and the
+   real modules stay in charge.
+
 3. **Fixtures.**  ``sample_image`` (deterministic seeded 64x64 RGB tensor) and
    the autouse ``mock_folder_paths`` reset, which gives every test its own
    ``models_dir`` and its own folder registry.
@@ -59,6 +66,21 @@ collect_ignore = ["__init__.py", "src", "nodes"]
 
 #: The package alias mandated by the plan (P1.2).
 PACKAGE_ALIAS = "ComfyUI_KEEP"
+
+#: Environment variable that switches the ComfyUI mocks **off** (see the
+#: module docstring).  The headless tier of the plan (section 4) imports the
+#: real ``comfy`` / ``comfy_api`` modules; the root conftest is imported
+#: before any test module, so without this opt-out the mocks would always
+#: win.
+DISABLE_MOCKS_ENV = "KEEP_NO_COMFY_MOCKS"
+
+#: The values of :data:`DISABLE_MOCKS_ENV` that count as "on".
+TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def comfy_mocks_disabled() -> bool:
+    """``True`` when the environment asks for the **real** ComfyUI modules."""
+    return os.environ.get(DISABLE_MOCKS_ENV, "").strip().lower() in TRUTHY_VALUES
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +657,14 @@ def _install_comfy_mocks() -> None:
     Nothing is overwritten: if a real ComfyUI is already imported (the
     ``headless`` tier runs the helper in its own interpreter), the real
     modules stay in charge.
+
+    The mocks are skipped entirely when ``KEEP_NO_COMFY_MOCKS`` is set - the
+    opt-out the headless tier needs (the root conftest is imported before any
+    test module, so the "already imported" check above can never be true in
+    an ordinary pytest session).
     """
+    if comfy_mocks_disabled():
+        return
     if "comfy_api.latest" in sys.modules or "comfy" in sys.modules:
         return
 

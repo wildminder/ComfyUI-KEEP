@@ -21,6 +21,7 @@ import importlib
 import importlib.util
 import inspect
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -38,21 +39,58 @@ PRODUCTION_FILES = (
 )
 
 #: Symbols the mocks imitate (plan section 6, mock-fidelity tripwires).
+#:
+#: ``symbol -> (source relative to COMFYUI_ROOT, kind)``:
+#:
+#: * ``"alias"``      - the module re-exports the symbol (``from . import
+#:   _io_public as io``);
+#: * ``"definition"`` - the symbol is defined (a ``def``, a ``class`` or an
+#:   assignment);
+#: * ``"attribute"``  - the symbol is an instance attribute (``self.execution``);
+#: * ``"io_symbol"``  - the symbol belongs to ``comfy_api.latest.io``; it is
+#:   looked up in the module that ``_io_public.py`` re-exports.
+#:
+#: The ``io`` symbols live in the *private* module behind
+#: ``comfy_api/latest/_io_public.py`` (``from ._io import *``), so the source
+#: is resolved through that star import instead of being hard-coded.
 MOCKED_SYMBOLS = {
-    "comfy_api.latest": ("io", "ui", "ComfyExtension", "ComfyAPI", "ComfyAPISync"),
-    "comfy.model_management": (
-        "load_models_gpu",
-        "unload_all_models",
-        "soft_empty_cache",
-        "get_torch_device",
-    ),
-    "comfy.model_patcher": ("ModelPatcher",),
-    "comfy.utils": ("tiled_scale", "ProgressBar"),
-    "folder_paths": (
-        "add_model_folder_path",
-        "get_full_path_or_raise",
-        "get_filename_list",
-    ),
+    "comfy_api.latest": {
+        "io": ("comfy_api/latest/__init__.py", "alias"),
+        "ui": ("comfy_api/latest/__init__.py", "alias"),
+        "IO": ("comfy_api/latest/__init__.py", "definition"),
+        "UI": ("comfy_api/latest/__init__.py", "definition"),
+        "ComfyExtension": ("comfy_api/latest/__init__.py", "definition"),
+        "ComfyAPI": ("comfy_api/latest/__init__.py", "definition"),
+        "ComfyAPISync": ("comfy_api/latest/__init__.py", "definition"),
+        "ComfyAPI.execution": ("comfy_api/latest/__init__.py", "attribute"),
+        "io.ComfyNode": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Schema": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.NodeOutput": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Image": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Float": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Boolean": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Combo": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Int": ("comfy_api/latest/_io_public.py", "io_symbol"),
+        "io.Custom": ("comfy_api/latest/_io_public.py", "io_symbol"),
+    },
+    "comfy.model_management": {
+        "load_models_gpu": ("comfy/model_management.py", "definition"),
+        "unload_all_models": ("comfy/model_management.py", "definition"),
+        "soft_empty_cache": ("comfy/model_management.py", "definition"),
+        "get_torch_device": ("comfy/model_management.py", "definition"),
+    },
+    "comfy.model_patcher": {
+        "ModelPatcher": ("comfy/model_patcher.py", "definition"),
+    },
+    "comfy.utils": {
+        "tiled_scale": ("comfy/utils.py", "definition"),
+        "ProgressBar": ("comfy/utils.py", "definition"),
+    },
+    "folder_paths": {
+        "add_model_folder_path": ("folder_paths.py", "definition"),
+        "get_full_path_or_raise": ("folder_paths.py", "definition"),
+        "get_filename_list": ("folder_paths.py", "definition"),
+    },
 }
 
 
@@ -357,12 +395,113 @@ def test_alias_provides_the_logger_the_modules_import():
     assert alias.logger.name == "ComfyUI_KEEP"
 
 
+@pytest.mark.unit
+def test_the_comfy_mocks_can_be_switched_off_for_the_headless_tier():
+    """``KEEP_NO_COMFY_MOCKS=1`` leaves ``sys.modules`` alone.
+
+    The root conftest is imported before any test module, so without this
+    opt-out the headless tier of the plan (section 4: the **real** ``comfy`` /
+    ``comfy_api`` modules from a ComfyUI source tree) could never import the
+    real modules in-process - the mocks would always win.  The check runs in
+    a subprocess because the opt-out is an import-time decision.
+    """
+    import json
+    import subprocess
+
+    conftest = _conftest_module()
+    assert "comfy_api.latest" in sys.modules, (
+        "the default session must install the mocks"
+    )
+
+    code = (
+        "import sys, json\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        "import conftest\n"
+        "print(json.dumps({name: name in sys.modules for name in "
+        "('comfy', 'comfy_api.latest', 'folder_paths')}))\n"
+    )
+    env = dict(os.environ)
+    env[conftest.DISABLE_MOCKS_ENV] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    loaded = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert loaded == {
+        "comfy": False,
+        "comfy_api.latest": False,
+        "folder_paths": False,
+    }, f"the mocks were installed despite the opt-out: {loaded}"
+
+
 # ---------------------------------------------------------------------------
 # mock fidelity against the real ComfyUI source (environment dependent)
 # ---------------------------------------------------------------------------
+def _read_source(source: Path) -> str:
+    """The text of a source file (or of every python file below a directory)."""
+    if source.is_dir():
+        return "\n".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in sorted(source.rglob("*.py"))
+        )
+    return source.read_text(encoding="utf-8", errors="replace")
+
+
+def _definition_pattern(name: str) -> re.Pattern[str]:
+    """``def name(``, ``class name`` or ``name = ...``."""
+    return re.compile(
+        rf"^\s*(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b"
+        rf"|^\s*{re.escape(name)}\s*=",
+        re.MULTILINE,
+    )
+
+
+def _io_public_text(root: Path) -> str:
+    """The text of the module behind ``comfy_api.latest.io``.
+
+    ``comfy_api/latest/_io_public.py`` is only ``from ._io import *``; the
+    symbols themselves live in the module it re-exports.  The name of that
+    module is resolved, not hard-coded.
+    """
+    public = root / "comfy_api" / "latest" / "_io_public.py"
+    assert public.is_file(), f"expected source file missing: {public}"
+    public_text = public.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"from\s+\.(\w+)\s+import\s+\*", public_text)
+    assert match, f"{public} must re-export the io symbols"
+    private = public.parent / f"{match.group(1)}.py"
+    assert private.is_file(), f"expected source file missing: {private}"
+    return private.read_text(encoding="utf-8", errors="replace")
+
+
+def _assert_symbol(module_name: str, symbol: str, kind: str, text: str, source: Path) -> None:
+    """One mocked symbol exists in the real source (text only, no import)."""
+    name = symbol.split(".")[-1]
+    if kind == "alias":
+        assert re.search(rf"\bas\s+{re.escape(name)}\b", text), (
+            f"{module_name}.{symbol} is not re-exported by {source}"
+        )
+    elif kind == "attribute":
+        assert re.search(rf"\bself\.{re.escape(name)}\b", text), (
+            f"{module_name}.{symbol} is not an instance attribute of {source}"
+        )
+    else:
+        assert _definition_pattern(name).search(text), (
+            f"{module_name}.{symbol} is not defined in {source}"
+        )
+
+
 @pytest.mark.headless
 def test_mocked_symbols_exist_in_the_real_comfyui_source():
     """The mocked names exist in the real ComfyUI source (text only, no import).
+
+    Every symbol the mocks imitate is checked - including the
+    ``comfy_api.latest`` ones the plan names (``io.ComfyNode``,
+    ``ComfyExtension``, ``ComfyAPI``, ``ComfyAPISync``).  A symbol that the
+    real API drops makes this test fail, so the mock cannot drift silently.
 
     Environment dependent: it needs ``COMFYUI_ROOT`` and therefore skips
     cleanly when the variable is absent (the acceptance gate runs without
@@ -375,25 +514,36 @@ def test_mocked_symbols_exist_in_the_real_comfyui_source():
     if not (root / "folder_paths.py").is_file():
         pytest.skip(f"COMFYUI_ROOT={comfyui_root!r} is not a ComfyUI source tree")
 
-    sources = {
-        "comfy_api.latest": root / "comfy_api" / "latest" / "__init__.py",
-        "comfy.model_management": root / "comfy" / "model_management.py",
-        "comfy.model_patcher": root / "comfy" / "model_patcher.py",
-        "comfy.utils": root / "comfy" / "utils.py",
-        "folder_paths": root / "folder_paths.py",
-    }
     for module_name, symbols in MOCKED_SYMBOLS.items():
-        source = sources[module_name]
-        assert source.is_file(), f"expected source file missing: {source}"
-        text = source.read_text(encoding="utf-8", errors="replace")
-        if module_name == "comfy_api.latest":
-            # io and ui are re-exported by the package __init__.
-            latest_text = text
-            assert "as io" in latest_text and "as ui" in latest_text, (
-                "the real comfy_api.latest must export io and ui as siblings"
-            )
-            continue
-        for symbol in symbols:
-            assert symbol in text, (
-                f"{module_name}.{symbol} does not exist in the real ComfyUI source"
-            )
+        for symbol, (relative, kind) in symbols.items():
+            source = root / relative
+            assert source.exists(), f"expected source file missing: {source}"
+            text = _read_source(source)
+            if kind == "io_symbol":
+                text = _io_public_text(root)
+            _assert_symbol(module_name, symbol, kind, text, source)
+
+
+@pytest.mark.headless
+def test_the_mock_exposes_no_symbol_the_real_api_lacks():
+    """The mock's public names all exist in the real ``comfy_api.latest``.
+
+    The other way round: a mock that invents a name the real API does not
+    have would let node code pass against the mock and fail in ComfyUI.
+    """
+    comfyui_root = os.environ.get("COMFYUI_ROOT", "").strip()
+    if not comfyui_root:
+        pytest.skip("COMFYUI_ROOT is not set - cannot check the real ComfyUI source")
+    root = Path(comfyui_root)
+    source = root / "comfy_api" / "latest" / "__init__.py"
+    if not source.is_file():
+        pytest.skip(f"COMFYUI_ROOT={comfyui_root!r} is not a ComfyUI source tree")
+    text = source.read_text(encoding="utf-8", errors="replace")
+
+    mock = sys.modules["comfy_api.latest"]
+    public_names = [name for name in vars(mock) if not name.startswith("_")]
+    assert public_names, "the mock must expose a public surface"
+    for name in public_names:
+        assert re.search(rf"\b{re.escape(name)}\b", text), (
+            f"comfy_api.latest.{name} exists in the mock but not in the real API"
+        )
