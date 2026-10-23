@@ -262,11 +262,8 @@ def test_guard_no_sys_path_mutation():
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=False,
-    reason="flip owner: P2.1 - no pdb/profiler/pip in the vendored runtime closure",
-)
 def test_guard_vendored_tree_has_no_debug_or_pip_leftovers():
+    """Guard (e) - flipped to strict in P2.1 (its flip owner)."""
     assert vendored_breakage_violations(REPO_ROOT) == []
 
 

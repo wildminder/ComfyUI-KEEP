@@ -131,36 +131,25 @@ def test_finding_line_numbers_are_exact(scanner):
 
 @pytest.mark.unit
 def test_real_tree_findings(scanner):
+    """The live tree must only contain the findings that are still open.
+
+    P2.1 removed ``from re import T``, the ``pdb`` imports, the
+    ``torch.profiler`` import and the pip shim module; P2.3 removes the
+    remaining ``distutils`` import.  The list below is therefore the
+    *expected* state of the tree - a new finding fails this test.
+    """
     report = scanner.scan_repo(REPO_ROOT)
     findings = report["findings"]
     assert report["closure_file_count"] > 0
     located = {(f["path"], f["line"], f["pattern"]) for f in findings}
 
-    assert (
-        "modules/deps/basicsr/archs/keep_arch.py",
-        2,
-        "re_import",
-    ) in located, "the `from re import T` breakage must be found"
-    assert (
-        "modules/deps/basicsr/utils/video_util.py",
-        13,
-        "import_pip",
-    ) in located, "the vendored pip shim must be found"
-    assert (
-        "modules/deps/basicsr/utils/video_util.py",
-        14,
-        "pip_main",
-    ) in located, "the vendored pip.main call must be found"
-    assert (
-        "modules/deps/basicsr/archs/gmflow_arch.py",
-        81,
-        "pdb",
-    ) in located, "the live pdb breakpoint must be found"
-    assert (
-        "modules/deps/basicsr/archs/keep_arch.py",
-        9,
-        "torch_profiler",
-    ) in located, "the torch.profiler import must be found"
+    expected = {
+        ("modules/deps/basicsr/archs/arch_util.py", 6, "distutils"),
+    }
+    assert located == expected, (
+        "the vendored closure must only contain the open findings "
+        f"({sorted(located)}); P2.1/P2.3 must have removed the others"
+    )
 
 
 @pytest.mark.unit
@@ -171,11 +160,12 @@ def test_closure_contains_the_runtime_files(scanner):
         "modules/deps/basicsr/archs/keep_arch.py",
         "modules/deps/basicsr/archs/gmflow_arch.py",
         "modules/deps/basicsr/archs/arch_util.py",
-        "modules/deps/basicsr/utils/video_util.py",
         "modules/deps/basicsr/utils/img_util.py",
         "modules/deps/facelib/utils/face_restoration_helper.py",
     ):
         assert expected in closure, f"{expected} is not in the runtime closure"
+    # P2.1 deleted the pip-shim module - it must not be in the closure any more
+    assert "modules/deps/basicsr/utils/video_util.py" not in closure
 
 
 @pytest.mark.unit

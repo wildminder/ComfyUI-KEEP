@@ -13,6 +13,12 @@ Recorded baseline (docs/audit/2026-10-22-baseline-import.md):
   ``re.T``), which the ``DummyArchRegistry`` fallback in ``modules/utils.py``
   converts into ``ARCH_REGISTRY.get('KEEP') is None`` and therefore into
   ``RuntimeError: KEEP architecture class not found in ARCH_REGISTRY.``.
+
+**P2.1 moved the baseline one step forward** (the plan's "documented
+next-failure progression"): ``from re import T`` is gone, so the eager arch
+scan now fails at the *diffusers* import (B2) instead.  The historical
+signature stays recorded in the audit document; the live assertions below
+follow the current tree.
 """
 
 from __future__ import annotations
@@ -116,11 +122,13 @@ def test_utils_exposes_stub_arch_registry(baseline_report):
 
 
 @pytest.mark.unit
-def test_vendored_keep_arch_import_raises_import_error_T():
-    """(b) importing the vendored ``keep_arch`` raises ImportError about 'T'.
+def test_vendored_keep_arch_import_raises_import_error_diffusers():
+    """(b) importing the vendored ``keep_arch`` raises ImportError about diffusers.
 
-    Executed in-process (with a clean-up of the interpreter state) so the
-    assertion is about the vendored source, not about a recorded string.
+    P2.1 removed ``from re import T`` (B1), so the failure moved on to the
+    next breakage: the ``diffusers`` import of the vendored arch (B2).  The
+    assertion is executed against the vendored source, not against a
+    recorded string.
     """
     saved_path = list(sys.path)
     saved_modules = {
@@ -135,8 +143,12 @@ def test_vendored_keep_arch_import_raises_import_error_T():
         with pytest.raises(ImportError) as excinfo:
             import basicsr.archs.keep_arch  # noqa: F401
         message = str(excinfo.value)
-        assert "cannot import name 'T' from 're'" in message, message
-        assert "'T'" in message, message
+        assert "diffusers" in message or "cached_download" in message, message
+        assert "cannot import name 'cached_download' from 'huggingface_hub'" in message, (
+            message
+        )
+        # the 'T' breakage is really gone (B1)
+        assert "cannot import name 'T' from 're'" not in message, message
     finally:
         sys.path[:] = saved_path
         for name in [
@@ -148,14 +160,22 @@ def test_vendored_keep_arch_import_raises_import_error_T():
 
 @pytest.mark.unit
 def test_eager_arch_scan_is_the_real_failure(baseline_report):
-    """The eager arch scan is where the import actually breaks (B1)."""
+    """The eager arch scan is where the import actually breaks.
+
+    P2.1 removed ``from re import T`` (B1); the scan now fails at the
+    diffusers import (B2) - the plan's documented next-failure progression.
+    """
     arch_scan = baseline_report["arch_scan"]
     assert arch_scan["ok"] is False, arch_scan
     assert arch_scan["error"]["type"] == "ImportError", arch_scan
-    assert "cannot import name 'T' from 're'" in arch_scan["error"]["message"]
+    assert "cannot import name 'cached_download' from 'huggingface_hub'" in (
+        arch_scan["error"]["message"]
+    )
     # the traceback must point at the vendored arch module
     assert "keep_arch.py" in arch_scan["error"]["traceback"]
     assert "archs" in arch_scan["error"]["traceback"]
+    # ... and at the diffusers import line of that module
+    assert "diffusers" in arch_scan["error"]["traceback"], arch_scan
 
 
 @pytest.mark.unit
@@ -183,20 +203,20 @@ def test_diffusers_symbols_are_unusable_in_this_env(baseline_report):
 
 
 @pytest.mark.unit
-def test_pip_shim_is_reachable_and_fires_without_ffmpeg(tmp_path):
-    """B10: the vendored video_util pip shim runs at import time.
+def test_the_pip_shim_is_gone(tmp_path):
+    """B10 is closed in P2.1: the vendored pip shim no longer exists.
 
-    On this host ``ffmpeg-python`` is present (installed --user by an earlier
-    baseline reproduction), so the shim stays inert; with ``ffmpeg`` blocked the
-    probe records the ``pip.main([...])`` call instead of performing it.
+    ``modules/deps/basicsr/utils/video_util.py`` (the module that ran
+    ``pip.main([...])`` at import time) was deleted, so importing the package
+    must not call pip - not even when ``ffmpeg`` is unavailable.
     """
     report = _run_probe(tmp_path, "--simulate-missing-ffmpeg")
     _skip_if_fatal(report)
     pip_shim = report["pip_shim"]
-    assert pip_shim["pip_main_calls"] == [["install", "--user", "ffmpeg-python"]], (
-        pip_shim
-    )
-    assert pip_shim["ffmpeg_importable"] is False
+    assert pip_shim["pip_main_calls"] == [], pip_shim
+    assert pip_shim["video_util_imported"] is False, pip_shim
+    assert pip_shim["ffmpeg_importable"] is False, pip_shim
+    assert not (REPO_ROOT / "modules" / "deps" / "basicsr" / "utils" / "video_util.py").exists()
 
 
 @pytest.mark.unit

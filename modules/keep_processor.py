@@ -9,9 +9,15 @@ from .utils import comfy_image_to_cv2, cv2_to_comfy_image
 from comfy.utils import ProgressBar, tiled_scale
 
 # Imports from vendored basicsr and facelib
+#
+# P2.1: the vendored ``basicsr.utils.video_util`` module is deleted (it
+# ran a pip install of ``ffmpeg-python`` at import time), so its
+# ``VideoReader`` / ``VideoWriter`` are not importable any more.
+# ``process_video`` is the only user and it is dead code (nothing in
+# the package calls it; P4.7 removes it), so it now fails loudly instead of
+# silently importing a stub.  The image / image-sequence paths are unaffected.
 try:
     from basicsr.utils.img_util import img2tensor, tensor2img
-    from basicsr.utils.video_util import VideoReader, VideoWriter
     from facelib.utils.misc import is_gray
 except ImportError as e:
     print(f"ImportError in keep_processor: {e}. Check vendored 'basicsr' and 'facelib'.")
@@ -165,6 +171,18 @@ class KEEPFaceProcessor:
     def process_video(self, video_path: str, output_video_path: str,
                       final_upscale_factor: float, has_aligned: bool, only_center_face: bool, draw_box: bool,
                       max_clip_length: int = 20, target_fps: float = None):
+        """Removed in P2.1 - the vendored ffmpeg shim is gone.
+
+        The vendored ``basicsr.utils.video_util`` module executed a pip
+        install at import time; it was deleted in P2.1 and this dead code
+        path was disabled with it.  Use ``KEEP_ProcessImageSequence`` for
+        sequences (P4.7 removes this method entirely).
+        """
+        raise NotImplementedError(
+            "process_video is not supported any more: the vendored "
+            "ffmpeg-python shim was removed in P2.1. Use the "
+            "KEEP_ProcessImageSequence node for image sequences."
+        )
 
         vidreader = VideoReader(video_path)
         original_fps = vidreader.get_fps()

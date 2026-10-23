@@ -1,12 +1,9 @@
 import math
-from re import T
 import numpy as np
-import pdb
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from typing import Optional, List
-from torch.profiler import profile, record_function, ProfilerActivity
 from collections import defaultdict
 
 # from gpu_mem_track import MemTracker
@@ -817,7 +814,6 @@ class KalmanFilter(nn.Module):
         w_codes = rearrange(
             w_codes, "(b f) c h w -> b f c h w", f=video_length)
 
-        # pdb.set_trace()
         return w_codes
 
 
@@ -1103,7 +1099,6 @@ class KEEP(nn.Module):
 
                 if j in cft_list:  # fuse after i-th block
                     f_size = str(x.shape[-1])
-                    # pdb.set_trace()
                     x = self.cft[f_size](
                         enc_feat_dict[f_size][:, i, ...], x, self.cond)
 
@@ -1114,7 +1109,6 @@ class KEEP(nn.Module):
                         cross_prev_feat[f_size] = x
                         # print(f_size)
                     else:
-                        # pdb.set_trace()
                         prev_fea = cross_prev_feat[f_size]
                         x = self.cfa[f_size](
                             x, prev_fea, residual=self.use_residual)

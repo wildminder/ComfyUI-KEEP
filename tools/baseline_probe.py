@@ -76,6 +76,22 @@ def _exc_info(exc: BaseException) -> dict:
     }
 
 
+def _symbol_origin(module, name: str) -> str | None:
+    """``__module__`` of ``module.name`` (``None`` when the symbol is absent)."""
+    symbol = getattr(module, name, None)
+    return getattr(symbol, "__module__", None)
+
+
+def _is_local_stub(module, name: str) -> bool:
+    """``True`` when ``module.name`` is a stub defined in ``module`` itself.
+
+    A symbol that does not exist at all (P2.1 removed the vendored
+    ``VideoReader`` / ``VideoWriter``) is **not** a stub.
+    """
+    origin = _symbol_origin(module, name)
+    return origin is not None and origin == module.__name__
+
+
 class _BlockFFmpegFinder:
     """meta_path finder that makes ``import ffmpeg`` fail (simulates a host
     without ``ffmpeg-python``) so the vendored pip shim can be observed."""
@@ -203,11 +219,15 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
         "processor_is_gray_is_dummy": (
             getattr(processor_mod, "is_gray").__module__ == processor_mod.__name__
         ),
-        "processor_video_reader_is_dummy": (
-            getattr(processor_mod, "VideoReader").__module__ == processor_mod.__name__
+        # P2.1 deleted the vendored ``video_util`` module (its import-time pip
+        # shim); ``VideoReader`` / ``VideoWriter`` are therefore *absent* from
+        # the processor instead of being dummy stubs.  An absent symbol is not
+        # a stub - the dead ``process_video`` path raises instead.
+        "processor_video_reader_is_dummy": _is_local_stub(
+            processor_mod, "VideoReader"
         ),
-        "processor_video_writer_is_dummy": (
-            getattr(processor_mod, "VideoWriter").__module__ == processor_mod.__name__
+        "processor_video_writer_is_dummy": _is_local_stub(
+            processor_mod, "VideoWriter"
         ),
         "loader_face_restore_helper_is_dummy": (
             getattr(loader_mod, "FaceRestoreHelper").__module__ == loader_mod.__name__
@@ -221,7 +241,7 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
         "img2tensor": getattr(processor_mod, "img2tensor").__module__,
         "tensor2img": getattr(processor_mod, "tensor2img").__module__,
         "is_gray": getattr(processor_mod, "is_gray").__module__,
-        "VideoReader": getattr(processor_mod, "VideoReader").__module__,
+        "VideoReader": _symbol_origin(processor_mod, "VideoReader"),
         "FaceRestoreHelper": getattr(loader_mod, "FaceRestoreHelper").__module__,
     }
 

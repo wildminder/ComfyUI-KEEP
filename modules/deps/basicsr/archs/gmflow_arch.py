@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pdb
 
 from basicsr.archs.gmflow.gmflow.gmflow import GMFlow
 
@@ -64,19 +63,3 @@ class FlowGenerator(nn.Module):
         # backward_flow = flow[N:]
 
         return flow
-
-
-if __name__ == '__main__':
-    h, w = 512, 512
-    # model = RAFT().cuda()
-    model = FlowGenerator(
-        load_path='../../weights/GMFlow/gmflow_sintel-0c07dcb3.pth').cuda()
-    model.eval()
-    print(model)
-
-    x = torch.randn((1, 3, h, w)).cuda()
-    y = torch.randn((1, 3, h, w)).cuda()
-    with torch.no_grad():
-        out = model(x, y)
-    pdb.set_trace()
-    print(out.shape)
