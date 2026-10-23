@@ -319,11 +319,8 @@ def test_guard_src_has_no_schema():
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=False,
-    reason="flip owner: P4.4 - __init__.py must expose exactly comfy_entrypoint",
-)
 def test_guard_entrypoint_is_v3_only():
+    """Guard (c) - flipped to strict in P4.4 (its flip owner)."""
     assert entrypoint_violations(REPO_ROOT) == []
 
 

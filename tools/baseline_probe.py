@@ -31,6 +31,7 @@ code) is the baseline evidence.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -143,6 +144,33 @@ def load_package_like_comfyui(package_dir: Path):
     return sys_module_name, module
 
 
+def _v3_nodes(package) -> tuple[list[str], dict[str, str]]:
+    """The node ids and display names of a **V3** package (P4.4).
+
+    The extension is loaded the way ``nodes.py:2316`` does it: through the
+    module level ``comfy_entrypoint``.  An empty result means the package is
+    not a V3 extension.
+    """
+    entrypoint = getattr(package, "comfy_entrypoint", None)
+    if entrypoint is None:
+        return [], {}
+
+    async def collect():
+        extension = await entrypoint()
+        await extension.on_load()
+        node_list = await extension.get_node_list()
+        return [cls.GET_SCHEMA() for cls in node_list]
+
+    try:
+        schemas = asyncio.run(collect())
+    except Exception:  # noqa: BLE001 - the probe reports everything
+        return [], {}
+    return (
+        sorted(schema.node_id for schema in schemas),
+        {schema.node_id: schema.display_name for schema in schemas},
+    )
+
+
 def probe(simulate_missing_ffmpeg: bool = False) -> dict:
     report: dict = {
         "repo_root": str(REPO_ROOT),
@@ -181,6 +209,11 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
         report["node_display_name_mappings"] = dict(
             getattr(package, "NODE_DISPLAY_NAME_MAPPINGS", {})
         )
+        # P4.4: the pack registers as a V3 extension - the node ids live in
+        # the schemas of the node classes, not in a V1 mapping.
+        v3_ids, v3_display_names = _v3_nodes(package)
+        report["v3_node_ids"] = v3_ids
+        report["v3_display_names"] = v3_display_names
     except BaseException as exc:  # noqa: BLE001 - the probe reports everything
         report["import"] = {"ok": False, "error": _exc_info(exc)}
         pip_module.main = pip_main_original

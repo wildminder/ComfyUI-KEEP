@@ -94,17 +94,23 @@ def test_execute_package_init_runs_the_real_entrypoint(tmp_path):
     out_path = tmp_path / "entrypoint.json"
     script = tmp_path / "run_entrypoint.py"
     script.write_text(
-        "import importlib.util, json, sys\n"
+        "import asyncio, importlib.util, json, sys\n"
         f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
         f"spec = importlib.util.spec_from_file_location('keep_root_conftest', {str(CONFTEST)!r})\n"
         "module = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(module)\n"
         "package = module.execute_package_init()\n"
+        "async def collect():\n"
+        "    extension = await package.comfy_entrypoint()\n"
+        "    await extension.on_load()\n"
+        "    node_list = await extension.get_node_list()\n"
+        "    return sorted(cls.GET_SCHEMA().node_id for cls in node_list)\n"
+        "node_ids = asyncio.run(collect())\n"
         "with open(sys.argv[1], 'w', encoding='utf-8') as handle:\n"
         "    json.dump({\n"
         "        'module_name': package.__name__,\n"
         "        'has_logger': hasattr(package, 'logger'),\n"
-        "        'node_ids': sorted(getattr(package, 'NODE_CLASS_MAPPINGS', {})),\n"
+        "        'node_ids': node_ids,\n"
         "    }, handle)\n",
         encoding="utf-8",
     )

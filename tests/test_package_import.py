@@ -35,9 +35,11 @@ PACK_NODE_IDS = [
 ]
 
 #: The probe: it registers the package the way ComfyUI does (the root
-#: ``__init__.py`` is executed under an alias) and reports the result.
+#: ``__init__.py`` is executed under an alias) and loads the **V3 extension**
+#: the way ``nodes.py:2316`` does - through the module level
+#: ``comfy_entrypoint`` - and reports the registered nodes.
 _HEADLESS_PROBE = """
-import json, os, sys
+import asyncio, json, os, sys
 
 comfyui_root, repo_root = sys.argv[1], sys.argv[2]
 sys.path.insert(0, comfyui_root)
@@ -49,18 +51,24 @@ import _headless
 module = _headless.register_package(
     repo_root, alias="ComfyUI_KEEP_headless", execute=True
 )
-print(
-    "KEEP_IMPORT_REPORT:"
-    + json.dumps(
-        {
-            "node_ids": sorted(getattr(module, "NODE_CLASS_MAPPINGS", {})),
-            "display_names": dict(
-                getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
-            ),
-            "has_logger": hasattr(module, "logger"),
-        }
-    )
-)
+
+
+async def collect():
+    extension = await module.comfy_entrypoint()
+    await extension.on_load()
+    node_list = await extension.get_node_list()
+    schemas = [cls.GET_SCHEMA() for cls in node_list]
+    return {
+        "node_ids": sorted(schema.node_id for schema in schemas),
+        "display_names": {
+            schema.node_id: schema.display_name for schema in schemas
+        },
+        "categories": sorted({schema.category for schema in schemas}),
+        "has_logger": hasattr(module, "logger"),
+    }
+
+
+print("KEEP_IMPORT_REPORT:" + json.dumps(asyncio.run(collect())))
 """
 
 
@@ -83,18 +91,28 @@ def _comfyui_root() -> str:
 
 @pytest.mark.mock_integration
 def test_the_package_imports_for_real_under_the_mocks():
-    """P3.6: the package imports for real under the mocks - no exception.
+    """P3.6 / P4.4: the package imports for real under the mocks.
 
     This is the strict version of the import smoke test: the root
-    ``__init__.py`` is executed and the three node mappings are exported.
-    The test follows the entry point that is really there (V1 today, the V3
-    ``comfy_entrypoint`` from P4.4 on).
+    ``__init__.py`` is executed and the V3 extension lists the three node
+    classes under their node ids.
     """
+    import asyncio
+
     conftest = importlib.import_module("conftest")
     package = conftest.execute_package_init()
     if hasattr(package, "comfy_entrypoint"):
         # V3 (P4.4): the entry point is the only registration surface
         assert callable(package.comfy_entrypoint)
+
+        async def collect():
+            extension = await package.comfy_entrypoint()
+            await extension.on_load()
+            return await extension.get_node_list()
+
+        node_list = asyncio.run(collect())
+        node_ids = sorted(cls.GET_SCHEMA().node_id for cls in node_list)
+        assert node_ids == PACK_NODE_IDS, node_ids
         return
     assert sorted(package.NODE_CLASS_MAPPINGS) == PACK_NODE_IDS
     assert sorted(package.NODE_DISPLAY_NAME_MAPPINGS) == PACK_NODE_IDS
@@ -102,7 +120,12 @@ def test_the_package_imports_for_real_under_the_mocks():
 
 @pytest.mark.headless
 def test_the_package_imports_against_the_real_comfyui_tree():
-    """P3.2: the whole package imports against the real ComfyUI source tree."""
+    """P4.4: the package loads as a V3 extension against the real tree.
+
+    The probe loads the extension the way ``nodes.py:2316`` does (through the
+    module level ``comfy_entrypoint``) and reads the schemas of the three
+    node classes - the real ``comfy_api.latest`` validates them.
+    """
     comfyui_root = _comfyui_root()
     result = subprocess.run(
         [sys.executable, "-c", _HEADLESS_PROBE, comfyui_root, str(REPO_ROOT)],
@@ -125,6 +148,11 @@ def test_the_package_imports_against_the_real_comfyui_tree():
     report = json.loads(sentinel[-1].split(":", 1)[1])
     assert report["node_ids"] == PACK_NODE_IDS, report
     assert report["display_names"]["KEEP_ModelLoader"] == "Load KEEP Models", report
+    assert report["display_names"]["KEEP_FaceUpscaleImage"] == "KEEP Single Image", report
+    assert report["display_names"]["KEEP_ProcessImageSequence"] == (
+        "KEEP Image Sequence"
+    ), report
+    assert report["categories"] == ["ComfyUI-KEEP"], report
     assert report["has_logger"] is True, report
 
 

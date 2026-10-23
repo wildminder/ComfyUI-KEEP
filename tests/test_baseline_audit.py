@@ -104,11 +104,16 @@ def test_package_imports_through_comfyui_loader(baseline_report):
     assert baseline_report["import"]["ok"] is True, baseline_report["import"]
     assert baseline_report["import"]["error"] is None
     # the three compatibility-guaranteed node ids are registered
-    assert baseline_report["node_class_mappings"] == [
+    # (P4.4: the pack registers as a V3 extension - the ids live in the
+    # schemas of the node classes)
+    assert baseline_report["v3_node_ids"] == [
         "KEEP_FaceUpscaleImage",
         "KEEP_ModelLoader",
         "KEEP_ProcessImageSequence",
-    ]
+    ], baseline_report["v3_node_ids"]
+    assert baseline_report["v3_display_names"]["KEEP_ModelLoader"] == (
+        "Load KEEP Models"
+    ), baseline_report["v3_display_names"]
 
 
 @pytest.mark.unit
