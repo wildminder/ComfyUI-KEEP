@@ -3,7 +3,7 @@ import torch
 import pathlib
 
 try:
-    from basicsr.utils.download_util import load_file_from_url
+    from ...basicsr.utils.download_util import load_file_from_url
 except ImportError:
     # Minimal fallback if basicsr isn't in path when facelib is directly used (should not happen with our setup)
     def load_file_from_url(url, model_dir, **kwargs):

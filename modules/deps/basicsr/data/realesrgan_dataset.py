@@ -8,10 +8,10 @@ import time
 import torch
 from torch.utils import data as data
 
-from basicsr.data.degradations import circular_lowpass_kernel, random_mixed_kernels
-from basicsr.data.transforms import augment
-from basicsr.utils import FileClient, get_root_logger, imfrombytes, img2tensor
-from basicsr.utils.registry import DATASET_REGISTRY
+from .degradations import circular_lowpass_kernel, random_mixed_kernels
+from .transforms import augment
+from ..utils import FileClient, get_root_logger, imfrombytes, img2tensor
+from ..utils.registry import DATASET_REGISTRY
 
 
 @DATASET_REGISTRY.register(suffix='basicsr')

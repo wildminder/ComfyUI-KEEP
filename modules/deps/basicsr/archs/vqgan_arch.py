@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import ARCH_REGISTRY
-from basicsr.archs.spectral_norm_arch import spectral_norm as _spectral_norm
+from ..utils import get_root_logger
+from ..utils.registry import ARCH_REGISTRY
+from .spectral_norm_arch import spectral_norm as _spectral_norm
 
 
 def normalize(in_channels):

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from basicsr.archs.gmflow.gmflow.gmflow import GMFlow
+from .gmflow.gmflow.gmflow import GMFlow
 
 
 class FlowGenerator(nn.Module):

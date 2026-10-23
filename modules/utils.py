@@ -7,21 +7,14 @@ import folder_paths
 from comfy.utils import ProgressBar
 from urllib.request import urlopen, Request
 import hashlib
-import sys
 from torch.hub import download_url_to_file, get_dir
 
 from .. import logger
 
-# Path to ComfyUI-KEEP/modules/
-module_path = os.path.dirname(os.path.abspath(__file__))
-deps_path = os.path.join(module_path, 'deps')
-if deps_path not in sys.path:
-    sys.path.insert(0, deps_path)
-
 # directly import from the vendored basicsr
 try:
-    from basicsr.utils.registry import ARCH_REGISTRY
-    from basicsr.utils.download_util import load_file_from_url
+    from .deps.basicsr.utils.registry import ARCH_REGISTRY
+    from .deps.basicsr.utils.download_util import load_file_from_url
     # print("Successfully imported ARCH_REGISTRY and load_file_from_url from vendored basicsr.")
 except ImportError as e:
     print(f"Error importing from vendored basicsr in utils.py: {e}")

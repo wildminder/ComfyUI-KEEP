@@ -3,7 +3,7 @@ import os
 import torch
 # Assuming load_file_from_url is now globally accessible via sys.path or vendored
 try:
-    from basicsr.utils.download_util import load_file_from_url
+    from ...basicsr.utils.download_util import load_file_from_url
 except ImportError:
     def load_file_from_url(url, model_dir, **kwargs):
         print(f"Fallback load_file_from_url in facelib.parsing for: {url} to {model_dir}")

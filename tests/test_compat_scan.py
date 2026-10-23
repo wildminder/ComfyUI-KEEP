@@ -242,6 +242,8 @@ _CLOSURE_IMPORT_SCRIPT = """\
 import importlib, json, sys
 
 sys.path.insert(0, sys.argv[1])
+import conftest  # registers the package alias and the ComfyUI mocks
+
 failures = []
 for name in json.loads(sys.argv[2]):
     try:
@@ -261,7 +263,7 @@ def _closure_module_names(report):
         dotted = rel[len("modules/deps/"):].replace("/", ".").removesuffix(".py")
         if dotted.endswith(".__init__"):
             dotted = dotted[: -len(".__init__")]
-        names.append(dotted)
+        names.append("ComfyUI_KEEP.modules.deps." + dotted)
     return names
 
 
@@ -277,7 +279,7 @@ def test_every_closure_module_imports(scanner):
     assert names, "the runtime closure is empty"
 
     result = subprocess.run(
-        [sys.executable, "-c", _CLOSURE_IMPORT_SCRIPT, str(DEPS_DIR), json.dumps(names)],
+        [sys.executable, "-c", _CLOSURE_IMPORT_SCRIPT, str(REPO_ROOT), json.dumps(names)],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,

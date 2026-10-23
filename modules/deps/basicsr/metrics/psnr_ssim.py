@@ -3,9 +3,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from basicsr.metrics.metric_util import reorder_image, to_y_channel
-from basicsr.utils.color_util import rgb2ycbcr_pt
-from basicsr.utils.registry import METRIC_REGISTRY
+from .metric_util import reorder_image, to_y_channel
+from ..utils.color_util import rgb2ycbcr_pt
+from ..utils.registry import METRIC_REGISTRY
 
 
 @METRIC_REGISTRY.register()

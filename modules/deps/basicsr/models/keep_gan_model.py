@@ -4,11 +4,11 @@ import torch.nn.functional as F
 
 from einops import rearrange
 
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import MODEL_REGISTRY
-from basicsr.archs import build_network
-from basicsr.losses import build_loss
-from basicsr.archs.arch_util import flow_warp, resize_flow
+from ..utils import get_root_logger
+from ..utils.registry import MODEL_REGISTRY
+from ..archs import build_network
+from ..losses import build_loss
+from ..archs.arch_util import flow_warp, resize_flow
 
 from .video_recurrent_model import VideoRecurrentModel
 

@@ -55,15 +55,16 @@ class _BlockPip:
 
 sys.meta_path.insert(0, _BlockPip())
 
-deps = Path(sys.argv[1])
-utils_dir = deps / "basicsr" / "utils"
-sys.path.insert(0, str(deps))
+root = Path(sys.argv[1])
+utils_dir = root / "modules" / "deps" / "basicsr" / "utils"
+sys.path.insert(0, str(root))
+import conftest  # registers the package alias and the ComfyUI mocks
 
 result = {"pip_imported": False, "modules": {}, "errors": []}
 for path in sorted(utils_dir.glob("*.py")):
     if path.name == "__init__.py":
         continue
-    name = "basicsr.utils." + path.stem
+    name = "ComfyUI_KEEP.modules.deps.basicsr.utils." + path.stem
     try:
         importlib.import_module(name)
         result["modules"][name] = "ok"
@@ -84,7 +85,7 @@ def test_importing_the_vendored_utils_never_calls_pip():
     imports cleanly or fails for the *known* reason only - the diffusers
     import of the eager arch scan (P2.2 removes that one as well).
     """
-    result = _run_python(_PIP_BLOCKED_PROBE, str(DEPS_DIR))
+    result = _run_python(_PIP_BLOCKED_PROBE, str(REPO_ROOT))
     assert result.returncode == 0, (
         f"the probe itself failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
@@ -350,35 +351,132 @@ def test_no_dynamic_folder_scan_remains_in_the_vendored_tree():
 
 @pytest.mark.unit
 def test_import_basicsr_still_succeeds():
-    """P2.4: ``import basicsr`` (and its sub-packages) still works.
+    """P2.4/P2.5: the vendored ``basicsr`` package still imports.
 
     This is the guard against the silent breakage path: a deleted package
     directory raises ``ModuleNotFoundError`` inside ``import basicsr``, which
     ``modules/utils.py`` swallows into the ``DummyArchRegistry`` - the node
     would keep loading and silently lose the KEEP architecture.
+
+    Since P2.5 the package is imported relatively (it is part of the node
+    package), so it is never a top-level ``basicsr`` module.
     """
-    code = (
-        _PIP_BLOCK
-        + "import sys; sys.path.insert(0, sys.argv[1]);"
-        "import basicsr; import basicsr.archs; import basicsr.models;"
-        "import basicsr.data; import basicsr.losses; import basicsr.metrics;"
-        "print('KEEP_IMPORT_OK', basicsr.__version__)"
-    )
-    result = _run_python(code, str(DEPS_DIR))
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "KEEP_IMPORT_OK" in result.stdout, result.stdout
+    import importlib
+
+    module = importlib.import_module("ComfyUI_KEEP.modules.deps.basicsr")
+    assert module.__name__ == "ComfyUI_KEEP.modules.deps.basicsr"
+    for name in ("archs", "models", "data", "losses", "metrics"):
+        assert importlib.import_module(
+            f"ComfyUI_KEEP.modules.deps.basicsr.{name}"
+        ) is not None
+    assert "basicsr" not in sys.modules
+
 
 
 @pytest.mark.unit
 def test_the_keep_architecture_is_still_registered():
-    """P2.4: the explicit arch list still registers the KEEP architecture."""
-    code = (
-        _PIP_BLOCK
-        + "import sys; sys.path.insert(0, sys.argv[1]);"
-        "from basicsr.utils.registry import ARCH_REGISTRY;"
-        "import basicsr.archs;"
-        "print('KEEP_REGISTERED', ARCH_REGISTRY.get('KEEP').__name__)"
+    """P2.4/P2.5: the explicit arch list still registers the KEEP architecture."""
+    import importlib
+
+    importlib.import_module("ComfyUI_KEEP.modules.deps.basicsr.archs")
+    registry = importlib.import_module(
+        "ComfyUI_KEEP.modules.deps.basicsr.utils.registry"
     )
-    result = _run_python(code, str(DEPS_DIR))
+    assert registry.ARCH_REGISTRY.get("KEEP").__name__ == "KEEP"
+
+
+# ---------------------------------------------------------------------------
+# P2.5 - the vendored tree is a package of the node package
+# ---------------------------------------------------------------------------
+
+#: The vendored packages inside the node package.
+VENDORED = "ComfyUI_KEEP.modules.deps"
+
+#: P2.5 (a): every module of ``modules/deps`` imports - with pip blocked and
+#: without touching the network (no import of the vendored tree downloads
+#: anything; the downloads happen in explicit calls).
+_WALK_PROBE = """
+import importlib, json, pkgutil, sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+import conftest  # registers the package alias and the ComfyUI mocks
+
+import ComfyUI_KEEP.modules.deps as deps
+
+failures = []
+for info in pkgutil.walk_packages(deps.__path__, deps.__name__ + "."):
+    try:
+        importlib.import_module(info.name)
+    except BaseException as exc:
+        failures.append({
+            "module": info.name,
+            "type": type(exc).__name__,
+            "error": str(exc)[:200],
+        })
+print("KEEP_WALK_FAILURES:" + json.dumps(failures))
+"""
+
+
+@pytest.mark.unit
+def test_every_vendored_module_imports_without_pip():
+    """P2.5 (a): the ``walk_packages`` import test over ``modules/deps``."""
+    result = _run_python(_PIP_BLOCK + _WALK_PROBE, str(REPO_ROOT))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "KEEP_REGISTERED KEEP" in result.stdout, result.stdout
+    sentinel = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("KEEP_WALK_FAILURES:")
+    ]
+    assert sentinel, (
+        f"the walk probe produced no result\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    failures = json.loads(sentinel[-1].split(":", 1)[1])
+    assert failures == [], f"vendored modules failed to import: {failures}"
+
+
+@pytest.mark.unit
+def test_the_vendored_packages_never_enter_sys_modules():
+    """P2.5 (b): ``basicsr`` / ``facelib`` are not top-level modules."""
+    import importlib
+
+    importlib.import_module(f"{VENDORED}.basicsr")
+    importlib.import_module(f"{VENDORED}.facelib")
+    assert "basicsr" not in sys.modules
+    assert "basicsr.utils" not in sys.modules
+    assert "facelib" not in sys.modules
+    assert "facelib.utils" not in sys.modules
+
+
+@pytest.mark.unit
+def test_the_processor_and_loader_use_the_vendored_classes():
+    """P2.5 (c): the real vendored symbols - not stubs."""
+    import importlib
+
+    processor = importlib.import_module("ComfyUI_KEEP.modules.keep_processor")
+    loader = importlib.import_module("ComfyUI_KEEP.modules.keep_model_loader")
+    assert processor.img2tensor.__module__.startswith(f"{VENDORED}.basicsr")
+    assert processor.tensor2img.__module__.startswith(f"{VENDORED}.basicsr")
+    assert processor.is_gray.__module__.startswith(f"{VENDORED}.facelib")
+    assert loader.FaceRestoreHelper.__module__.startswith(f"{VENDORED}.facelib")
+
+
+@pytest.mark.unit
+def test_importing_the_package_does_not_change_sys_path():
+    """P2.5 (d): ``sys.path`` before/after the import is byte-identical."""
+    code = (
+        "import sys\n"
+        "root = sys.argv[1]\n"
+        "sys.path.insert(0, root)\n"
+        "import conftest\n"
+        "before = list(sys.path)\n"
+        "import ComfyUI_KEEP.modules.utils\n"
+        "import ComfyUI_KEEP.modules.keep_processor\n"
+        "import ComfyUI_KEEP.modules.keep_model_loader\n"
+        "print('KEEP_SYS_PATH_SAME', before == sys.path)\n"
+    )
+    result = _run_python(code, str(REPO_ROOT))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "KEEP_SYS_PATH_SAME True" in result.stdout, result.stdout

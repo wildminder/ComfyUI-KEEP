@@ -17,8 +17,8 @@ from comfy.utils import ProgressBar, tiled_scale
 # the package calls it; P4.7 removes it), so it now fails loudly instead of
 # silently importing a stub.  The image / image-sequence paths are unaffected.
 try:
-    from basicsr.utils.img_util import img2tensor, tensor2img
-    from facelib.utils.misc import is_gray
+    from .deps.basicsr.utils.img_util import img2tensor, tensor2img
+    from .deps.facelib.utils.misc import is_gray
 except ImportError as e:
     print(f"ImportError in keep_processor: {e}. Check vendored 'basicsr' and 'facelib'.")
     # Dummy just in case

@@ -9,11 +9,11 @@ from collections import defaultdict
 # from gpu_mem_track import MemTracker
 from einops import rearrange, repeat
 
-from basicsr.archs.vqgan_arch import Encoder, VectorQuantizer, GumbelQuantizer, Generator, ResBlock
-from basicsr.archs.arch_util import flow_warp, resize_flow
-from basicsr.archs.gmflow_arch import FlowGenerator
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import ARCH_REGISTRY
+from .vqgan_arch import Encoder, VectorQuantizer, GumbelQuantizer, Generator, ResBlock
+from .arch_util import flow_warp, resize_flow
+from .gmflow_arch import FlowGenerator
+from ..utils import get_root_logger
+from ..utils.registry import ARCH_REGISTRY
 
 # P2.2 - the two diffusers symbols are vendored (diffusers itself is
 # unusable in this environment: ``diffusers.models.attention`` needs the

@@ -117,12 +117,16 @@ def test_utils_exposes_the_real_arch_registry(baseline_report):
 
     Since P2.2 the vendored tree imports completely, so the
     ``DummyArchRegistry`` fallback of ``modules/utils.py`` is not used any
-    more and the registry knows the ``KEEP`` architecture.
+    more and the registry knows the ``KEEP`` architecture.  Since P2.5 the
+    registry lives inside the node package (``..deps.basicsr``) and never
+    shadows an installed ``basicsr``.
     """
     arch_registry = baseline_report["arch_registry"]
     assert arch_registry["is_stub"] is False, arch_registry
     assert arch_registry["class_name"] == "Registry", arch_registry
-    assert arch_registry["module"] == "basicsr.utils.registry", arch_registry
+    assert arch_registry["module"].endswith(
+        ".modules.deps.basicsr.utils.registry"
+    ), arch_registry
     assert arch_registry["get_keep"] is True, arch_registry
     # the fallback block is still in the source (P2.7 removes it) but it did
     # not fire - the import of the vendored tree succeeded
@@ -135,31 +139,27 @@ def test_vendored_keep_arch_import_succeeds_after_p22():
     """(b) importing the vendored ``keep_arch`` succeeds (B2 closed).
 
     P2.1 moved the failure to the ``diffusers`` import, P2.2 vendored the two
-    symbols into ``modules/deps/basicsr/archs/_diffusers_compat.py`` - the
-    vendored arch therefore imports without the (unusable) diffusers package.
+    symbols into ``modules/deps/basicsr/archs/_diffusers_compat.py`` and P2.5
+    turned the vendored tree into a package of the node package - the arch is
+    imported relatively and needs neither the (unusable) diffusers package
+    nor a ``sys.path`` entry.
     """
-    saved_path = list(sys.path)
-    saved_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == "basicsr" or name.startswith("basicsr.")
-    }
-    for name in saved_modules:
-        del sys.modules[name]
-    sys.path.insert(0, str(DEPS_DIR))
-    try:
-        module = importlib.import_module("basicsr.archs.keep_arch")
-        assert module.__name__ == "basicsr.archs.keep_arch"
-        # both symbols come from the vendored compat module, not from diffusers
-        assert module.FeedForward.__module__ == "basicsr.archs._diffusers_compat"
-        assert module.AdaLayerNorm.__module__ == "basicsr.archs._diffusers_compat"
-    finally:
-        sys.path[:] = saved_path
-        for name in [
-            n for n in list(sys.modules) if n == "basicsr" or n.startswith("basicsr.")
-        ]:
-            del sys.modules[name]
-        sys.modules.update(saved_modules)
+    import importlib
+
+    module = importlib.import_module(
+        "ComfyUI_KEEP.modules.deps.basicsr.archs.keep_arch"
+    )
+    assert module.__name__.endswith(".modules.deps.basicsr.archs.keep_arch")
+    # both symbols come from the vendored compat module, not from diffusers
+    assert module.FeedForward.__module__.endswith(
+        ".modules.deps.basicsr.archs._diffusers_compat"
+    )
+    assert module.AdaLayerNorm.__module__.endswith(
+        ".modules.deps.basicsr.archs._diffusers_compat"
+    )
+    # the vendored packages are not top-level packages
+    assert "basicsr" not in sys.modules
+    assert "facelib" not in sys.modules
 
 
 
@@ -225,11 +225,19 @@ def test_the_pip_shim_is_gone(tmp_path):
 
 
 @pytest.mark.unit
-def test_vendored_deps_are_shadowed_globally(baseline_report):
-    """B4: modules/deps is injected into sys.path - global shadowing."""
+def test_vendored_deps_are_not_shadowed_globally(baseline_report):
+    """B4 is closed in P2.5: the vendored tree no longer shadows anything.
+
+    ``modules/deps`` is not on ``sys.path`` any more and neither
+    ``basicsr`` nor ``facelib`` is a top-level module - the vendored tree is
+    imported relatively from the node package.
+    """
     shadowing = baseline_report["sys_path_shadowing"]
-    assert shadowing["deps_path_on_sys_path"] is True, shadowing
-    assert shadowing["facelib_in_sys_modules"] is True, shadowing
+    assert shadowing["deps_path_on_sys_path"] is False, shadowing
+    assert shadowing["basicsr_in_sys_modules"] is False, shadowing
+    assert shadowing["basicsr_utils_in_sys_modules"] is False, shadowing
+    assert shadowing["facelib_in_sys_modules"] is False, shadowing
+
 
 
 @pytest.mark.unit

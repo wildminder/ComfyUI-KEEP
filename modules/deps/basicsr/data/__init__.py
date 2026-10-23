@@ -5,10 +5,10 @@ import torch.utils.data
 from copy import deepcopy
 from functools import partial
 
-from basicsr.data.prefetch_dataloader import PrefetchDataLoader
-from basicsr.utils import get_root_logger
-from basicsr.utils.dist_util import get_dist_info
-from basicsr.utils.registry import DATASET_REGISTRY
+from .prefetch_dataloader import PrefetchDataLoader
+from ..utils import get_root_logger
+from ..utils.dist_util import get_dist_info
+from ..utils.registry import DATASET_REGISTRY
 
 __all__ = ['build_dataset', 'build_dataloader']
 

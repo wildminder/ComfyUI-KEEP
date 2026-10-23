@@ -6,9 +6,9 @@ from torchvision.transforms.functional import normalize
 import comfy.model_management as model_management
 from comfy.utils import tiled_scale # Import for upscaling
 
-from facelib.detection import init_detection_model
-from facelib.parsing import init_parsing_model
-from facelib.utils.misc import img2tensor, imwrite, is_gray, bgr2gray, adain_npy
+from ..detection import init_detection_model
+from ..parsing import init_parsing_model
+from .misc import img2tensor, imwrite, is_gray, bgr2gray, adain_npy
 
 dlib_model_url = {
     'face_detector': 'https://github.com/jnjaby/KEEP/releases/download/v1.0.0/mmod_human_face_detector-4cb19393.dat',

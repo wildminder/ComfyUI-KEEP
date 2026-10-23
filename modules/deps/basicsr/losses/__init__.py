@@ -2,8 +2,8 @@
 # flake8: noqa
 from copy import deepcopy
 
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import LOSS_REGISTRY
+from ..utils import get_root_logger
+from ..utils.registry import LOSS_REGISTRY
 from .gan_loss import g_path_regularize, gradient_penalty_loss, r1_penalty
 
 # P2.4 - explicit import list; the eager folder scan is gone

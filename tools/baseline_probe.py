@@ -257,7 +257,9 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
     except ImportError:
         ffmpeg_importable = False
     report["pip_shim"] = {
-        "video_util_imported": "basicsr.utils.video_util" in sys.modules,
+        "video_util_imported": any(
+            name.endswith("basicsr.utils.video_util") for name in sys.modules
+        ),
         "ffmpeg_importable": ffmpeg_importable,
         "pip_main_calls": list(pip_calls),
     }
@@ -269,14 +271,12 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
     }
 
     # ------------------------------------------------------------------
-    # 4. the *real* (unmasked) failure of the eager arch scan (B1)
+    # 4. the *real* (unmasked) import of the vendored KEEP arch (B1/B2)
     # ------------------------------------------------------------------
-    if deps_path not in sys.path:
-        sys.path.insert(0, deps_path)
-    for name in [n for n in sys.modules if n == "basicsr" or n.startswith("basicsr.")]:
-        del sys.modules[name]
     try:
-        importlib.import_module("basicsr.archs.keep_arch")
+        importlib.import_module(
+            f"{sys_module_name}.modules.deps.basicsr.archs.keep_arch"
+        )
         report["arch_scan"] = {"ok": True, "error": None}
     except BaseException as exc:  # noqa: BLE001
         report["arch_scan"] = {"ok": False, "error": _exc_info(exc)}

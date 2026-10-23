@@ -2,8 +2,8 @@
 # flake8: noqa
 from copy import deepcopy
 
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import ARCH_REGISTRY
+from ..utils import get_root_logger
+from ..utils.registry import ARCH_REGISTRY
 
 # P2.4 - explicit import list; the eager folder scan is gone
 from . import (

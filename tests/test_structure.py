@@ -253,11 +253,8 @@ def test_guard_entrypoint_is_v3_only():
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=False,
-    reason="flip owner: P2.5 - the package must not mutate sys.path",
-)
 def test_guard_no_sys_path_mutation():
+    """Guard (d) - flipped to strict in P2.5 (its flip owner)."""
     assert sys_path_violations(REPO_ROOT) == []
 
 
