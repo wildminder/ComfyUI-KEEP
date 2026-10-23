@@ -13,3 +13,21 @@ Repository = "https://github.com/wildminder/ComfyUI-KEEP"
 PublisherId = "wildai"
 DisplayName = "ComfyUI-KEEP"
 Icon = ""
+
+# P1.1 - pytest harness configuration.
+# The four markers are the tiers of the modernization plan (section 4):
+#   unit             - pure logic, no ComfyUI dependency
+#   mock_integration - node execute paths against the root conftest mocks
+#   headless         - real ComfyUI source tree on sys.path, no server
+#   gpu_acceptance   - opt-in real-weight run (RUN_KEEP_E2E + KEEP_MODEL_DIR)
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short --import-mode=importlib"
+consider_namespace_packages = true
+pythonpath = ["."]
+markers = [
+    "unit: Pure unit test (no ComfyUI dependency)",
+    "mock_integration: Mock-based integration test (node execute paths against the conftest mocks)",
+    "headless: Requires the real ComfyUI source tree on sys.path (no server)",
+    "gpu_acceptance: Opt-in real-weight run (RUN_KEEP_E2E=1 and KEEP_MODEL_DIR)",
+]
