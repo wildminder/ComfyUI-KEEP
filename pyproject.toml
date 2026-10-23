@@ -1,9 +1,12 @@
 [project]
 name = "ComfyUI-KEEP"
 description = "Kalman-Inspired Feature Propagation for Video Face Super-Resolution"
-version = "1.1.0"
+version = "2.0.0"
 license = {file = "LICENSE"}
-dependencies = ["addict", "future", "lmdb", "numpy", "opencv-python", "Pillow", "pyyaml", "scikit-image", "scipy", "torch", "torchvision", "tqdm", "yapf", "ffmpeg-python"]
+requires-python = ">=3.10"
+# The true runtime set of the pack (P2.6) - it is derived from the pruned
+# runtime closure of the vendored tree and matches requirements.txt.
+dependencies = ["torch", "torchvision", "numpy", "opencv-python", "Pillow", "einops", "scipy", "tqdm", "pyyaml", "requests"]
 
 [project.urls]
 Repository = "https://github.com/wildminder/ComfyUI-KEEP"
@@ -11,8 +14,10 @@ Repository = "https://github.com/wildminder/ComfyUI-KEEP"
 
 [tool.comfy]
 PublisherId = "wildai"
-DisplayName = "ComfyUI-KEEP"
+DisplayName = "KEEP"
+# P6.5 restores the preview asset and points the Icon at the committed file.
 Icon = ""
+requires-comfyui = ">=0.28.0"
 
 # P1.1 - pytest harness configuration.
 # The four markers are the tiers of the modernization plan (section 4):
