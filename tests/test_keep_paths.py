@@ -124,11 +124,6 @@ def test_a_missing_weight_names_the_file(keep_paths, mock_folder_paths):
     assert "does-not-exist.pth" in str(excinfo.value)
 
 
-#: A URL that cannot be downloaded - a test that expects **no** download
-#: fails fast (and loudly) when the lookup does not find the weight.
-UNREACHABLE_URL = "http://127.0.0.1:1/never-downloaded.pth"
-
-
 def _extra_model_root(mock_folder_paths) -> str:
     """A second model root next to the (temporary) primary one."""
     root = str(Path(mock_folder_paths.models_dir).parent / "extra-models")
@@ -151,18 +146,17 @@ def test_the_loader_uses_a_weight_from_an_extra_model_root(keep_paths, mock_fold
     The plan (P3.5) wants the multi-root handling in the load path, not
     only in a helper the product never calls: a weight that lives in an
     extra model root is used where it is instead of being downloaded into
-    the primary root again.
+    the primary root again.  The lookup that the pack really uses is
+    :func:`src.keep_paths.find_model_file` (the downloader of P5.2 calls
+    it), so the test calls that.
     """
     keep_paths.register_model_folders()
     extra = _extra_model_root(mock_folder_paths)
     mock_folder_paths.add_model_folder_path("keep_models", extra)
     weight = _write_weight(os.path.join(extra, "KEEP", "KEEP-b76feb75.pth"))
 
-    resolved = keep_paths.load_file_from_url_comfy(
-        url=UNREACHABLE_URL,
-        folder_name="keep_models",
-        file_name="KEEP-b76feb75.pth",
-        subdir="KEEP",
+    resolved = keep_paths.find_model_file(
+        "keep_models", "KEEP-b76feb75.pth", subdir="KEEP"
     )
     assert resolved == weight, resolved
     # nothing was downloaded into the primary root
@@ -185,11 +179,8 @@ def test_the_primary_root_wins_over_an_extra_model_root(keep_paths, mock_folder_
     )
     _write_weight(os.path.join(extra, "KEEP", "KEEP-b76feb75.pth"))
 
-    resolved = keep_paths.load_file_from_url_comfy(
-        url=UNREACHABLE_URL,
-        folder_name="keep_models",
-        file_name="KEEP-b76feb75.pth",
-        subdir="KEEP",
+    resolved = keep_paths.find_model_file(
+        "keep_models", "KEEP-b76feb75.pth", subdir="KEEP"
     )
     assert resolved == primary_weight, resolved
 

@@ -66,9 +66,16 @@ def stubbed_loader(loader_module, monkeypatch, tmp_path):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.loaded = None
+            self.state = {"weight": torch.zeros(1)}
 
         def to(self, device):
             return self
+
+        def state_dict(self):
+            # the real arch owns the flownet (keep_arch.py:882); this stub
+            # has no flownet tensors, so nothing is merged into the
+            # checkpoint state dict before the strict load
+            return dict(self.state)
 
         def load_state_dict(self, state_dict, strict=True):
             self.loaded = state_dict

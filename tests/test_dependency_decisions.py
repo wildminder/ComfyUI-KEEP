@@ -156,6 +156,12 @@ def test_flownet_path_is_wired(monkeypatch, tmp_path):
         def to(self, device):
             return self
 
+        def state_dict(self):
+            # the real arch owns the flownet (keep_arch.py:882) - the stub
+            # has no flownet tensors, so nothing has to be merged into the
+            # checkpoint state dict before the strict load
+            return {}
+
         def load_state_dict(self, state_dict, strict=True):
             return self
 

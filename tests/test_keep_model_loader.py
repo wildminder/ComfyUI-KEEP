@@ -387,15 +387,41 @@ def loader(loader_module, monkeypatch, tmp_path, synthetic_manifest, transport):
     """A loader whose model build is stubbed out (the weights are real)."""
 
     class _StubArch:
+        """A stand-in for the vendored arch that behaves like ``nn.Module``.
+
+        The real arch **owns** the flownet as a submodule
+        (``keep_arch.py:882``), so the state dict of the net always carries
+        the ``flownet.*`` keys - and a checkpoint without them fails the
+        **strict** load.  The stub keeps that behaviour (a no-op recorder
+        would hide exactly that defect).
+        """
+
+        #: The state dict of the stub net (the flownet is part of it).
+        STATE = {
+            "weight": torch.zeros(1),
+            "flownet.model.conv1.weight": torch.ones(1),
+        }
+
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             # the real arch owns the flownet as a submodule (keep_arch.py:882)
             self.flownet = _StubModule("flownet")
+            self.state = dict(self.STATE)
 
         def to(self, device):
             return self
 
+        def state_dict(self):
+            return dict(self.state)
+
         def load_state_dict(self, state_dict, strict=True):
+            missing = [key for key in self.state if key not in state_dict]
+            unexpected = [key for key in state_dict if key not in self.state]
+            if strict and (missing or unexpected):
+                raise RuntimeError(
+                    "Error(s) in loading state_dict for KEEP: missing "
+                    f"{missing}, unexpected {unexpected}"
+                )
             self.loaded = state_dict
             return self
 
@@ -523,6 +549,45 @@ def test_the_arch_gets_a_resolved_flownet_path_without_flownet_weights(loader, t
     assert flownet_path is not None, "the GMFlow checkpoint was not resolved"
     assert flownet_path.endswith("gmflow_sintel-0c07dcb3.pth"), flownet_path
     assert "gmflow_sintel-0c07dcb3.pth" in _downloaded(transport)
+
+
+@pytest.mark.unit
+def test_a_checkpoint_without_flownet_weights_loads_strictly(loader):
+    """The fallback branch must not break the strict load.
+
+    The real arch **always** owns the flownet (``keep_arch.py:882``), so the
+    state dict of the net always carries the ``flownet.*`` keys.  A
+    checkpoint without them used to make the strict load raise
+    ``RuntimeError: Missing key(s) in state_dict: flownet.*`` - and the
+    GMFlow weights the arch had just loaded were thrown away.  The flownet
+    tensors of the built net fill the gap, so the load stays strict **and**
+    the trained flow weights survive.
+    """
+    pack = loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    # the strict load happened (the stub arch raises on a missing key)
+    assert pack.keep_net.loaded is not None
+    # the flownet of the built net (the trained GMFlow weights) is in the
+    # loaded state dict - it was not discarded
+    assert torch.equal(
+        pack.keep_net.loaded["flownet.model.conv1.weight"],
+        pack.keep_net.state_dict()["flownet.model.conv1.weight"],
+    )
+
+
+@pytest.mark.unit
+def test_the_strict_load_still_rejects_an_unexpected_key(loader_module, loader, monkeypatch):
+    """The flownet merge does not weaken the strict load."""
+    monkeypatch.setattr(
+        loader_module.torch,
+        "load",
+        lambda *args, **kwargs: {
+            "params_ema": {"weight": torch.zeros(1), "unexpected.key": torch.zeros(1)}
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
 
 
 @pytest.mark.unit

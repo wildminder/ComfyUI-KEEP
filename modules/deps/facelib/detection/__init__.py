@@ -60,7 +60,8 @@ def init_detection_model(model_name, half=False, device='cuda', model_rootpath=N
         # above) - it will try to download to a generic 'weights/facelib' if
         # model_dir is relative like this.
         # This is not ideal as it bypasses ComfyUI's model management.
-        # Better to ensure load_file_from_url_comfy in our utils handles all downloads.
+        # Better to ensure the pack's downloader (src/keep_download.py) handles
+        # all downloads.
         model_path_final = load_file_from_url(url=URLS[model_name], model_dir=model_rootpath, file_name=model_file_name)
 
     load_net = torch.load(model_path_final, map_location=lambda storage, loc: storage)

@@ -801,7 +801,7 @@ def no_weight_downloads():
 
 
 @pytest.fixture(autouse=True)
-def mock_folder_paths(tmp_path):
+def mock_folder_paths(tmp_path, request):
     """Autouse: every test gets its own ``models_dir`` and folder registry.
 
     The reset happens *before* the test (so a test never sees the directory of
@@ -810,7 +810,15 @@ def mock_folder_paths(tmp_path):
     The fixture is defensive on purpose: a test that installs its own
     ``folder_paths`` stand-in (the P0 dependency-decision probe does) keeps
     working - only the attributes that exist are isolated.
+
+    The opt-in **GPU acceptance** tier is **not** isolated: it runs against
+    the real ComfyUI and the real weights (``KEEP_MODEL_DIR`` is the models
+    root of the run), so its ``folder_paths`` has to survive the fixture.
     """
+    if request.node.get_closest_marker("gpu_acceptance") is not None:
+        yield None
+        return
+
     folder_paths = sys.modules.get("folder_paths")
     if folder_paths is None:
         yield None

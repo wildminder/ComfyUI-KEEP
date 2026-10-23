@@ -15,7 +15,10 @@ Since **P5.5** the optical flow is wired: the GMFlow checkpoint is only
 resolved when the loaded KEEP checkpoint does **not** carry the ``flownet.*``
 weights (the shipped checkpoint does - P0.4 section 2).  The resolved path is
 put into the architecture config **before** the net is built, so the arch
-loads the trained weights instead of random ones.
+loads the trained weights instead of random ones.  The flownet tensors of the
+built net are merged into the checkpoint state dict before the strict load -
+the arch owns the flownet, so a checkpoint without those keys would otherwise
+break the build and throw the trained weights away.
 
 The ``comfy`` imports are **lazy** (function level): the plan's §3 import
 rule wants the pack to import without a ComfyUI server.  The vendored
@@ -369,6 +372,38 @@ class KEEPModelLoader:
                 if 'fuse_convs_dict' in k: new_k = k.replace('fuse_convs_dict', 'cft')
                 converted_state_dict[new_k] = v
             state_dict = converted_state_dict
+
+        # P5.5: the arch **always** owns the flownet (``keep_arch.py:882``),
+        # so the state dict of the net always carries the ``flownet.*``
+        # keys.  A checkpoint **without** them would make the strict load
+        # below fail ("Missing key(s) in state_dict: flownet.model.*") and
+        # the GMFlow weights the arch has just loaded would be thrown away.
+        # The flownet tensors of the built net - the **trained** ones,
+        # because the arch was built with ``flownet_path`` - fill the gap,
+        # so the load stays strict and the flow keeps its trained weights.
+        flownet_state = {
+            key: value
+            for key, value in net.state_dict().items()
+            if key.startswith("flownet.")
+        }
+        missing_flownet = [key for key in flownet_state if key not in state_dict]
+        if missing_flownet:
+            if flownet_from_checkpoint:
+                # the checkpoint carries only **part** of the flownet - the
+                # missing tensors are not trained (the arch was built without
+                # the GMFlow file).  That is not silent.
+                logger.warning(
+                    "KEEP: the checkpoint carries only part of the flownet "
+                    f"weights ({len(missing_flownet)} of "
+                    f"{len(flownet_state)} tensors are missing) - the missing "
+                    "ones come from the built net"
+                )
+            for key in missing_flownet:
+                state_dict[key] = flownet_state[key]
+            logger.debug(
+                f"KEEP: {len(missing_flownet)} flownet tensors were taken from "
+                "the built net (the GMFlow checkpoint)"
+            )
 
         net.load_state_dict(state_dict, strict=True)
         net.eval()

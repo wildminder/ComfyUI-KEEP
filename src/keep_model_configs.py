@@ -26,7 +26,7 @@ from dataclasses import dataclass
 # the node kept loading without it.
 #
 # P4.7: the unused ``load_file_from_url`` import is gone - the downloads run
-# through ``src/keep_paths.py`` (``load_file_from_url_comfy``).
+# through ``src/keep_download.py`` (the manifest-driven downloader of P5.2).
 try:  # the package import (the node package is the parent package)
     from ..modules.deps.basicsr.utils.registry import ARCH_REGISTRY
 except ImportError:  # the flat import (the repository root on sys.path)
