@@ -15,7 +15,10 @@ from basicsr.archs.gmflow_arch import FlowGenerator
 from basicsr.utils import get_root_logger
 from basicsr.utils.registry import ARCH_REGISTRY
 
-from diffusers.models.attention import FeedForward, AdaLayerNorm
+# P2.2 - the two diffusers symbols are vendored (diffusers itself is
+# unusable in this environment: ``diffusers.models.attention`` needs the
+# removed ``huggingface_hub.cached_download``).  See ``_diffusers_compat.py``.
+from ._diffusers_compat import FeedForward, AdaLayerNorm
 
 # gpu_tracker = MemTracker()
 

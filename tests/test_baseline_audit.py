@@ -16,9 +16,14 @@ Recorded baseline (docs/audit/2026-10-22-baseline-import.md):
 
 **P2.1 moved the baseline one step forward** (the plan's "documented
 next-failure progression"): ``from re import T`` is gone, so the eager arch
-scan now fails at the *diffusers* import (B2) instead.  The historical
-signature stays recorded in the audit document; the live assertions below
-follow the current tree.
+scan failed at the *diffusers* import (B2) instead.
+
+**P2.2 moved it one more step forward**: the two diffusers symbols are
+vendored, so the vendored tree imports cleanly, the *real* ``ARCH_REGISTRY``
+is used and the KEEP architecture is built.  The model build now fails in the
+weight-loading step (the probe uses a stub weight file that is not a real
+checkpoint).  The historical signatures stay recorded in the audit document;
+the live assertions below follow the current tree.
 """
 
 from __future__ import annotations
@@ -107,28 +112,31 @@ def test_package_imports_through_comfyui_loader(baseline_report):
 
 
 @pytest.mark.unit
-def test_utils_exposes_stub_arch_registry(baseline_report):
-    """(a) modules/utils.py exposes the *stub* ARCH_REGISTRY path.
+def test_utils_exposes_the_real_arch_registry(baseline_report):
+    """(a) modules/utils.py exposes the **real** vendored ARCH_REGISTRY.
 
-    The dummy registry must be in place (the real one could not even be
-    imported) and it must not know the 'KEEP' architecture.
+    Since P2.2 the vendored tree imports completely, so the
+    ``DummyArchRegistry`` fallback of ``modules/utils.py`` is not used any
+    more and the registry knows the ``KEEP`` architecture.
     """
     arch_registry = baseline_report["arch_registry"]
-    assert arch_registry["is_stub"] is True, arch_registry
-    assert arch_registry["class_name"] == "DummyArchRegistry", arch_registry
-    assert arch_registry["get_keep"] is False, arch_registry
-    assert baseline_report["stub_summary"]["fired"], baseline_report["stub_summary"]
-    assert "utils_arch_registry_dummy" in baseline_report["stub_summary"]["fired"]
+    assert arch_registry["is_stub"] is False, arch_registry
+    assert arch_registry["class_name"] == "Registry", arch_registry
+    assert arch_registry["module"] == "basicsr.utils.registry", arch_registry
+    assert arch_registry["get_keep"] is True, arch_registry
+    # the fallback block is still in the source (P2.7 removes it) but it did
+    # not fire - the import of the vendored tree succeeded
+    assert "utils_arch_registry_dummy" not in baseline_report["stub_summary"]["fired"]
+
 
 
 @pytest.mark.unit
-def test_vendored_keep_arch_import_raises_import_error_diffusers():
-    """(b) importing the vendored ``keep_arch`` raises ImportError about diffusers.
+def test_vendored_keep_arch_import_succeeds_after_p22():
+    """(b) importing the vendored ``keep_arch`` succeeds (B2 closed).
 
-    P2.1 removed ``from re import T`` (B1), so the failure moved on to the
-    next breakage: the ``diffusers`` import of the vendored arch (B2).  The
-    assertion is executed against the vendored source, not against a
-    recorded string.
+    P2.1 moved the failure to the ``diffusers`` import, P2.2 vendored the two
+    symbols into ``modules/deps/basicsr/archs/_diffusers_compat.py`` - the
+    vendored arch therefore imports without the (unusable) diffusers package.
     """
     saved_path = list(sys.path)
     saved_modules = {
@@ -140,15 +148,11 @@ def test_vendored_keep_arch_import_raises_import_error_diffusers():
         del sys.modules[name]
     sys.path.insert(0, str(DEPS_DIR))
     try:
-        with pytest.raises(ImportError) as excinfo:
-            import basicsr.archs.keep_arch  # noqa: F401
-        message = str(excinfo.value)
-        assert "diffusers" in message or "cached_download" in message, message
-        assert "cannot import name 'cached_download' from 'huggingface_hub'" in message, (
-            message
-        )
-        # the 'T' breakage is really gone (B1)
-        assert "cannot import name 'T' from 're'" not in message, message
+        module = importlib.import_module("basicsr.archs.keep_arch")
+        assert module.__name__ == "basicsr.archs.keep_arch"
+        # both symbols come from the vendored compat module, not from diffusers
+        assert module.FeedForward.__module__ == "basicsr.archs._diffusers_compat"
+        assert module.AdaLayerNorm.__module__ == "basicsr.archs._diffusers_compat"
     finally:
         sys.path[:] = saved_path
         for name in [
@@ -158,24 +162,18 @@ def test_vendored_keep_arch_import_raises_import_error_diffusers():
         sys.modules.update(saved_modules)
 
 
-@pytest.mark.unit
-def test_eager_arch_scan_is_the_real_failure(baseline_report):
-    """The eager arch scan is where the import actually breaks.
 
-    P2.1 removed ``from re import T`` (B1); the scan now fails at the
-    diffusers import (B2) - the plan's documented next-failure progression.
+@pytest.mark.unit
+def test_eager_arch_scan_succeeds_after_p22(baseline_report):
+    """The eager arch scan of the vendored ``basicsr`` is clean again.
+
+    P2.1 moved the failure to the diffusers import, P2.2 vendored those two
+    symbols - so the scan over ``basicsr/archs/*_arch.py`` succeeds.
     """
     arch_scan = baseline_report["arch_scan"]
-    assert arch_scan["ok"] is False, arch_scan
-    assert arch_scan["error"]["type"] == "ImportError", arch_scan
-    assert "cannot import name 'cached_download' from 'huggingface_hub'" in (
-        arch_scan["error"]["message"]
-    )
-    # the traceback must point at the vendored arch module
-    assert "keep_arch.py" in arch_scan["error"]["traceback"]
-    assert "archs" in arch_scan["error"]["traceback"]
-    # ... and at the diffusers import line of that module
-    assert "diffusers" in arch_scan["error"]["traceback"], arch_scan
+    assert arch_scan["ok"] is True, arch_scan
+    assert arch_scan["error"] is None, arch_scan
+
 
 
 @pytest.mark.unit
@@ -183,14 +181,21 @@ def test_model_build_fails_not_the_import(baseline_report):
     """Acceptance: the failure mode is *model-build*, not import.
 
     The build is attempted with a stubbed weight file present, so a missing
-    weight cannot explain the failure.
+    weight cannot explain the failure.  Since P2.2 the vendored arch imports
+    and the architecture is built - the build now fails later, while loading
+    the *stub* weight file (which is not a real checkpoint).
     """
     model_build = baseline_report["model_build"]
     assert model_build["ok"] is False, model_build
     assert model_build["stub_weight_present"] is True, model_build
-    assert model_build["error"]["type"] == "RuntimeError", model_build
-    assert "ARCH_REGISTRY" in model_build["error"]["message"], model_build
-    assert "keep_model_loader.py" in model_build["error"]["traceback"]
+    error = model_build["error"]
+    # the import worked - the failure is not an ImportError any more
+    assert error["type"] != "ImportError", model_build
+    # ... and it happens *after* the architecture was built, in the weight
+    # loading step of the loader
+    assert "keep_model_loader.py" in error["traceback"], model_build
+    assert "torch.load" in error["traceback"], model_build
+
 
 
 @pytest.mark.unit

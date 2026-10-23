@@ -113,25 +113,47 @@ def utils_module():
 
 
 @pytest.mark.unit
-def test_exactly_one_diffusers_import():
+def test_no_diffusers_import_remains_in_the_vendored_tree():
+    """P2.2 flipped this guard: **no** diffusers import may remain.
+
+    The two symbols are vendored byte-for-byte in
+    ``modules/deps/basicsr/archs/_diffusers_compat.py``; the vendored tree
+    must not depend on diffusers any more.
+    """
     imports = _diffusers_imports()
-    assert len(imports) == 1, f"expected exactly one diffusers import, got {imports}"
-    path, line, names = imports[0]
-    assert path == "modules/deps/basicsr/archs/keep_arch.py", (path, line)
-    assert names == EXPECTED_DIFFUSERS_SYMBOLS, (
-        f"the vendored diffusers import must request exactly "
-        f"{sorted(EXPECTED_DIFFUSERS_SYMBOLS)}, got {sorted(names)}"
-    )
+    assert imports == [], f"no diffusers import may remain, got {imports}"
 
 
 @pytest.mark.unit
-def test_diffusers_import_targets_the_expected_symbols():
-    """The import must name the two symbols P2.2 vendors byte-for-byte."""
-    path = REPO_ROOT / "modules" / "deps" / "basicsr" / "archs" / "keep_arch.py"
+def test_the_vendored_compat_module_provides_the_expected_symbols():
+    """The vendored module must define exactly the two planned symbols."""
+    path = (
+        REPO_ROOT
+        / "modules"
+        / "deps"
+        / "basicsr"
+        / "archs"
+        / "_diffusers_compat.py"
+    )
+    assert path.is_file(), f"the vendored compat module is missing: {path}"
     source = path.read_text(encoding="utf-8")
-    assert (
-        "from diffusers.models.attention import FeedForward, AdaLayerNorm" in source
-    ), "the diffusers import line changed - P2.2 vendors these two symbols"
+    for symbol in sorted(EXPECTED_DIFFUSERS_SYMBOLS):
+        assert f"class {symbol}(nn.Module):" in source, symbol
+    # the attribution header must name the upstream project and version
+    assert "diffusers 0.11.0" in source, (
+        "the attribution header must name diffusers 0.11.0"
+    )
+    assert "Apache License" in source, (
+        "the attribution header must name the Apache-2.0 license"
+    )
+
+    # and the architecture must use the vendored copy
+    keep_arch = (
+        REPO_ROOT / "modules" / "deps" / "basicsr" / "archs" / "keep_arch.py"
+    ).read_text(encoding="utf-8")
+    assert "from ._diffusers_compat import FeedForward, AdaLayerNorm" in keep_arch, (
+        "keep_arch.py must import the vendored classes"
+    )
 
 
 @pytest.mark.unit
