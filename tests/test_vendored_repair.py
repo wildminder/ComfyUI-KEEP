@@ -480,3 +480,93 @@ def test_importing_the_package_does_not_change_sys_path():
     result = _run_python(code, str(REPO_ROOT))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "KEEP_SYS_PATH_SAME True" in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# P2.6 - requirements.txt is the true runtime set
+# ---------------------------------------------------------------------------
+
+#: The third-party modules the closure imports -> their distribution name.
+_DISTRIBUTIONS = {
+    "torch": "torch",
+    "torchvision": "torchvision",
+    "numpy": "numpy",
+    "scipy": "scipy",
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "einops": "einops",
+    "tqdm": "tqdm",
+    "yaml": "pyyaml",
+    "requests": "requests",
+}
+
+#: The dependency set of the pruned closure (plan P2.6 + the two packages the
+#: plan's list missed - see ``docs/audit/2026-10-23-p2-vendored-repair.md``).
+_EXPECTED_REQUIREMENTS = {
+    "torch",
+    "torchvision",
+    "numpy",
+    "opencv-python",
+    "Pillow",
+    "einops",
+    "scipy",
+    "tqdm",
+    "pyyaml",
+    "requests",
+}
+
+
+def _requirement_entries():
+    text = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    return {
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+
+def _closure_imports():
+    """The third-party module names imported by the runtime closure."""
+    import ast
+
+    report = _scan_report()
+    names = set()
+    for rel in report["closure_files"]:
+        tree = ast.parse((REPO_ROOT / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names.add(node.module.split(".")[0])
+    return names
+
+
+@pytest.mark.unit
+def test_the_requirements_are_the_true_runtime_set():
+    """P2.6: ``requirements.txt`` lists exactly the runtime dependencies."""
+    entries = _requirement_entries()
+    assert entries == _EXPECTED_REQUIREMENTS, sorted(entries)
+    for phantom in PHANTOM_PACKAGES:
+        assert phantom not in entries
+
+
+@pytest.mark.unit
+def test_no_phantom_package_is_imported_in_the_closure():
+    """P2.6: ``addict`` / ``lmdb`` / ``yapf`` are imported nowhere."""
+    imported = _closure_imports()
+    offenders = sorted(name for name in imported if name in PHANTOM_PACKAGES)
+    assert offenders == [], offenders
+
+
+@pytest.mark.unit
+def test_every_third_party_import_of_the_closure_is_declared():
+    """P2.6: every third-party import of the closure is a declared dependency."""
+    imported = _closure_imports()
+    declared = {
+        _DISTRIBUTIONS[name] for name in imported if name in _DISTRIBUTIONS
+    }
+    entries = _requirement_entries()
+    assert declared == entries, (
+        f"the closure imports {sorted(declared)}, requirements.txt declares "
+        f"{sorted(entries)}"
+    )
