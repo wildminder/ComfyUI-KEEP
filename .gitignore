@@ -154,9 +154,6 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-docs/*
-!docs/plans/
-!docs/audit/
-!docs/*.md
-.dev/
-.codegraph
+docs/
+/.dev
+/.codegraph
