@@ -7,8 +7,9 @@ The V3 API of ComfyUI reports the progress of a node through
   max_value)``,
 * the **asynchronous** form is ``await ComfyAPI().execution.set_progress(...)``.
 
-Facts that were verified against the real ComfyUI source (v0.42.0) and
-recorded in ``.dev/docs/audit/2026-10-23-p4-v3-migration.md``:
+Facts that were verified against the real ComfyUI source (v0.42.0 - the
+``comfy_api.latest`` module of the host) and recorded by the P4 probe of the
+V3 migration:
 
 * ``execution`` is an **instance** attribute - the class level access
   (``ComfyAPISync.execution``) raises ``AttributeError``;

@@ -20,10 +20,10 @@ The closure is computed with a static import tracer:
   :data:`EAGER_SCAN_PACKAGES`), so every matching module of those folders
   belongs to the closure.
 
-Usage (embedded python):
+Usage (embedded python, from the repository root):
 
-    python scan_compat.py tools/scan_compat.py
-    python scan_compat.py tools/scan_compat.py --json out.json
+    python tools/scan_compat.py
+    python tools/scan_compat.py --json out.json
 
 Exit codes:
 

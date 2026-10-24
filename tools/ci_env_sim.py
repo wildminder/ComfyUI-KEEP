@@ -13,8 +13,8 @@ with ``--block``.
 
 Usage (embedded python, from the repository root):
 
-    python ci_env_sim.py tools/ci_env_sim.py
-    python ci_env_sim.py tools/ci_env_sim.py --block yaml
+    python tools/ci_env_sim.py
+    python tools/ci_env_sim.py --block yaml
 
 Exit code: the pytest exit code of the gate run.
 """

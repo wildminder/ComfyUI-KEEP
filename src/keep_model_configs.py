@@ -10,8 +10,7 @@ the **single source of truth** - the model configs and the facelib list are
 derived from it, so a URL or a hash is never written down twice.
 
 The sha256 values come from the one time verified download of **P5.0**; the
-provenance is recorded in
-``.dev/docs/audit/2026-10-22-weight-manifest-sources.md`` (the machine-readable
+provenance is recorded by ``tools/fetch_weight_hashes.py`` (the machine-readable
 record is ``tools/weight_hashes.json``).
 """
 

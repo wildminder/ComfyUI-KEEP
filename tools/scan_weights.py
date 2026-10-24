@@ -6,10 +6,10 @@ weight, whether it is present on this host, its size and its sha256.
 The inventory is a *local* fact: a weight that is not on this host is recorded
 as absent with ``sha256: null``.  No hash is ever invented.
 
-Usage (embedded python):
+Usage (embedded python, from the repository root):
 
-    python scan_weights.py tools/scan_weights.py
-    python scan_weights.py tools/scan_weights.py --models-root <abs>
+    python tools/scan_weights.py
+    python tools/scan_weights.py --models-root <abs>
 
 The models root is resolved from (in order): ``--models-root``,
 ``$KEEP_MODEL_DIR`` and ``$COMFYUI_ROOT/models``.

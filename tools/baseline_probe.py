@@ -49,12 +49,6 @@ def resolve_comfyui_root(explicit: str | None) -> str | None:
     There is no machine-local fallback: the probe runs against a tree the
     caller names.
     """
-    """The ComfyUI source tree to probe against.
-
-    The tree comes from the explicit argument, else from ``COMFYUI_ROOT``.
-    There is no machine-local fallback: the probe runs against a tree the
-    caller names.
-    """
     candidates = []
     if explicit:
         candidates.append(explicit)
