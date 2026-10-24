@@ -118,6 +118,23 @@ def _load_flownet_weights(flownet, path: str) -> None:
     target.load_state_dict(weights, strict=True)
 
 
+def keep_model_pack_error(pack) -> str | None:
+    """The actionable message when ``pack`` is not a ``KEEPModelPack``.
+
+    ``None`` means "no error".  A ``None`` pack is **not** an error here:
+    ComfyUI runs the prompt validation before the links are resolved, so a
+    connected pack arrives as ``None`` in that phase - it is checked in
+    ``execute`` instead, which raises the message.
+    """
+    if isinstance(pack, KEEPModelPack):
+        return None
+    return (
+        "Invalid KEEP Model Pack provided: expected a KEEPModelPack, "
+        f"got {type(pack).__name__}. Connect the output of the "
+        "'Load KEEP Models' node."
+    )
+
+
 class KEEPModelPack:
     """The models of the pack and their residency (P4.5).
 

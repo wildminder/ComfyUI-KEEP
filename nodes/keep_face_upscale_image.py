@@ -19,12 +19,12 @@ from comfy_api.latest import io
 
 try:  # the package import (ComfyUI loads the node package)
     from ..src.keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
-    from ..src.keep_model_loader import KEEPModelPack
+    from ..src.keep_model_loader import KEEPModelPack, keep_model_pack_error
     from ..src.keep_processor import KEEPFaceProcessor
     from ..src.keep_progress import report_progress
 except ImportError:  # the flat import (the repository root on sys.path)
     from src.keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
-    from src.keep_model_loader import KEEPModelPack
+    from src.keep_model_loader import KEEPModelPack, keep_model_pack_error
     from src.keep_processor import KEEPFaceProcessor
     from src.keep_progress import report_progress
 
@@ -96,15 +96,22 @@ class KEEP_FaceUpscaleImageNode(io.ComfyNode):
     def validate_inputs(cls, **kwargs) -> bool | str:
         """Refuse a model pack that is not a ``KEEPModelPack``.
 
-        The returned string is the error message ComfyUI shows to the user.
+        ComfyUI runs ``validate_inputs`` during the **prompt validation**,
+        where the links are not resolved yet: a connected pack arrives as
+        ``None``.  An unresolved pack is therefore accepted here and checked
+        in ``execute``, which raises the actionable error.
         """
         keep_model = kwargs.get("keep_model")
+        if keep_model is None or (
+            isinstance(keep_model, tuple) and len(keep_model) == 1 and keep_model[0] is None
+        ):
+            # A linked pack is not resolved yet during the prompt validation:
+            # ComfyUI hands it over as ``None`` (after its list unwrapping) or
+            # as the ``(None,)`` marker of a missing link.  The real type check
+            # happens in ``execute``.
+            return True
         if not isinstance(keep_model, KEEPModelPack):
-            return (
-                "Invalid KEEP Model Pack provided: expected a KEEPModelPack, "
-                f"got {type(keep_model).__name__}. Connect the output of the "
-                "'Load KEEP Models' node."
-            )
+            return keep_model_pack_error(keep_model)
         return True
 
     @classmethod
@@ -122,6 +129,10 @@ class KEEP_FaceUpscaleImageNode(io.ComfyNode):
         The pack is always offloaded - also when the processing fails (the
         exception is **not** swallowed: a failed node must fail loudly).
         """
+        error = keep_model_pack_error(keep_model)
+        if error is not None:
+            raise RuntimeError(error)
+
         try:
             keep_model.load_device()
             report_progress(0.0, 1.0)

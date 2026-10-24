@@ -226,6 +226,56 @@ def test_validate_inputs_accepts_a_real_pack(node_module, stub_pack):
     )
 
 
+@pytest.mark.unit
+def test_validate_inputs_accepts_an_unresolved_pack(node_module):
+    """A linked pack has no value during the prompt validation.
+
+    ComfyUI resolves the links only during the execution, so the pack arrives
+    as ``None`` in the validation phase.  Rejecting it there broke every
+    prompt - the error was reported once per input of the node.
+    """
+    assert (
+        node_module.KEEP_FaceUpscaleImageNode.validate_inputs(
+            image=torch.rand((1, 4, 4, 3), dtype=torch.float32),
+            keep_model=None,
+            final_upscale_factor=1.0,
+            has_aligned_face=True,
+            only_center_face=True,
+            draw_bounding_box=False,
+        )
+        is True
+    )
+    # ComfyUI marks an unresolved link with a one element tuple
+    # (``execution.get_input_data`` -> ``mark_missing``).
+    assert (
+        node_module.KEEP_FaceUpscaleImageNode.validate_inputs(
+            image=torch.rand((1, 4, 4, 3), dtype=torch.float32),
+            keep_model=(None,),
+            final_upscale_factor=1.0,
+            has_aligned_face=True,
+            only_center_face=True,
+            draw_bounding_box=False,
+        )
+        is True
+    )
+
+
+@pytest.mark.unit
+def test_execute_raises_for_a_foreign_pack(node_module):
+    """The pack is type checked in ``execute`` - which raises, never returns None."""
+    with pytest.raises(RuntimeError) as error:
+        node_module.KEEP_FaceUpscaleImageNode.execute(
+            image=torch.rand((1, 4, 4, 3), dtype=torch.float32),
+            keep_model=object(),
+            final_upscale_factor=1.0,
+            has_aligned_face=True,
+            only_center_face=True,
+            draw_bounding_box=False,
+        )
+    assert "KEEPModelPack" in str(error.value), str(error.value)
+    assert "Load KEEP Models" in str(error.value), str(error.value)
+
+
 @pytest.mark.mock_integration
 def test_upscale_face_image_returns_the_processed_image(node_module, stub_pack, monkeypatch):
     """The node returns the processed image and uses the pack once."""
@@ -375,6 +425,39 @@ def test_the_sequence_node_refuses_a_foreign_pack(sequence_node_module):
     )
     assert isinstance(message, str), message
     assert "KEEPModelPack" in message, message
+
+
+@pytest.mark.unit
+def test_the_sequence_node_accepts_an_unresolved_pack(sequence_node_module):
+    """A linked pack has no value during the prompt validation - it is fine."""
+    assert (
+        sequence_node_module.KEEP_ProcessImageSequenceNode.validate_inputs(
+            images=torch.rand((2, 4, 4, 3), dtype=torch.float32),
+            keep_model=None,
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_bounding_box=False,
+            max_clip_length=20,
+        )
+        is True
+    )
+
+
+@pytest.mark.unit
+def test_the_sequence_node_raises_for_a_foreign_pack(sequence_node_module):
+    """The pack is type checked in ``execute`` - which raises, never returns None."""
+    with pytest.raises(RuntimeError) as error:
+        sequence_node_module.KEEP_ProcessImageSequenceNode.execute(
+            images=torch.rand((2, 4, 4, 3), dtype=torch.float32),
+            keep_model=object(),
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_bounding_box=False,
+            max_clip_length=20,
+        )
+    assert "KEEPModelPack" in str(error.value), str(error.value)
 
 
 @pytest.mark.mock_integration
