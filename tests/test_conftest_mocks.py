@@ -543,7 +543,13 @@ def test_the_mock_exposes_no_symbol_the_real_api_lacks():
         pytest.skip(f"COMFYUI_ROOT={comfyui_root!r} is not a ComfyUI source tree")
     text = source.read_text(encoding="utf-8", errors="replace")
 
-    mock = sys.modules["comfy_api.latest"]
+    mock = sys.modules.get("comfy_api.latest")
+    if mock is None:
+        # The mocks are switched off in this configuration
+        # (``KEEP_NO_COMFY_MOCKS``, the headless tier): they are not installed
+        # in ``sys.modules``.  The comparison does not need them installed, so
+        # the mock is built explicitly.
+        _, mock = _conftest_module().build_comfy_api_mocks()
     public_names = [name for name in vars(mock) if not name.startswith("_")]
     assert public_names, "the mock must expose a public surface"
     for name in public_names:

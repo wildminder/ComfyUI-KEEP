@@ -672,6 +672,33 @@ class _MockFolderPaths(types.ModuleType):
         return self.get_full_path_or_raise(name, filename), None
 
 
+def build_comfy_api_mocks() -> tuple[types.ModuleType, types.ModuleType]:
+    """Build the ``comfy_api`` package and its ``latest`` submodule.
+
+    The construction is kept apart from the installation so that the test
+    suite can compare the mock against the real ComfyUI API in **every**
+    configuration - including the headless tier, where the mocks are
+    switched off (``KEEP_NO_COMFY_MOCKS``) and are therefore absent from
+    ``sys.modules``.
+    """
+    mock_comfy_api = types.ModuleType("comfy_api")
+    mock_comfy_api.__path__ = []  # type: ignore[attr-defined]
+    mock_comfy_api_latest = types.ModuleType("comfy_api.latest")
+
+    mock_io = _MockIO()
+    mock_ui = _MockUI()
+
+    mock_comfy_api_latest.io = mock_io
+    mock_comfy_api_latest.ui = mock_ui
+    mock_comfy_api_latest.IO = mock_io
+    mock_comfy_api_latest.UI = mock_ui
+    mock_comfy_api_latest.ComfyExtension = _MockComfyExtension
+    mock_comfy_api_latest.ComfyAPI = _MockComfyAPI
+    mock_comfy_api_latest.ComfyAPISync = _MockComfyAPISync
+
+    return mock_comfy_api, mock_comfy_api_latest
+
+
 def _install_comfy_mocks() -> None:
     """Install the ComfyUI mocks into ``sys.modules``.
 
@@ -690,20 +717,7 @@ def _install_comfy_mocks() -> None:
         return
 
     # --- comfy_api.latest -------------------------------------------------
-    mock_comfy_api = types.ModuleType("comfy_api")
-    mock_comfy_api.__path__ = []  # type: ignore[attr-defined]
-    mock_comfy_api_latest = types.ModuleType("comfy_api.latest")
-
-    mock_io = _MockIO()
-    mock_ui = _MockUI()
-
-    mock_comfy_api_latest.io = mock_io
-    mock_comfy_api_latest.ui = mock_ui
-    mock_comfy_api_latest.IO = mock_io
-    mock_comfy_api_latest.UI = mock_ui
-    mock_comfy_api_latest.ComfyExtension = _MockComfyExtension
-    mock_comfy_api_latest.ComfyAPI = _MockComfyAPI
-    mock_comfy_api_latest.ComfyAPISync = _MockComfyAPISync
+    mock_comfy_api, mock_comfy_api_latest = build_comfy_api_mocks()
 
     # --- comfy.model_management / comfy.model_patcher / comfy.utils ------
     mock_model_management = _MockModelManagement()
