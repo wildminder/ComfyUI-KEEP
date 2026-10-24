@@ -10,10 +10,19 @@ unchanged and the second call is served from the loader's cache.
 from __future__ import annotations
 
 import importlib
+import os
 
 import numpy as np
 import pytest
 import torch
+
+
+#: The harness mocks are switched off in the headless / real-ComfyUI
+#: configurations (``KEEP_NO_COMFY_MOCKS``).  The progress test asserts on
+#: the stub that records the calls; without the mocks the node uses the
+#: real ``comfy_api.latest`` API, whose execution recorder has no
+#: ``calls`` attribute.
+MOCKS_DISABLED = bool(os.environ.get("KEEP_NO_COMFY_MOCKS", "").strip())
 
 
 @pytest.fixture(scope="module")
@@ -379,6 +388,10 @@ def test_upscale_face_image_raises_on_a_failure(node_module, stub_pack, monkeypa
 
 
 @pytest.mark.mock_integration
+@pytest.mark.skipif(
+    MOCKS_DISABLED,
+    reason="the progress stub only records the calls while the harness mocks are installed",
+)
 def test_upscale_face_image_reports_the_progress(node_module, stub_pack, monkeypatch):
     """The node reports its progress through the ComfyUI execution API."""
     progress_module = importlib.import_module("ComfyUI_KEEP.src.keep_progress")
