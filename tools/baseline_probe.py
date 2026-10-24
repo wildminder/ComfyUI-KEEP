@@ -42,6 +42,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+
 def resolve_comfyui_root(explicit: str | None) -> str | None:
     """The ComfyUI source tree to probe against.
 
