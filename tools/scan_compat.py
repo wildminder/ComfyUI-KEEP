@@ -22,15 +22,15 @@ The closure is computed with a static import tracer:
 
 Usage (embedded python):
 
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/scan_compat.py
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/scan_compat.py --json out.json
+    python scan_compat.py tools/scan_compat.py
+    python scan_compat.py tools/scan_compat.py --json out.json
 
 Exit codes:
 
 * ``0`` - the scan ran and found **no** incompatible pattern in the closure;
 * ``1`` - the scan ran and found **at least one** incompatible pattern
   (``finding_count > 0``).  This is a *result*, not a tool crash: the fix list
-  is in ``docs/audit/2026-10-22-compat-scan.md``.
+  is in ``.dev/docs/audit/2026-10-22-compat-scan.md``.
 """
 
 from __future__ import annotations

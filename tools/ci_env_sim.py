@@ -13,8 +13,8 @@ with ``--block``.
 
 Usage (embedded python, from the repository root):
 
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/ci_env_sim.py
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/ci_env_sim.py --block yaml
+    python ci_env_sim.py tools/ci_env_sim.py
+    python ci_env_sim.py tools/ci_env_sim.py --block yaml
 
 Exit code: the pytest exit code of the gate run.
 """

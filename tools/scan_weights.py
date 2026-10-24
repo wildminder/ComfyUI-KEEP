@@ -8,12 +8,11 @@ as absent with ``sha256: null``.  No hash is ever invented.
 
 Usage (embedded python):
 
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/scan_weights.py
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/scan_weights.py --models-root <abs>
+    python scan_weights.py tools/scan_weights.py
+    python scan_weights.py tools/scan_weights.py --models-root <abs>
 
 The models root is resolved from (in order): ``--models-root``,
-``$KEEP_MODEL_DIR``, ``$COMFYUI_ROOT/models``, then the local ComfyUI runtime
-tree of this repository.
+``$KEEP_MODEL_DIR`` and ``$COMFYUI_ROOT/models``.
 """
 
 from __future__ import annotations
@@ -26,15 +25,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_MODELS_ROOTS = (
-    r"C:\_Dev\ComfyUI_dev\ComfyUI_t211c130p313\ComfyUI\models",
-)
-
 #: The 8 weights the node needs (plan section 5 / P5.1 manifest scope).
 #: ``dest_folder`` / ``subdir`` reproduce the legacy on-disk layout exactly.
 #:
 #: ``required`` mirrors the manifest decision of P0.4
-#: (``docs/audit/2026-10-22-dependency-decisions.md`` §4.1): only the GMFlow
+#: (``.dev/docs/audit/2026-10-22-dependency-decisions.md`` §4.1): only the GMFlow
 #: entry (defensive) and the ``Asian`` entry (not published upstream, HTTP 404)
 #: are optional - the latter because a *required* entry that can never be
 #: downloaded would make the fail-fast rule of P5.3 break the **default** KEEP
@@ -102,7 +97,12 @@ EXPECTED_WEIGHTS = (
 SCANNED_FOLDERS = ("keep_models", "facedetection", "gmflow")
 
 
-def resolve_models_root(explicit: str | None = None) -> Path | None:
+def models_root_candidates(explicit: str | None = None) -> list[Path]:
+    """The models roots that are tried, in order.
+
+    There is no machine-local fallback: the roots come from the explicit
+    argument or from the environment.
+    """
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
@@ -112,8 +112,11 @@ def resolve_models_root(explicit: str | None = None) -> Path | None:
     env_comfy = os.environ.get("COMFYUI_ROOT")
     if env_comfy:
         candidates.append(Path(env_comfy) / "models")
-    candidates.extend(Path(p) for p in DEFAULT_MODELS_ROOTS)
-    for candidate in candidates:
+    return candidates
+
+
+def resolve_models_root(explicit: str | None = None) -> Path | None:
+    for candidate in models_root_candidates(explicit):
         if candidate.is_dir():
             return candidate
     return None
@@ -195,8 +198,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "fatal": "no models root found; set KEEP_MODEL_DIR or COMFYUI_ROOT",
-                    "searched": list(DEFAULT_MODELS_ROOTS),
+                    "fatal": "no models root found; set --models-root, KEEP_MODEL_DIR or COMFYUI_ROOT",
+                    "searched": [str(p) for p in models_root_candidates(args.models_root)],
                 },
                 indent=2,
             )

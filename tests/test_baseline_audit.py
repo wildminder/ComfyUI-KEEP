@@ -4,7 +4,7 @@ These tests assert the *recorded baseline* against the **current code**, not
 against the audit document: the document is only checked for the two required
 signatures, as the plan requires.
 
-Recorded baseline (docs/audit/2026-10-22-baseline-import.md):
+Recorded baseline (.dev/docs/audit/2026-10-22-baseline-import.md):
 
 * the package **imports** through ComfyUI's own loader (spec_from_file_location
   + alias, no server) - the swallow-and-stub blocks of B9 hide the real errors;
@@ -39,7 +39,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROBE = REPO_ROOT / "tools" / "baseline_probe.py"
-AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-baseline-import.md"
+AUDIT_DOC = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-baseline-import.md"
 DEPS_DIR = REPO_ROOT / "modules" / "deps"
 
 #: The audit artifacts are development documentation: they are not shipped with
@@ -264,9 +264,8 @@ def test_fatal_probe_report_leads_to_a_skip_not_a_failure(monkeypatch):
     probe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(probe)
 
-    # no ComfyUI tree at all: neither the fallback roots nor COMFYUI_ROOT exist
-    monkeypatch.setattr(probe, "DEFAULT_COMFYUI_ROOTS", ())
-    monkeypatch.setenv("COMFYUI_ROOT", "C:/definitely-not-a-comfyui-tree")
+    # no ComfyUI tree at all: COMFYUI_ROOT points at a tree that does not exist
+    monkeypatch.setenv("COMFYUI_ROOT", "definitely-not-a-comfyui-tree")
     report = probe.probe()
     assert "fatal" in report, report
     assert probe.main([]) == 2, "the probe must exit 2 when it has no ComfyUI tree"

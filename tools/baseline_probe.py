@@ -11,14 +11,13 @@ the two things the modernization plan needs a verified baseline for:
 
 Run it with the embedded interpreter:
 
-    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe tools/baseline_probe.py
+    python tools/baseline_probe.py
 
 Useful flags:
 
     --json PATH            write the machine-readable report to PATH
     --comfyui-root PATH    ComfyUI source tree to put on sys.path
-                           (default: $COMFYUI_ROOT, else the local runtime tree,
-                           else the read-only source reference tree)
+                           (default: $COMFYUI_ROOT)
     --simulate-missing-ffmpeg
                            block ``import ffmpeg`` and record (instead of perform)
                            the ``pip.main([...])`` call of the vendored
@@ -43,24 +42,25 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: Local ComfyUI trees, tried in order when neither ``--comfyui-root`` nor
-#: ``COMFYUI_ROOT`` is given.  The first entry is the runtime tree that owns the
-#: embedded interpreter used by this repository; the second is the read-only
-#: v0.42.0 source reference.  Override with ``--comfyui-root`` / ``COMFYUI_ROOT``.
-DEFAULT_COMFYUI_ROOTS = (
-    r"C:\_Dev\ComfyUI_dev\ComfyUI_t211c130p313\ComfyUI",
-    r"C:\_Dev\ComfyUI_dev\ComfyUI-source\ComfyUI",
-)
-
-
 def resolve_comfyui_root(explicit: str | None) -> str | None:
+    """The ComfyUI source tree to probe against.
+
+    The tree comes from the explicit argument, else from ``COMFYUI_ROOT``.
+    There is no machine-local fallback: the probe runs against a tree the
+    caller names.
+    """
+    """The ComfyUI source tree to probe against.
+
+    The tree comes from the explicit argument, else from ``COMFYUI_ROOT``.
+    There is no machine-local fallback: the probe runs against a tree the
+    caller names.
+    """
     candidates = []
     if explicit:
         candidates.append(explicit)
     env_root = os.environ.get("COMFYUI_ROOT")
     if env_root:
         candidates.append(env_root)
-    candidates.extend(DEFAULT_COMFYUI_ROOTS)
     for candidate in candidates:
         if candidate and (Path(candidate) / "folder_paths.py").is_file():
             return str(Path(candidate))

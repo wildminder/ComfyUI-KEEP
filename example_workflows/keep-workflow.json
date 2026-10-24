@@ -469,7 +469,7 @@
             "format": "video/h264-mp4",
             "frame_rate": 15,
             "workflow": "wan_00048.png",
-            "fullpath": "C:\\_Dev\\ComfyUI_test\\ComfyUI\\output\\Wan\\wan_00048.mp4"
+            "fullpath": "output/Wan/wan_00048.mp4"
           },
           "muted": false
         }
