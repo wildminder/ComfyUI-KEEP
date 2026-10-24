@@ -5,7 +5,7 @@ this file pins the two facts every later phase relies on:
 
 * the interpreter is a supported Python (the plan's embedded interpreter is
   3.13; the CI matrix of P1.5 adds 3.10 and 3.12 - see the deviation note in
-  ``docs/audit/2026-10-23-p1-test-infrastructure.md``),
+  ``.dev/docs/audit/2026-10-23-p1-test-infrastructure.md``),
 * ``torch`` is importable - every tier of the suite imports it, and the
   ``sample_image`` fixture of the root conftest is a torch tensor.
 """

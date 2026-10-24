@@ -11,7 +11,7 @@ derived from it, so a URL or a hash is never written down twice.
 
 The sha256 values come from the one time verified download of **P5.0**; the
 provenance is recorded in
-``docs/audit/2026-10-22-weight-manifest-sources.md`` (the machine-readable
+``.dev/docs/audit/2026-10-22-weight-manifest-sources.md`` (the machine-readable
 record is ``tools/weight_hashes.json``).
 """
 

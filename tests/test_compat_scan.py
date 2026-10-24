@@ -18,7 +18,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCANNER = REPO_ROOT / "tools" / "scan_compat.py"
-AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-compat-scan.md"
+AUDIT_DOC = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-compat-scan.md"
 DEPS_DIR = REPO_ROOT / "modules" / "deps"
 
 #: The audit artifacts are development documentation: they are not shipped with

@@ -139,7 +139,7 @@ def test_comfy_api_latest_exports_io_and_ui_as_siblings():
     """``io`` and ``ui`` are siblings - ``io.ui`` does not exist.
 
     Verified against the real ComfyUI v0.42.0 source
-    (``docs/audit/2026-10-23-comfy-api-surface.md`` section 1): a mock that
+    (``.dev/docs/audit/2026-10-23-comfy-api-surface.md`` section 1): a mock that
     hides ``ui`` inside ``io`` would let the mistake "from .. import io, ui"
     slip through.
     """

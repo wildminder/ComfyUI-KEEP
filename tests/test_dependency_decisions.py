@@ -27,7 +27,7 @@ PACKAGE_DIR = REPO_ROOT / "modules"
 SRC_DIR = REPO_ROOT / "src"
 NODES_DIR = REPO_ROOT / "nodes"
 UTILS_FILE = SRC_DIR / "keep_model_configs.py"
-AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-dependency-decisions.md"
+AUDIT_DOC = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-dependency-decisions.md"
 
 #: The audit artifacts are development documentation: they are not shipped with
 #: the pack and may be absent from a working tree.

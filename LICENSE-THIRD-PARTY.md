@@ -63,7 +63,7 @@ KEEP architecture uses from `diffusers.models.attention`).
 The copies are needed because `diffusers` cannot be imported in the supported
 environments (Python 3.13 / torch 2.11); the equivalence with the upstream
 0.11.0 classes is recorded in
-`docs/audit/2026-10-22-diffusers-equivalence.md`.
+the diffusers equivalence record produced by ``tools/diffusers_equivalence.py``.
 
 ## 3. GMFlow — Apache-2.0
 

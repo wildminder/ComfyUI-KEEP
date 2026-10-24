@@ -769,7 +769,7 @@ def test_guard_e_flip_owner_covers_every_current_finding():
     nobody notices.  This test compares the P2.1 section of the plan with the
     live scanner output - the plan's work list and the tree cannot drift.
     """
-    plan = REPO_ROOT / "docs" / "plans" / "2026-10-22-comfyui-keep-v3-modernization.md"
+    plan = REPO_ROOT / ".dev" / "docs" / "plans" / "2026-10-22-comfyui-keep-v3-modernization.md"
     if not plan.is_file():
         pytest.skip("the modernization plan is not part of this checkout")
 

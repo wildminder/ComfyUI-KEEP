@@ -5,7 +5,7 @@ of the manifest cannot come from a local inventory.  They come from a **one
 time verified download**: every upstream URL is downloaded exactly once, the
 sha256 of the downloaded bytes is computed and cross-checked against the
 upstream ``-<8 hex>`` file name convention, and the result is recorded in
-``docs/audit/2026-10-22-weight-manifest-sources.md``.
+``.dev/docs/audit/2026-10-22-weight-manifest-sources.md``.
 
 The script is
 
@@ -45,7 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CACHE = REPO_ROOT / "tools" / "weight_hashes.json"
 
 #: The provenance document the script writes.
-DEFAULT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-weight-manifest-sources.md"
+DEFAULT_DOC = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-weight-manifest-sources.md"
 
 #: The environment variable that allows the script to touch the network.
 FETCH_ENV = "KEEP_FETCH_WEIGHT_HASHES"

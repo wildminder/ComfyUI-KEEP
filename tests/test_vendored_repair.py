@@ -193,7 +193,7 @@ def test_no_debug_leftovers_in_the_vendored_closure():
 # P2.2 - the vendored diffusers classes
 # ---------------------------------------------------------------------------
 COMPAT_FILE = DEPS_DIR / "basicsr" / "archs" / "_diffusers_compat.py"
-EQUIVALENCE_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-diffusers-equivalence.md"
+EQUIVALENCE_DOC = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-diffusers-equivalence.md"
 
 
 def _load_compat_module():
@@ -568,7 +568,7 @@ _OPTIONAL_LAZY_IMPORTS = {
 }
 
 #: The dependency set of the pruned closure (plan P2.6 + the two packages the
-#: plan's list missed - see ``docs/audit/2026-10-23-p2-vendored-repair.md``).
+#: plan's list missed - see ``.dev/docs/audit/2026-10-23-p2-vendored-repair.md``).
 _EXPECTED_REQUIREMENTS = {
     "torch",
     "torchvision",

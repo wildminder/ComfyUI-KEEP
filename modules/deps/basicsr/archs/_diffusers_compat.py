@@ -29,7 +29,7 @@ both are plain ``nn.Module``s without any diffusers-specific behaviour, so
 they are vendored here instead of adding a hard dependency.
 
 The equivalence of this copy with the upstream 0.11.0 classes is verified in
-``docs/audit/2026-10-22-diffusers-equivalence.md``.
+``.dev/docs/audit/2026-10-22-diffusers-equivalence.md``.
 """
 
 from typing import Optional

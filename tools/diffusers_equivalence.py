@@ -4,7 +4,7 @@ The plan (P2.2) asks for a **recorded** equivalence run: the pristine
 ``diffusers==0.11.0`` classes and the vendored copy must have the same
 ``state_dict`` keys and produce identical outputs on a seeded input
 (tolerance 0).  The result is written to
-``docs/audit/2026-10-22-diffusers-equivalence.md``.
+``.dev/docs/audit/2026-10-22-diffusers-equivalence.md``.
 
 Why this is a *tool* and not a plain test: the pristine diffusers sources are
 not part of the repository.  The hard environment rules of this phase forbid
@@ -45,7 +45,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDORED_FILE = REPO_ROOT / "modules" / "deps" / "basicsr" / "archs" / "_diffusers_compat.py"
-DEFAULT_MARKDOWN = REPO_ROOT / "docs" / "audit" / "2026-10-22-diffusers-equivalence.md"
+DEFAULT_MARKDOWN = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-diffusers-equivalence.md"
 
 #: The classes that are vendored (the helper classes are pulled in by
 #: ``FeedForward`` and are part of the copied block).

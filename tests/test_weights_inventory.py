@@ -25,7 +25,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCANNER = REPO_ROOT / "tools" / "scan_weights.py"
-INVENTORY_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-weights-inventory.md"
+INVENTORY_DOC = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-weights-inventory.md"
 
 #: The audit artifacts are development documentation: they are not shipped with
 #: the pack and may be absent from a working tree.

@@ -27,7 +27,7 @@ from tools import fetch_weight_hashes as fwh
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_FILE = REPO_ROOT / "tools" / "weight_hashes.json"
-DOC_FILE = REPO_ROOT / "docs" / "audit" / "2026-10-22-weight-manifest-sources.md"
+DOC_FILE = REPO_ROOT / ".dev" / "docs" / "audit" / "2026-10-22-weight-manifest-sources.md"
 
 #: The audit artifacts are development documentation: they are not shipped with
 #: the pack and may be absent from a working tree.
@@ -230,7 +230,7 @@ def test_the_committed_document_is_in_sync_with_the_committed_cache():
     """The document is a pure function of the cache - they cannot drift."""
     cache = fwh.load_cache(CACHE_FILE)
     assert DOC_FILE.read_text(encoding="utf-8") == fwh.render_doc(cache), (
-        "docs/audit/2026-10-22-weight-manifest-sources.md is out of sync with "
+        ".dev/docs/audit/2026-10-22-weight-manifest-sources.md is out of sync with "
         "tools/weight_hashes.json - re-run tools/fetch_weight_hashes.py"
     )
 

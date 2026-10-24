@@ -17,7 +17,7 @@ things, in this order:
    ``comfy.model_management``, ``comfy.model_patcher``, ``comfy.utils`` and
    ``folder_paths`` are installed into ``sys.modules`` before any test module
    is imported.  The mocks mirror the *verified* surface of ComfyUI v0.42.0
-   (``docs/audit/2026-10-23-comfy-api-surface.md``); in particular ``ui`` is
+   (``.dev/docs/audit/2026-10-23-comfy-api-surface.md``); in particular ``ui`` is
    **not** an attribute of ``io``, and ``execution`` is an instance attribute
    (class-level access raises ``AttributeError``), exactly like the real API.
 
@@ -767,7 +767,7 @@ register_package_alias()
 #:
 #: This is the P0 "collection artifact" that P1.2 planned to drop - it cannot
 #: be dropped while the repository root is a package (see
-#: ``docs/audit/2026-10-23-p1-test-infrastructure.md``).
+#: ``.dev/docs/audit/2026-10-23-p1-test-infrastructure.md``).
 COLLECTION_MODULE_NAME = "__init__"
 sys.modules.setdefault(COLLECTION_MODULE_NAME, sys.modules[PACKAGE_ALIAS])
 
