@@ -15,6 +15,9 @@ claims are **checked** instead of trusted:
 * the **weights table** is the table the manifest generates (the manifest is
   the single source of truth: a URL, a hash, a size or a destination that
   changes breaks this test),
+* every **per-node parameter table** is the widget contract of the node it
+  documents (the names, the defaults, the ranges and the order of the
+  widgets are the V3 schema, not a prose copy of it),
 * the third-party license file exists and is linked,
 * the **S-Lab non-commercial notice** and the **VideoHelperSuite note** are
   really in the text.
@@ -35,27 +38,31 @@ NODES_DIR = REPO_ROOT / "nodes"
 THIRD_PARTY_LICENSE = REPO_ROOT / "LICENSE-THIRD-PARTY.md"
 DOCS_TABLES = REPO_ROOT / "tools" / "docs_tables.py"
 
+
+def _load_docs_tables():
+    """The table generator of ``tools/docs_tables.py`` (the rule source)."""
+    spec = importlib.util.spec_from_file_location("keep_docs_tables", DOCS_TABLES)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+#: The generator module: it owns the rules the README is checked against
+#: (the weights table, the per-node parameter tables and the path rules), so
+#: the checker and the generator cannot drift apart.
+DOCS_TABLES_MODULE = _load_docs_tables()
+
 #: The socket types of the pack - they are *not* node ids.
 SOCKET_TYPES = {"KEEP_MODEL_PACK"}
 
 #: The path roots that live in the **ComfyUI installation**, not in the
 #: repository (the model folders and the custom node folder).
-EXTERNAL_PATH_ROOTS = {"ComfyUI", "custom_nodes", "models"}
+EXTERNAL_PATH_ROOTS = DOCS_TABLES_MODULE.EXTERNAL_PATH_ROOTS
 
 #: The extensions that make a backticked token a path claim of the
 #: repository.  The weight extensions (.pth) are not part of it: the weights
 #: live in the model folders of ComfyUI.
-REPO_FILE_EXTENSIONS = (
-    ".cfg",
-    ".json",
-    ".md",
-    ".png",
-    ".py",
-    ".toml",
-    ".txt",
-    ".yaml",
-    ".yml",
-)
+REPO_FILE_EXTENSIONS = DOCS_TABLES_MODULE.REPO_FILE_EXTENSIONS
 
 LINK_RE = re.compile(r"\[(?P<text>[^\]]*)\]\((?P<target>[^)\s]+)")
 REFERENCE_RE = re.compile(r"^\[[^\]]+\]:\s*(?P<target>\S+)", re.MULTILINE)
@@ -64,6 +71,9 @@ BACKTICK_RE = re.compile(r"`(?P<token>[^`\n]+)`")
 ANCHOR_RE = re.compile(r'id="(?P<id>[^"]+)"')
 HTML_HREF_RE = re.compile(r'href="(?P<target>#[^"]+)"')
 NODE_ID_RE = re.compile(r"(?<![\w.\-])KEEP_[A-Za-z0-9_]+(?![\w.\-])")
+
+#: The header of a per-node parameter table of the README.
+PARAMETER_TABLE_HEADER = "| Parameter | Default | Description |"
 
 
 @pytest.fixture(scope="module")
@@ -75,10 +85,7 @@ def readme_text() -> str:
 @pytest.fixture(scope="module")
 def docs_tables():
     """The table generator of ``tools/docs_tables.py``."""
-    spec = importlib.util.spec_from_file_location("keep_docs_tables", DOCS_TABLES)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return DOCS_TABLES_MODULE
 
 
 @pytest.fixture(scope="module")
@@ -97,12 +104,98 @@ def registered_node_ids() -> set[str]:
     return ids
 
 
+@pytest.fixture(scope="module")
+def pack_schemas() -> dict:
+    """The V3 schema of every pack node, by node id."""
+    module = importlib.import_module("ComfyUI_KEEP.nodes")
+    schemas = {}
+    for class_name in module.__all__:
+        schema = getattr(module, class_name).define_schema()
+        schemas[schema.node_id] = schema
+    return schemas
+
+
 def _is_external(target: str) -> bool:
     return target.split("/", 1)[0] in EXTERNAL_PATH_ROOTS
 
 
 def _repo_path(target: str) -> Path:
     return REPO_ROOT / target.lstrip("./")
+
+
+def _parameter_rows(readme_text: str, node_id: str) -> list[tuple[str, str, str]]:
+    """The rows of the parameter table the README gives for a node.
+
+    The table is the one that follows the ``**Node id:**`` line of the node
+    - it holds the parameter name, its default and its description.
+    """
+    lines = readme_text.splitlines()
+    marker = f"**Node id:** `{node_id}`"
+    start = next(
+        (index for index, line in enumerate(lines) if line.startswith(marker)),
+        None,
+    )
+    assert start is not None, f"the README has no 'Node id' line for {node_id}"
+
+    header = next(
+        (
+            index
+            for index in range(start, len(lines))
+            if lines[index].strip() == PARAMETER_TABLE_HEADER
+        ),
+        None,
+    )
+    assert header is not None, (
+        f"the README documents no parameters for {node_id} - there is no "
+        f"{PARAMETER_TABLE_HEADER!r} below its 'Node id' line"
+    )
+
+    rows = []
+    for line in lines[header + 1 :]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            break
+        if stripped.startswith("|:"):
+            continue  # the separator of the table
+        cells = [cell.strip() for cell in stripped.strip("|").split("|", 2)]
+        assert len(cells) == 3, (
+            f"the parameter row {stripped!r} of {node_id} is malformed"
+        )
+        rows.append((cells[0].strip("`"), cells[1], cells[2]))
+    return rows
+
+
+@pytest.mark.unit
+def test_the_parameter_tables_of_the_readme_match_the_node_schemas(
+    readme_text, pack_schemas, docs_tables
+):
+    """The parameter tables of the README are the widget contract of the nodes.
+
+    The README calls the widget names, the defaults, the ranges and the
+    widget order compatibility guarantees - so the tables it shows are the
+    V3 schemas of the nodes, not a prose copy of them.
+    """
+    assert pack_schemas, "the pack registers no node - the test would be vacuous"
+
+    for node_id, schema in pack_schemas.items():
+        rows = _parameter_rows(readme_text, node_id)
+        documented = docs_tables.documented_parameters(schema)
+
+        assert [name for name, _, _ in rows] == [name for name, _ in documented], (
+            f"the README documents the parameters {[name for name, _, _ in rows]} "
+            f"for {node_id}, the schema has {[name for name, _ in documented]}"
+        )
+        assert [default for _, default, _ in rows] == [
+            default for _, default in documented
+        ], (
+            f"the defaults the README documents for {node_id} are "
+            f"{[default for _, default, _ in rows]}, the schema says "
+            f"{[default for _, default in documented]}"
+        )
+        for name, _, description in rows:
+            assert description, (
+                f"the parameter {name} of {node_id} has no description in the README"
+            )
 
 
 @pytest.mark.unit

@@ -92,7 +92,6 @@ def _anchor_out(node: dict, index: int) -> tuple[float, float]:
 
 def _anchor_in(node: dict, index: int) -> tuple[float, float]:
     pos = node.get("pos", [0, 0])
-    size = node.get("size", [200, 80])
     return float(pos[0]), float(pos[1]) + 26.0 + 18.0 * index
 
 
