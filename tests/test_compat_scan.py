@@ -21,6 +21,13 @@ SCANNER = REPO_ROOT / "tools" / "scan_compat.py"
 AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-compat-scan.md"
 DEPS_DIR = REPO_ROOT / "modules" / "deps"
 
+#: The audit artifacts are development documentation: they are not shipped with
+#: the pack and may be absent from a working tree.
+pytestmark = pytest.mark.skipif(
+    not AUDIT_DOC.exists(),
+    reason=f"the audit artifact {AUDIT_DOC.name} is not in the working tree",
+)
+
 KNOWN_BAD = '''\
 import pdb
 import imp

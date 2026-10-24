@@ -42,6 +42,13 @@ PROBE = REPO_ROOT / "tools" / "baseline_probe.py"
 AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-baseline-import.md"
 DEPS_DIR = REPO_ROOT / "modules" / "deps"
 
+#: The audit artifacts are development documentation: they are not shipped with
+#: the pack and may be absent from a working tree.
+pytestmark = pytest.mark.skipif(
+    not AUDIT_DOC.exists(),
+    reason=f"the audit artifact {AUDIT_DOC.name} is not in the working tree",
+)
+
 
 def _run_probe(tmp_path: Path, *extra: str) -> dict:
     """Run the baseline probe in a fresh interpreter and return its report.

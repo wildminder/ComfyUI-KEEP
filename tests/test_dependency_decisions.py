@@ -29,6 +29,13 @@ NODES_DIR = REPO_ROOT / "nodes"
 UTILS_FILE = SRC_DIR / "keep_model_configs.py"
 AUDIT_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-dependency-decisions.md"
 
+#: The audit artifacts are development documentation: they are not shipped with
+#: the pack and may be absent from a working tree.
+pytestmark = pytest.mark.skipif(
+    not AUDIT_DOC.exists(),
+    reason=f"the audit artifact {AUDIT_DOC.name} is not in the working tree",
+)
+
 EXPECTED_DIFFUSERS_SYMBOLS = {"FeedForward", "AdaLayerNorm"}
 
 

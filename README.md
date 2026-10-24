@@ -139,7 +139,7 @@ The node ids, the display names, the category, the socket types (`IMAGE`, `KEEP_
 <a id="keep-weights"></a>
 ## ▓ Weights
 
-The pack downloads its checkpoints on the first run and verifies every file against the sha256 of the manifest (`src/keep_model_configs.py`). The provenance of every hash is recorded in `docs/audit/2026-10-22-weight-manifest-sources.md`.
+The pack downloads its checkpoints on the first run and verifies every file against the sha256 of the manifest (`src/keep_model_configs.py`). The provenance of every hash is recorded by `tools/fetch_weight_hashes.py`, which downloads each published checkpoint once and hashes it.
 
 | File | Size | SHA-256 | Destination | Notes |
 |:---|---:|:---|:---|:---|

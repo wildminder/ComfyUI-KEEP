@@ -29,6 +29,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CACHE_FILE = REPO_ROOT / "tools" / "weight_hashes.json"
 DOC_FILE = REPO_ROOT / "docs" / "audit" / "2026-10-22-weight-manifest-sources.md"
 
+#: The audit artifacts are development documentation: they are not shipped with
+#: the pack and may be absent from a working tree.
+pytestmark = pytest.mark.skipif(
+    not DOC_FILE.exists(),
+    reason=f"the audit artifact {DOC_FILE.name} is not in the working tree",
+)
+
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 

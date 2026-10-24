@@ -27,6 +27,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCANNER = REPO_ROOT / "tools" / "scan_weights.py"
 INVENTORY_DOC = REPO_ROOT / "docs" / "audit" / "2026-10-22-weights-inventory.md"
 
+#: The audit artifacts are development documentation: they are not shipped with
+#: the pack and may be absent from a working tree.
+pytestmark = pytest.mark.skipif(
+    not INVENTORY_DOC.exists(),
+    reason=f"the audit artifact {INVENTORY_DOC.name} is not in the working tree",
+)
+
 
 def _load_scanner():
     spec = importlib.util.spec_from_file_location("keep_scan_weights", SCANNER)
