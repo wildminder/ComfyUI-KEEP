@@ -515,7 +515,8 @@ def test_importing_the_package_does_not_change_sys_path():
 
 
 # ---------------------------------------------------------------------------
-# P2.6 - requirements.txt is the true runtime set
+# P2.6 -> the host-guarantee policy: requirements.txt is the set the host
+# does **not** provide
 # ---------------------------------------------------------------------------
 
 #: The third-party module names of the closure -> their **distribution** name.
@@ -524,14 +525,34 @@ def test_importing_the_package_does_not_change_sys_path():
 #: ``numpy`` -> ``numpy``, ...).
 #:
 #: This map is a **rename** map, not an allowlist: a module that is not in it
-#: is *not* dropped, it is mapped to its own name - and therefore shows up as
-#: an undeclared dependency (that was the hole of the first version of this
-#: guard: it filtered the imports through this map, so every module outside
-#: of it was silently ignored).
+#: is *not* dropped, it is mapped to its own name - and therefore has to be
+#: covered by the declared set or by the host (that was the hole of the first
+#: version of this guard: it filtered the imports through this map, so every
+#: module outside of it was silently ignored).  ``cv2`` maps to the headless
+#: wheel: no GUI function is called anywhere in the closure and the pack is
+#: server-side.
 _DISTRIBUTIONS = {
-    "cv2": "opencv-python",
+    "cv2": "opencv-python-headless",
     "PIL": "Pillow",
     "yaml": "pyyaml",
+}
+
+#: The distributions the **ComfyUI host** guarantees (the host's own
+#: ``requirements.txt``) - the pack declares none of them, but they still
+#: cover their share of the closure imports.  The value is the line of the
+#: host's requirements.txt that ships the distribution: when the host drops
+#: one, the failing test names the line that disappeared and the fix is a
+#: one-set edit (move the distribution into ``_EXPECTED_REQUIREMENTS``).
+_HOST_PROVIDED = {
+    "torch": "torch",
+    "torchvision": "torchvision",
+    "numpy": "numpy>=1.25.0",
+    "Pillow": "Pillow>=10.1.0",
+    "einops": "einops",
+    "scipy": "scipy",
+    "tqdm": "tqdm",
+    "pyyaml": "pyyaml",
+    "requests": "requests",
 }
 
 #: The modules the **ComfyUI host** provides - they are not dependencies of
@@ -574,20 +595,9 @@ _OPTIONAL_LAZY_IMPORTS = {
     ),
 }
 
-#: The dependency set of the pruned closure (plan P2.6 + the two packages the
-#: plan's list missed - see ``.dev/docs/audit/2026-10-23-p2-vendored-repair.md``).
-_EXPECTED_REQUIREMENTS = {
-    "torch",
-    "torchvision",
-    "numpy",
-    "opencv-python",
-    "Pillow",
-    "einops",
-    "scipy",
-    "tqdm",
-    "pyyaml",
-    "requests",
-}
+#: The declared set (the host-guarantee policy): the only runtime dependency
+#: the ComfyUI host does not already provide.
+_EXPECTED_REQUIREMENTS = {"opencv-python-headless"}
 
 
 def _requirement_entries():
@@ -696,7 +706,12 @@ def _closure_third_party_imports() -> tuple[set[str], set[str]]:
 
 @pytest.mark.unit
 def test_the_requirements_are_the_true_runtime_set():
-    """P2.6: ``requirements.txt`` lists exactly the runtime dependencies."""
+    """``requirements.txt`` lists exactly what the host does not provide.
+
+    The host-guarantee policy: the pack declares only the dependency the
+    ComfyUI host does not ship (OpenCV, headless wheel) - everything else
+    the closure imports comes from the host (``_HOST_PROVIDED``).
+    """
     entries = _requirement_entries()
     assert entries == _EXPECTED_REQUIREMENTS, sorted(entries)
     for phantom in PHANTOM_PACKAGES:
@@ -713,23 +728,25 @@ def test_no_phantom_package_is_imported_in_the_closure():
 
 @pytest.mark.unit
 def test_every_third_party_import_of_the_closure_is_declared():
-    """P2.6: every third-party import of the closure is a declared dependency.
+    """Every third-party import of the closure is declared or host-provided.
 
     The check is **exhaustive**: every third-party module the closure
     imports at import time is mapped to a distribution name (identity,
     unless ``_DISTRIBUTIONS`` says otherwise) and that distribution has to
-    be declared in ``requirements.txt``.  A module that is not in
-    ``_DISTRIBUTIONS`` is therefore *not* dropped - it shows up as an
-    undeclared dependency.
+    be covered by the policy - declared in ``requirements.txt`` **or**
+    shipped by the ComfyUI host (``_HOST_PROVIDED``).  A module covered by
+    neither fails the test, so a new dependency cannot slip through
+    unnoticed; a distribution the closure no longer imports shows up as
+    stale and forces a one-set edit of the policy.
     """
     module_level, _lazy = _closure_third_party_imports()
-    entries = _requirement_entries()
-    declared = {_DISTRIBUTIONS.get(name, name) for name in module_level}
-    assert declared == entries, (
-        f"the closure imports {sorted(declared)} at import time, "
-        f"requirements.txt declares {sorted(entries)}; "
-        f"undeclared: {sorted(declared - entries)}; "
-        f"declared but unused: {sorted(entries - declared)}"
+    imported = {_DISTRIBUTIONS.get(name, name) for name in module_level}
+    covered = _EXPECTED_REQUIREMENTS | set(_HOST_PROVIDED)
+    assert imported == covered, (
+        f"the closure imports {sorted(imported)} at import time, the policy "
+        f"covers {sorted(covered)} (declared + host-provided); "
+        f"uncovered: {sorted(imported - covered)}; "
+        f"stale (covered but not imported): {sorted(covered - imported)}"
     )
 
 

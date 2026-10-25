@@ -4,9 +4,18 @@ description = "Kalman-Inspired Feature Propagation for Video Face Super-Resoluti
 version = "2.0.0"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
-# The true runtime set of the pack (P2.6) - it is derived from the pruned
-# runtime closure of the vendored tree and matches requirements.txt.
-dependencies = ["torch", "torchvision", "numpy", "opencv-python", "Pillow", "einops", "scipy", "tqdm", "pyyaml", "requests"]
+# The declared runtime set (host-guarantee policy): the pack declares only
+# what the ComfyUI host does not already provide.  The host's own
+# requirements.txt ships torch, torchvision, numpy, einops, pyyaml, Pillow,
+# scipy, tqdm and requests, so none of them is repeated here - the pack
+# reports progress through the ComfyUI execution API instead of tqdm, and
+# its single scipy call (gaussian_filter1d) became a torch-native smoothing.
+# OpenCV is the one image dependency the host does not ship, and the
+# vendored architectures plus the LANCZOS4 resizes of the processor still
+# need cv2 - the headless wheel covers the whole closure (no GUI function
+# is called anywhere in the pack or the vendored tree) without dragging
+# the libGL/Qt stack into a server-side install.  Matches requirements.txt.
+dependencies = ["opencv-python-headless"]
 
 # The test-only dependencies.  ``tomli`` is the ``tomllib`` parser of
 # Python 3.10 (the minimum of ``requires-python``) - the metadata test

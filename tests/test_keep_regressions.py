@@ -23,7 +23,8 @@ D5       only the selected face detector is downloaded
 The file also carries the two **behavioural** regressions that close the
 loops of the batches (the yaml of the owner is honoured end to end; the log
 line of the pack carries the tag) and the invariants of the repository (the
-vendored tree is read-only, the runtime dependencies did not change).
+vendored tree is read-only; the runtime dependencies stay the slimmed
+host-guarantee set - both files declare ``opencv-python-headless`` only).
 
 The guards scan the **sources of the pack** (``src/``, ``nodes/`` and the
 package entry point).  The vendored tree (``modules/deps``) is upstream code
@@ -533,22 +534,52 @@ def test_the_calls_into_the_vendored_tree_are_wrapped_in_the_capture():
         )
 
 
+#: The V1 progress bar of the host is allowed in exactly one surface: the
+#: guarded download-progress factory of the downloader (its lazy import) and
+#: the one-step report of a finished download.  Every other use - in
+#: particular the processing loop - must go through the V3 execution API
+#: (``src/keep_progress.py``).
+DOWNLOAD_BAR_FUNCTIONS = ("_host_progress_bar", "_report_download_done")
+
+
+def _progressbar_offenders(path: Path) -> list[tuple[str, int]]:
+    """The ProgressBar references outside the one allowed download surface."""
+    tree = _tree(path)
+    allowed: list[tuple[int, int]] = []
+    if path.name == "keep_download.py":
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                node.name in DOWNLOAD_BAR_FUNCTIONS
+            ):
+                allowed.append((node.lineno, node.end_lineno))
+    offenders = []
+    for node in ast.walk(tree):
+        referenced = (
+            isinstance(node, ast.Attribute) and node.attr == "ProgressBar"
+        ) or (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name == "ProgressBar" for alias in node.names)
+        )
+        if referenced and not any(
+            low <= node.lineno <= high for low, high in allowed
+        ):
+            offenders.append((path.name, node.lineno))
+    return offenders
+
+
 @pytest.mark.unit
 def test_the_progress_of_the_pack_goes_through_the_comfy_api():
-    """The pack does not use the V1 progress bar any more.
+    """The pack reports progress through the V3 execution API.
 
-    The progress bar of ``comfy.utils`` writes to the console of the host
-    without the tag of the pack.
+    The V1 progress bar of ``comfy.utils`` writes to the console of the host
+    without the tag of the pack - the processing loop must not touch it.  The
+    one allowed surface is the guarded download bar of the downloader
+    (``DOWNLOAD_BAR_FUNCTIONS``): one step per weight file, on the bar the
+    host supplies during prompt execution.
     """
-    offenders = []
-    for path in PACK_SOURCES:
-        for node in ast.walk(_tree(path)):
-            if isinstance(node, ast.Attribute) and node.attr == "ProgressBar":
-                offenders.append((path.name, node.lineno))
-            elif isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    if alias.name == "ProgressBar":
-                        offenders.append((path.name, node.lineno))
+    offenders = [
+        offender for path in PACK_SOURCES for offender in _progressbar_offenders(path)
+    ]
     assert offenders == [], offenders
 
 
@@ -646,13 +677,15 @@ def test_the_vendored_tree_is_untouched():
 
 
 @pytest.mark.unit
-def test_the_runtime_dependencies_agree_and_keep_tqdm():
-    """No dependency was added - and ``tqdm`` stays.
+def test_the_runtime_dependencies_agree_on_the_slimmed_set():
+    """``requirements.txt`` and ``pyproject.toml`` agree - on the slimmed set.
 
-    ``requirements.txt`` and the ``dependencies`` of ``pyproject.toml`` are
-    the runtime closure of the pack and must not drift apart.  ``tqdm``
-    stays: the vendored tree still imports it
-    (``modules/deps/basicsr/utils/download_util.py``).
+    The two files are the declared runtime set of the pack and must not
+    drift apart.  The host-guarantee policy declares **one** dependency -
+    ``opencv-python-headless``: the ComfyUI host ships torch, torchvision,
+    numpy, einops, pyyaml, Pillow, scipy, tqdm and requests itself (its own
+    requirements.txt), and ``tqdm`` in particular is gone from the pack's
+    own code (the progress is reported through the ComfyUI execution API).
     """
     requirements = set()
     for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
@@ -676,7 +709,7 @@ def test_the_runtime_dependencies_agree_and_keep_tqdm():
         declared.add(requirement.split(";")[0].split("[")[0].strip())
 
     assert requirements == declared, (sorted(requirements), sorted(declared))
-    assert "tqdm" in requirements, sorted(requirements)
+    assert requirements == {"opencv-python-headless"}, sorted(requirements)
 
 
 # ---------------------------------------------------------------------------

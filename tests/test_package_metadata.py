@@ -3,7 +3,8 @@
 ``pyproject.toml`` is the metadata the ComfyUI Registry reads.  The test
 parses it with ``tomllib`` (the standard library since Python 3.11) and
 asserts that the metadata is complete and that the dependency list is the
-true runtime set of P2.6 (``requirements.txt``).
+true runtime set of P2.6 (``requirements.txt``) - under the host-guarantee
+policy that set is the one dependency the ComfyUI host does not ship.
 
 The parser import is **guarded**: the pack supports Python 3.10
 (``requires-python = ">=3.10"``), where ``tomllib`` does not exist.  The
@@ -176,3 +177,15 @@ def test_the_dependencies_are_the_true_runtime_set(pyproject):
     assert declared == _requirement_entries(), sorted(
         declared ^ _requirement_entries()
     )
+
+
+@pytest.mark.unit
+def test_the_declared_set_is_the_slimmed_set(pyproject):
+    """The host-guarantee policy: the pack declares ``opencv-python-headless``.
+
+    The host's own requirements.txt ships torch, torchvision, numpy, einops,
+    pyyaml, Pillow, scipy, tqdm and requests - the pack declares only the one
+    image dependency the host does not provide (OpenCV, headless wheel).
+    """
+    declared = set(pyproject["project"]["dependencies"])
+    assert declared == {"opencv-python-headless"}, sorted(declared)

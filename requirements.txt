@@ -1,25 +1,30 @@
-# ComfyUI-KEEP - true runtime dependency set (P2.6)
+# ComfyUI-KEEP - declared runtime dependency set (host-guarantee policy)
 #
-# Derived from the pruned runtime closure of the vendored tree
-# (tools/scan_compat.py) - not from the environment it was developed in.
+# The pack declares only what the ComfyUI host does not already provide:
+# the host's own requirements.txt ships torch, torchvision, numpy, einops,
+# pyyaml, Pillow, scipy, tqdm and requests, so none of them is repeated
+# here and the pack can never pull a version that conflicts with the host
+# environment.  Of the old P2.6 list:
 #
-# torch / torchvision      - the vendored architectures and models
-# numpy / scipy            - the tensor maths of the vendored tree
-# opencv-python / Pillow   - the image conversions of the node package
-# einops                   - the tensor reshaping of the KEEP architecture
-# tqdm                     - the progress bars of the node package
-# pyyaml                   - the YOLOv5 face detector configuration
-# requests                 - the fallback download of the facelib weights
+# torch / torchvision / numpy - host core; the pack's own code uses them,
+#   the host guarantees them
+# Pillow / einops             - only the vendored tree imports them; host-shipped
+# scipy                       - host-shipped, and the pack's single call
+#   (gaussian_filter1d for the video smoothing) became a torch depthwise
+#   conv1d smoothing
+# tqdm                        - the pack reports progress through the ComfyUI
+#   execution API; the vendored tqdm imports are host-shipped
+# pyyaml                      - host-shipped (the YOLOv5 detector config and
+#   the lazy import of keep_paths stay covered)
+# requests                    - host-shipped; a phantom of the vendored
+#   download helper, the pack itself never imports it
 #
-# The phantom entries of the old list (addict, future, lmdb, scikit-image,
-# yapf, ffmpeg-python) are gone: nothing in the closure imports them.
-torch
-torchvision
-numpy
-opencv-python
-Pillow
-einops
-scipy
-tqdm
-pyyaml
-requests
+# The one entry the host does not ship:
+#
+# opencv-python-headless - the vendored architectures and the LANCZOS4
+#   resizes of the processor need cv2.  The headless wheel covers the whole
+#   closure: no GUI function (imshow/waitKey/namedWindow) is called
+#   anywhere in the pack or the vendored tree, and a server-side pack
+#   should not pull the libGL/Qt stack of the full wheel.  The CI already
+#   installs the headless wheel (.github/workflows/tests.yml).
+opencv-python-headless
