@@ -6,12 +6,11 @@ P3.2.
 """
 
 import torch
+import torch.nn.functional as F
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
-from torchvision.transforms.functional import normalize
 from .keep_console import capture_console_to_logger
-from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
+from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image, resize_bgr_u8
 from .keep_logger import logger
 from .keep_progress import ProgressReporter
 
@@ -63,6 +62,44 @@ def interpolate_sequence(sequence):
         interpolated_sequence[missing_indices] = np.interp(
             x[missing_indices], x[valid_indices], sequence[valid_indices])
     return interpolated_sequence
+
+
+def _gaussian_smooth(values: np.ndarray, sigma: float = 5.0) -> np.ndarray:
+    """Smooth a ``(frames, values)`` array along the frame axis.
+
+    The torch-native replacement of the pack's former ``gaussian_filter1d``
+    smoothing (the temporal landmark filter): the kernel is the reference
+    implementation's own formula (``exp(-x**2 / (2*sigma**2))`` normalized
+    by its sum, with the radius ``int(truncate * sigma + 0.5)`` of the
+    ``truncate=4.0`` default), the boundary extension is symmetric (the
+    reference ``mode="reflect"``) and the correlation runs as a float64
+    depthwise ``conv1d`` - one channel per value column.  The output keeps
+    the dtype of the input; the measured difference against the reference is
+    ~4e-14 in float64 (``tests/test_image_op_equivalence.py``).
+    """
+    source = np.asarray(values)
+    radius = int(4.0 * sigma + 0.5)
+    positions = torch.arange(-radius, radius + 1, dtype=torch.float64)
+    kernel = torch.exp(-(positions**2) / (2.0 * sigma**2))
+    kernel = (kernel / kernel.sum()).view(1, 1, -1)
+    # ``mode="reflect"`` of the reference == numpy ``mode="symmetric"``: the
+    # edges are mirrored with the edge value repeated.
+    padded = np.pad(source, ((radius, radius), (0, 0)), mode="symmetric")
+    signal = torch.from_numpy(padded).double().T.unsqueeze(0)
+    weight = kernel.repeat(signal.shape[1], 1, 1)
+    smoothed = F.conv1d(signal, weight, groups=signal.shape[1])
+    result = smoothed.squeeze(0).T.contiguous().numpy()
+    return result.astype(source.dtype, copy=False)
+
+
+def _gray_to_bgr(gray: np.ndarray) -> np.ndarray:
+    """A 2D image -> a 3-channel BGR image (cv2 GRAY2BGR, torch-native).
+
+    ``torch.stack`` materializes the channels (contiguous and writable) - a
+    stride-0 ``expand`` view would be read-only for the consumers downstream.
+    """
+    gray_t = torch.from_numpy(np.ascontiguousarray(gray))
+    return torch.stack((gray_t, gray_t, gray_t), dim=-1).numpy()
 
 
 class KEEPFaceProcessor:
@@ -130,14 +167,16 @@ class KEEPFaceProcessor:
                 self.face_helper.all_landmarks_5 = [avg_landmarks_list[0]]
                 self.face_helper.align_warp_face()
         else:
-            img_resized = cv2.resize(img_to_crop, (512, 512), interpolation=cv2.INTER_LINEAR)
+            img_resized = resize_bgr_u8(img_to_crop, (512, 512))
             self.face_helper.is_gray = is_gray(img_resized, threshold=10)
             self.face_helper.cropped_faces = [img_resized]
         if not self.face_helper.cropped_faces: return cv2_image_orig
         
         cropped_face_cv2 = self.face_helper.cropped_faces[0]
         cropped_face_t = img2tensor(cropped_face_cv2 / 255., bgr2rgb=True, float32=True)
-        normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+        # torchvision ``normalize`` became the equivalent in-place torch
+        # arithmetic: (t - mean) / std with mean = std = 0.5, bit-exact.
+        cropped_face_t.sub_(0.5).div_(0.5)
         cropped_face_t_list.append(cropped_face_t)
         cropped_faces_tensor = torch.stack(cropped_face_t_list, dim=0).unsqueeze(0).to(self.device)
         duplicated_input_frames = torch.cat([cropped_faces_tensor, cropped_faces_tensor], dim=1)
@@ -149,7 +188,7 @@ class KEEPFaceProcessor:
         img_for_pasting = input_img_list[0]
         self.face_helper.clean_all()
         if has_aligned:
-            img_resized = cv2.resize(img_for_pasting, (512, 512), interpolation=cv2.INTER_LINEAR)
+            img_resized = resize_bgr_u8(img_for_pasting, (512, 512))
             self.face_helper.is_gray = is_gray(img_resized, threshold=10)
         else:
             if avg_landmarks_list is None or not avg_landmarks_list: return img_for_pasting
@@ -241,7 +280,7 @@ class KEEPFaceProcessor:
                 return image_sequence_tensor 
             for i_lm_coord in range(raw_landmarks_np_video.shape[1]):
                 raw_landmarks_np_video[:, i_lm_coord] = interpolate_sequence(raw_landmarks_np_video[:, i_lm_coord])
-            avg_landmarks_sequence = gaussian_filter1d(raw_landmarks_np_video, sigma=5, axis=0).reshape(num_input_frames, 5, 2)
+            avg_landmarks_sequence = _gaussian_smooth(raw_landmarks_np_video, sigma=5.0).reshape(num_input_frames, 5, 2)
             progress.update(num_input_frames)
         else:
              progress.update(num_input_frames)
@@ -262,7 +301,7 @@ class KEEPFaceProcessor:
                     self.face_helper.all_landmarks_5 = [avg_landmarks_sequence[i]]
                     self.face_helper.align_warp_face()
                 else:
-                    img_resized = cv2.resize(img_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
+                    img_resized = resize_bgr_u8(img_bgr, (512, 512))
                     self.face_helper.is_gray = is_gray(img_resized, threshold=10)
                     self.face_helper.cropped_faces = [img_resized]
                 if not self.face_helper.cropped_faces:
@@ -270,7 +309,8 @@ class KEEPFaceProcessor:
                     continue
                 cropped_face_cv2 = self.face_helper.cropped_faces[0]
                 cropped_face_t = img2tensor(cropped_face_cv2 / 255., bgr2rgb=True, float32=True)
-                normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+                # the in-place normalize replacement (mean = std = 0.5)
+                cropped_face_t.sub_(0.5).div_(0.5)
                 all_cropped_face_tensors.append(cropped_face_t)
 
         if not all_cropped_face_tensors:
@@ -354,7 +394,7 @@ class KEEPFaceProcessor:
                         final_pasted_frame = restored_face_with_model
 
                     if len(final_pasted_frame.shape) == 2:
-                        final_pasted_frame = cv2.cvtColor(final_pasted_frame, cv2.COLOR_GRAY2BGR)
+                        final_pasted_frame = _gray_to_bgr(final_pasted_frame)
 
                 output_frames_cv2.append(final_pasted_frame)
                 progress.update(1)
