@@ -351,7 +351,6 @@ def synthetic_manifest(loader_module, configs_module, monkeypatch):
         for entry in configs_module.WEIGHT_MANIFEST
     )
     by_name = {entry.name: entry for entry in entries}
-    monkeypatch.setattr(loader_module, "WEIGHT_MANIFEST", entries)
     monkeypatch.setattr(loader_module, "WEIGHT_MANIFEST_BY_NAME", by_name)
     monkeypatch.setattr(
         loader_module,
@@ -383,7 +382,7 @@ def transport(monkeypatch):
 
 
 @pytest.fixture
-def loader(loader_module, monkeypatch, tmp_path, synthetic_manifest, transport):
+def loader(loader_module, monkeypatch, synthetic_manifest, transport):
     """A loader whose model build is stubbed out (the weights are real)."""
 
     class _StubArch:
@@ -439,9 +438,6 @@ def loader(loader_module, monkeypatch, tmp_path, synthetic_manifest, transport):
         lambda *args, **kwargs: {"params_ema": {"weight": torch.zeros(1)}},
     )
     monkeypatch.setattr(loader_module, "_face_restore_helper", lambda: _StubHelper)
-    monkeypatch.setattr(
-        loader_module.keep_paths, "resolve_model_root", lambda *args, **kwargs: str(tmp_path)
-    )
     return loader_module.KEEPModelLoader()
 
 
@@ -453,14 +449,10 @@ def test_a_missing_required_weight_triggers_a_download(loader, transport):
     assert pack.keep_net is not None
     urls = [url.rsplit("/", 1)[-1] for url in transport]
     assert "KEEP-b76feb75.pth" in urls, urls
-    for name in (
-        "detection_Resnet50_Final.pth",
-        "detection_mobilenet0.25_Final.pth",
-        "yolov5n-face.pth",
-        "yolov5l-face.pth",
-        "parsing_parsenet.pth",
-    ):
-        assert name in urls, (name, urls)
+    # D5: only the **selected** detector and the face parsing net are
+    # fetched - the other detectors of the manifest are never downloaded.
+    assert "detection_Resnet50_Final.pth" in urls, urls
+    assert "parsing_parsenet.pth" in urls, urls
 
 
 @pytest.mark.unit

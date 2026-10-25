@@ -230,6 +230,27 @@ def weight_entry_for(model_type: str) -> WeightEntry:
 #: The facelib weights (the destination of the facelib helper).
 FACELIB_DEST_FOLDER = 'facedetection'
 
+#: The face detectors of the vendored facelib helper (the V1 combo) - the
+#: **ordered** list of the widget of the model loader node.  The order and
+#: the default (``retinaface_resnet50``) are compatibility guarantees of the
+#: pack: the options of the node must not change.
+#:
+#: The mapping of a name to its weight file is **not** written down here: it
+#: is the ``MODEL_NAMES`` of the vendored helper
+#: (``modules/deps/facelib/detection/__init__.py``), so the pack and the
+#: helper can never disagree about the file of a detector.
+DETECTION_MODELS = (
+    "retinaface_resnet50",
+    "retinaface_mobile0.25",
+    "YOLOv5l",
+    "YOLOv5n",
+)
+
+#: The manifest entry of the face parsing net - the helper is built with
+#: ``use_parse=True``, so the parsing net is needed next to **every**
+#: detector (it is the only other weight the helper loads).
+PARSING_WEIGHT_NAME = "parsing_parsenet.pth"
+
 #: The facelib weights - derived from the manifest.
 FACELIB_MODEL_URLS = {
     entry.name: (entry.url, entry.sha256)

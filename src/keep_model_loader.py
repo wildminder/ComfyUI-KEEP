@@ -20,22 +20,36 @@ built net are merged into the checkpoint state dict before the strict load -
 the arch owns the flownet, so a checkpoint without those keys would otherwise
 break the build and throw the trained weights away.
 
+Since **D5** only the **selected** face detector is downloaded: the face
+helper needs the detector and the face parsing net (``use_parse=True``), and
+the other detectors of the manifest are never fetched.  The two weights must
+live in **one** root - the vendored helper builds the weight paths from a
+single root (``detection/__init__.py:53``, ``parsing/__init__.py:30``) - so
+the detector is resolved **first** (the download target then follows the root
+that already holds the pack) and a weight that lives in another root is
+**copied** there, never downloaded a second time.
+
 The ``comfy`` imports are **lazy** (function level): the plan's §3 import
 rule wants the pack to import without a ComfyUI server.  The vendored
 facelib helper imports ``comfy`` as well, so it is imported lazily too.
 """
 
+import os
+import shutil
+
 import torch
 
 from . import keep_download
 from . import keep_paths
-from .keep_logger import logger
+from .keep_console import capture_console_to_logger
+from .keep_logger import logger, tagged
 from .keep_model_configs import (
     ARCH_REGISTRY,
     FACELIB_DEST_FOLDER,
     KEEP_MODEL_CONFIGS,
-    WEIGHT_MANIFEST,
+    PARSING_WEIGHT_NAME,
     WEIGHT_MANIFEST_BY_NAME,
+    WeightEntry,
     weight_entry_for,
 )
 
@@ -69,6 +83,118 @@ def __getattr__(name: str):
     if name == "FaceRestoreHelper":
         return _face_restore_helper()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _facelib_model_names() -> dict[str, str]:
+    """The vendored ``MODEL_NAMES`` - the detector name to file name mapping.
+
+    The mapping is the one the vendored helper uses itself
+    (``modules/deps/facelib/detection/__init__.py:31``), so the pack
+    downloads exactly the file the helper loads - a second table would
+    drift.
+
+    The import is **lazy**: the vendored module pulls ``requests`` and
+    ``torch.hub`` (through ``modules/deps/basicsr/utils/download_util.py``)
+    and must stay out of the import path of the pack.
+    """
+    try:  # the package import (the node package is the parent package)
+        from ..modules.deps.facelib.detection import MODEL_NAMES
+    except ImportError:  # the flat import (the repository root on sys.path)
+        from modules.deps.facelib.detection import MODEL_NAMES
+    return dict(MODEL_NAMES)
+
+
+def detection_weight_entry(model_name: str) -> WeightEntry:
+    """The manifest entry of the selected face detector.
+
+    An unsupported name raises a ``ValueError`` that names the supported
+    detectors - the selection is validated **before** anything is
+    downloaded.
+    """
+    names = _facelib_model_names()
+    if model_name not in names:
+        supported = ", ".join(sorted(names))
+        raise ValueError(
+            tagged(
+                f"unknown face detector {model_name!r} - the supported "
+                f"detectors are: {supported}"
+            )
+        )
+
+    file_name = names[model_name]
+    entry = WEIGHT_MANIFEST_BY_NAME.get(file_name)
+    if entry is None:
+        raise ValueError(
+            tagged(
+                f"the face detector {model_name!r} needs the weight "
+                f"{file_name!r}, which is not in the manifest"
+            )
+        )
+    if entry.dest_folder != FACELIB_DEST_FOLDER:
+        raise ValueError(
+            tagged(
+                f"the weight {file_name!r} of the face detector "
+                f"{model_name!r} does not live in the {FACELIB_DEST_FOLDER!r} "
+                "folder"
+            )
+        )
+    return entry
+
+
+def facelib_weight_entries(detection_model: str) -> tuple[WeightEntry, WeightEntry]:
+    """The weights the face helper needs - the detector and the parsing net.
+
+    The helper is built with ``use_parse=True``, so the face parsing net is
+    needed next to **every** detector; the other detectors of the manifest
+    are never downloaded.
+    """
+    detector = detection_weight_entry(detection_model)
+
+    parsing = WEIGHT_MANIFEST_BY_NAME.get(PARSING_WEIGHT_NAME)
+    if parsing is None:
+        raise ValueError(
+            tagged(
+                f"the face parsing net {PARSING_WEIGHT_NAME!r} is not in the "
+                "manifest"
+            )
+        )
+    return detector, parsing
+
+
+def co_locate_facelib_weights(
+    detector_path: str,
+    parsing_entry: WeightEntry,
+    parsing_path: str,
+) -> str:
+    """Put the weights of the face helper into **one** root.
+
+    The vendored helper builds the weight paths from a **single** root
+    (``os.path.join(model_rootpath, file)`` - ``detection/__init__.py:53``,
+    ``parsing/__init__.py:30``), so the detector and the parsing net must
+    live side by side.
+
+    The root of the **selected detector** is the target: a weight that lives
+    in another root is **copied** (``shutil.copy2`` - no network, no second
+    download of an 85 MB file) and the copy is logged.  The root the weights
+    were co-located in is returned; the loader resolves the root of the
+    helper through :mod:`src.keep_paths` (the registered root that holds
+    both weights).
+    """
+    target_root = os.path.dirname(detector_path)
+    source_root = os.path.dirname(parsing_path)
+    if os.path.normcase(os.path.abspath(source_root)) == os.path.normcase(
+        os.path.abspath(target_root)
+    ):
+        return target_root
+
+    target = os.path.join(target_root, parsing_entry.relative_path)
+    os.makedirs(os.path.dirname(target) or target_root, exist_ok=True)
+    shutil.copy2(parsing_path, target)
+    logger.info(
+        f"the face parsing net was copied from {parsing_path} to {target} - "
+        "the face helper loads its weights from a single root"
+    )
+    return target_root
 
 
 def _build_patchers(keep_net, face_helper, device, offload_device) -> dict:
@@ -240,7 +366,7 @@ class KEEPModelPack:
         try:
             model.to(offload_device)
         except Exception as exc:  # noqa: BLE001 - the offload must not raise
-            logger.debug(f"KEEP: a model could not be offloaded ({exc})")
+            logger.debug(f"a model could not be offloaded ({exc})")
 
     def ensure_flow(self) -> bool:
         """Make sure the optical flow net of the KEEP net has **trained** weights.
@@ -277,7 +403,7 @@ class KEEPModelPack:
         path = self.flownet_path or keep_download.ensure_optional(entry)
         if path is None:
             logger.warning(
-                f"KEEP: the optical flow weights ({entry.name}) could not be "
+                f"the optical flow weights ({entry.name}) could not be "
                 "resolved - the flow net keeps its initial weights. Download "
                 f"the file to {keep_download.target_path(entry)} and run again."
             )
@@ -330,6 +456,10 @@ class KEEPModelLoader:
 
         config_entry = KEEP_MODEL_CONFIGS[model_type_str]
 
+        # D5 / AC-12: the selection is validated **before** anything is
+        # downloaded - an unsupported detector names the supported ones.
+        detector_entry, parsing_entry = facelib_weight_entries(detection_model_str)
+
         # P5.3: fail fast.  Every weight the pack needs is resolved (and
         # downloaded when it is missing) **before** the model is built.  A
         # missing required weight raises a FileNotFoundError that names the
@@ -337,12 +467,26 @@ class KEEPModelLoader:
         weight_entry = weight_entry_for(model_type_str)
         ckpt_path = self._resolve_checkpoint(weight_entry)
 
-        facelib_entries = [
-            entry for entry in WEIGHT_MANIFEST
-            if entry.dest_folder == FACELIB_DEST_FOLDER
-        ]
-        for entry in facelib_entries:
-            keep_download.ensure_required(entry)
+        # D5: only the **selected** detector and the face parsing net are
+        # downloaded - the other detectors of the manifest are never
+        # fetched.  The detector is resolved **first**: the download target
+        # follows the root that already holds the pack, so the parsing net
+        # lands next to it.
+        detector_path = keep_download.ensure_required(detector_entry)
+        parsing_path = keep_download.ensure_required(parsing_entry)
+
+        # AC-4: the helper loads its weights from a **single** root - the
+        # two weights are co-located there (a copy, never a second download)
+        co_locate_facelib_weights(
+            detector_path, parsing_entry, parsing_path
+        )
+
+        # the root the helper loads its weights from - it is the root that
+        # holds **both** of them (the primary root is the fallback)
+        facelib_root = keep_paths.resolve_model_root(
+            FACELIB_DEST_FOLDER,
+            [detector_entry.relative_path, parsing_entry.relative_path],
+        )
 
         keep_model_arch_class = ARCH_REGISTRY.get('KEEP')
         if keep_model_arch_class is None:
@@ -373,7 +517,7 @@ class KEEPModelLoader:
             architecture['flownet_path'] = flownet_path
             if flownet_path is None:
                 logger.warning(
-                    "KEEP: the checkpoint does not carry the flownet weights "
+                    "the checkpoint does not carry the flownet weights "
                     "and the GMFlow checkpoint could not be resolved - the flow "
                     "net keeps its initial weights."
                 )
@@ -410,7 +554,7 @@ class KEEPModelLoader:
                 # missing tensors are not trained (the arch was built without
                 # the GMFlow file).  That is not silent.
                 logger.warning(
-                    "KEEP: the checkpoint carries only part of the flownet "
+                    "the checkpoint carries only part of the flownet "
                     f"weights ({len(missing_flownet)} of "
                     f"{len(flownet_state)} tensors are missing) - the missing "
                     "ones come from the built net"
@@ -418,7 +562,7 @@ class KEEPModelLoader:
             for key in missing_flownet:
                 state_dict[key] = flownet_state[key]
             logger.debug(
-                f"KEEP: {len(missing_flownet)} flownet tensors were taken from "
+                f"{len(missing_flownet)} flownet tensors were taken from "
                 "the built net (the GMFlow checkpoint)"
             )
 
@@ -426,21 +570,17 @@ class KEEPModelLoader:
         net.eval()
         logger.debug(f"KEEP model '{model_type_str}' loaded onto {self.offload_device}.")
 
-        # P3.5: the facelib root comes from the registered model folders -
-        # the raw ``folder_paths.models_dir`` concatenation is gone.  It is
-        # the root the facelib weights really live in (an extra model root
-        # included), because facelib builds the weight paths from it.
-        facelib_actual_paths = keep_paths.resolve_model_root(
-            FACELIB_DEST_FOLDER, [entry.name for entry in facelib_entries]
-        )
-
+        # D4: the vendored helper prints to the console while it is built
+        # (the model paths, the fused layers) - the writes of this thread
+        # are routed to the logger of the pack, so they carry the tag.
         FaceRestoreHelper = _face_restore_helper()
         try:
-            face_helper = FaceRestoreHelper(
-                upscale_factor=1, face_size=512, crop_ratio=(1, 1),
-                det_model=detection_model_str, save_ext='png', use_parse=True, device=self.offload_device,
-                model_rootpath=facelib_actual_paths
-            )
+            with capture_console_to_logger():
+                face_helper = FaceRestoreHelper(
+                    upscale_factor=1, face_size=512, crop_ratio=(1, 1),
+                    det_model=detection_model_str, save_ext='png', use_parse=True,
+                    device=self.offload_device, model_rootpath=facelib_root
+                )
         except Exception as e:
             logger.error(f"Error initializing FaceRestoreHelper: {e}")
             raise
@@ -474,10 +614,12 @@ class KEEPModelLoader:
         path = keep_download.ensure_weight(weight_entry)
         if path is None:
             raise FileNotFoundError(
-                f"KEEP: the model needs the weight {weight_entry.name!r}, which "
-                "is not published upstream (HTTP 404).\n"
-                f"  url:  {weight_entry.url}\n"
-                f"  dest: {keep_download.target_path(weight_entry)}\n"
-                "Place the file manually at the destination and try again."
+                tagged(
+                    f"the model needs the weight {weight_entry.name!r}, which "
+                    "is not published upstream (HTTP 404).\n"
+                    f"  url:  {weight_entry.url}\n"
+                    f"  dest: {keep_download.target_path(weight_entry)}\n"
+                    "Place the file manually at the destination and try again."
+                )
             )
         return path

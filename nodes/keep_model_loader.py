@@ -13,21 +13,13 @@ module (the repository root on ``sys.path``).
 from comfy_api.latest import io
 
 try:  # the package import (ComfyUI loads the node package)
-    from ..src.keep_model_configs import KEEP_MODEL_CONFIGS
+    from ..src.keep_model_configs import DETECTION_MODELS, KEEP_MODEL_CONFIGS
     from ..src.keep_model_loader import KEEPModelLoader
 except ImportError:  # the flat import (the repository root on sys.path)
-    from src.keep_model_configs import KEEP_MODEL_CONFIGS
+    from src.keep_model_configs import DETECTION_MODELS, KEEP_MODEL_CONFIGS
     from src.keep_model_loader import KEEPModelLoader
 
 GLOBAL_KEEP_MODEL_LOADER = None
-
-#: The face detectors of the vendored facelib helper (the V1 combo).
-DETECTION_MODELS = [
-    "retinaface_resnet50",
-    "retinaface_mobile0.25",
-    "YOLOv5l",
-    "YOLOv5n",
-]
 
 
 def get_keep_model_loader():
