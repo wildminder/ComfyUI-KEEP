@@ -497,6 +497,44 @@ def test_the_explicit_keys_are_read_by_the_loader_of_the_host(
 
 
 @pytest.mark.unit
+def test_the_loader_of_the_host_does_not_repeat_its_own_block(
+    keep_paths, mock_folder_paths, tmp_path, monkeypatch, caplog
+):
+    """The host logged the block of the yaml at its startup.
+
+    The pack asks the host to read the file again (it needs the explicit
+    keys), but it must not print the block of the host a second time.
+    """
+    import logging
+
+    calls: list[str] = []
+    package = types.ModuleType("utils")
+    package.__path__ = []  # type: ignore[attr-defined]
+    module = types.ModuleType("utils.extra_config")
+
+    def load_extra_path_config(yaml_path):
+        calls.append(yaml_path)
+        logging.info(f"Adding extra search path keep_models {yaml_path}")
+
+    module.load_extra_path_config = load_extra_path_config  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "utils", package)
+    monkeypatch.setitem(sys.modules, "utils.extra_config", module)
+    yaml_path = _write_yaml(
+        tmp_path / "extra_model_paths.yaml", _owner_yaml(str(tmp_path))
+    )
+
+    with caplog.at_level(logging.INFO):
+        keep_paths.apply_extra_model_paths(yaml_path)
+
+    assert calls == [yaml_path], calls
+    assert not [
+        record
+        for record in caplog.records
+        if "Adding extra search path" in record.getMessage()
+    ], [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.unit
 def test_the_yaml_of_the_command_line_is_read_too(
     keep_paths, mock_folder_paths, tmp_path, monkeypatch
 ):

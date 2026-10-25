@@ -31,6 +31,7 @@ sha256-verified) - the helper that used to live here is gone.
 
 from __future__ import annotations
 
+import logging
 import os
 
 try:  # ComfyUI provides the top-level ``folder_paths`` module
@@ -172,11 +173,18 @@ def _apply_explicit_keys(yaml_path: str) -> None:
         return
 
     snapshot = _snapshot_registry(registry)
+    root = logging.getLogger()
+    level = root.level
     try:
+        # The loader of the host logs one line per yaml entry ("Adding extra
+        # search path ...").  The host already printed that block at its
+        # startup, so the pack does not repeat it on the console.
+        root.setLevel(logging.WARNING)
         load_extra_path_config(yaml_path)
     except Exception as exc:  # noqa: BLE001 - a broken yaml is not an error
         logger.debug(f"the extra model paths of {yaml_path} are unreadable: {exc}")
     finally:
+        root.setLevel(level)
         _restore_registry(registry, snapshot, set(MODEL_FOLDERS))
 
 
