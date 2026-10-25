@@ -366,6 +366,39 @@ def test_the_weights_stay_where_they_are_when_they_share_a_root(
     assert _facelib_downloads(transport) == [], _downloaded(transport)
 
 
+@pytest.mark.unit
+def test_the_co_location_never_overwrites_a_file_of_the_user(
+    loader, transport, mock_folder_paths, tmp_path
+):
+    """A parsing net that is already in the root of the detector is kept.
+
+    The co-location must not overwrite a file of the user silently: a file
+    that does not match the manifest is kept as a backup.
+    """
+    primary_root = tmp_path / "models" / "facedetection"
+    primary_root.mkdir(parents=True, exist_ok=True)
+    (primary_root / "parsing_parsenet.pth").write_bytes(PAYLOAD)
+
+    extra_root = tmp_path / "extra" / "facedetection"
+    extra_root.mkdir(parents=True)
+    (extra_root / "detection_Resnet50_Final.pth").write_bytes(PAYLOAD)
+    user_file = extra_root / "parsing_parsenet.pth"
+    user_file.write_bytes(b"the user's own parsing net")
+
+    mock_folder_paths.add_model_folder_path(
+        "facedetection", str(extra_root), is_default=False
+    )
+
+    loader.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    # the file of the user is kept as a backup ...
+    backup = extra_root / "parsing_parsenet.pth.bak"
+    assert backup.is_file(), sorted(p.name for p in extra_root.iterdir())
+    assert backup.read_bytes() == b"the user's own parsing net"
+    # ... and the verified file is in place
+    assert user_file.read_bytes() == PAYLOAD
+
+
 # ---------------------------------------------------------------------------
 # D4 - the console writes of the vendored helper reach the logger
 # ---------------------------------------------------------------------------

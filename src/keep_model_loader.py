@@ -161,6 +161,17 @@ def facelib_weight_entries(detection_model: str) -> tuple[WeightEntry, WeightEnt
     return detector, parsing
 
 
+def _backup_path(path: str) -> str:
+    """A backup name for a file that does not exist yet."""
+    base = path + ".bak"
+    if not os.path.exists(base):
+        return base
+    index = 1
+    while os.path.exists(f"{base}.{index}"):
+        index += 1
+    return f"{base}.{index}"
+
+
 def co_locate_facelib_weights(
     detector_path: str,
     parsing_entry: WeightEntry,
@@ -189,6 +200,19 @@ def co_locate_facelib_weights(
 
     target = os.path.join(target_root, parsing_entry.relative_path)
     os.makedirs(os.path.dirname(target) or target_root, exist_ok=True)
+    if os.path.isfile(target):
+        # the target exists: it is never overwritten blindly
+        if keep_download.verify(parsing_entry, target):
+            logger.debug(f"the face parsing net is already in place ({target})")
+            return target_root
+        # the file does not match the manifest: it is kept as a backup, so
+        # nothing of the user is lost
+        backup = _backup_path(target)
+        os.replace(target, backup)
+        logger.warning(
+            f"the face parsing net {target} does not match the manifest - it "
+            f"is kept as {backup} and replaced by the verified file"
+        )
     shutil.copy2(parsing_path, target)
     logger.info(
         f"the face parsing net was copied from {parsing_path} to {target} - "

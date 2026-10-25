@@ -16,8 +16,12 @@ The rules are:
   fresh installation;
 * the on-disk layout is the **legacy** one (``models/keep_models/KEEP``,
   ``models/facedetection``, ``models/gmflow``);
-* a downloaded file is verified against the sha256 of the manifest - a mismatch
-  deletes the file and downloads it **once** more;
+* a downloaded file is verified against the sha256 of the manifest before it is
+  put in place - the transport writes into a temporary file, so a failed or
+  wrong download never destroys what was there;
+* a file that does not match the manifest is only replaced when the pack owns
+  it (the primary root of the installation); a file of an **extra** model root
+  belongs to the user and is never deleted;
 * a file whose manifest entry carries **no** hash (the Asian checkpoint, which
   is not published upstream) is downloaded **without** a verification, and the
   downloader says so loudly;
@@ -44,6 +48,10 @@ from .keep_model_configs import WEIGHT_MANIFEST, WeightEntry
 #: The names of the entries that were already reported as "no hash" - the
 #: warning is loud, but it must not be repeated for every call.
 _WARNED_UNVERIFIED: set[str] = set()
+
+#: The suffix of the temporary file of a download: the transport writes into
+#: it and the file is only put in place after it was verified.
+PART_SUFFIX = ".part"
 
 
 def sha256_of(path: str) -> str:
@@ -79,6 +87,38 @@ def target_path(entry: WeightEntry) -> str:
 def find_weight(entry: WeightEntry) -> str | None:
     """An **existing** file of the entry (any registered root, primary first)."""
     return keep_paths.find_model_file(entry.dest_folder, entry.name, entry.subdir)
+
+
+def _primary_target(entry: WeightEntry) -> str:
+    """The destination of the weight in the **primary** root of the pack."""
+    try:
+        root = keep_paths.get_primary_folder(entry.dest_folder)
+    except FileNotFoundError:
+        return target_path(entry)
+    target = os.path.join(
+        root, keep_paths.model_relative_path(entry.name, entry.subdir)
+    )
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    return target
+
+
+def _is_in_primary_root(entry: WeightEntry, path: str) -> bool:
+    """Does the path live in the primary root of the pack?
+
+    The primary root belongs to the installation - the pack owns the files
+    there.  A file in an **extra** model root belongs to the user: the pack
+    never deletes it.
+    """
+    try:
+        root = keep_paths.get_primary_folder(entry.dest_folder)
+    except FileNotFoundError:
+        return False
+    root = os.path.normcase(os.path.abspath(root))
+    path = os.path.normcase(os.path.abspath(path))
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:  # a different drive (Windows)
+        return False
 
 
 def verify(entry: WeightEntry, path: str) -> bool:
@@ -128,12 +168,36 @@ def _fetch(entry: WeightEntry, target: str) -> None:
     download_url_to_file(entry.url, target, hash_prefix=None, progress=False)
 
 
+def _place(part: str, target: str) -> None:
+    """Put the verified file in place (the old file is replaced atomically)."""
+    try:
+        os.replace(part, target)
+    except OSError as exc:
+        # the target is held by another process (Windows) - the verified file
+        # stays where it is, so nothing is lost
+        raise FileNotFoundError(
+            tagged(
+                f"the verified file could not be put in place at {target}: {exc}\n"
+                f"  the file is at {part} - move it into place manually."
+            )
+        ) from exc
+
+
 def download_weight(entry: WeightEntry, progress: bool = True) -> str:
     """Download the entry to its destination and verify it.
 
     ``progress`` is **inert**: the transport is always called without its own
     (untagged) progress bar.  The parameter stays in the signature because the
     callers of the pack pass it.
+
+    The download is **atomic**: the transport writes into a temporary file and
+    the file is only put in place after it was verified.  A failed download
+    therefore never destroys what was there.
+
+    A file that does not match the manifest is only replaced when the pack
+    **owns** it (the primary root of the installation).  A file in an extra
+    model root belongs to the user: it is never deleted - the verified file is
+    downloaded into the primary root instead.
 
     Returns the path of the downloaded file.  Raises ``FileNotFoundError`` when
     the download fails (the message names the URL and the destination) and
@@ -149,18 +213,32 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
                 _warn_unverified(entry)
             logger.debug(f"{entry.name} is already present ({existing})")
             return existing
-        logger.warning(
-            f"the sha256 of {existing} does not match the manifest - the "
-            "file is deleted and downloaded again"
-        )
-        _remove_partials(existing)
+        if _is_in_primary_root(entry, existing):
+            # the pack owns the file (its own installation): it is replaced
+            # by the verified download
+            logger.warning(
+                f"the sha256 of {existing} does not match the manifest - the "
+                "file is replaced by a verified download"
+            )
+            target = existing
+        else:
+            # the file belongs to the user (an extra model root): it is never
+            # deleted.  The verified file is downloaded into the primary root
+            # of the pack instead.
+            logger.warning(
+                f"the sha256 of {existing} does not match the manifest - the "
+                "file is kept untouched (it is not owned by the pack) and the "
+                "verified file is downloaded into the primary root"
+            )
+            target = _primary_target(entry)
 
+    part = target + PART_SUFFIX
     for attempt in (1, 2):
         logger.info(f"downloading {entry.name} from {entry.url} to {target}")
         try:
-            _fetch(entry, target)
+            _fetch(entry, part)
         except Exception as exc:  # noqa: BLE001 - the error is re-raised below
-            _remove_partials(target)
+            _remove_partials(part)
             raise FileNotFoundError(
                 tagged(
                     f"the weight {entry.name!r} could not be downloaded.\n"
@@ -173,23 +251,25 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
 
         if not entry.sha256:
             _warn_unverified(entry)
+            _place(part, target)
             return target
 
-        actual = sha256_of(target)
+        actual = sha256_of(part)
         if actual == entry.sha256:
+            _place(part, target)
             return target
 
         logger.warning(
             f"the sha256 of the downloaded {entry.name} does not match "
             f"the manifest (expected {entry.sha256}, got {actual})"
         )
-        _remove_partials(target)
+        _remove_partials(part)
         if attempt == 2:
             raise ValueError(
                 tagged(
                     f"the downloaded {entry.name!r} does not match the "
-                    f"manifest hash (expected {entry.sha256}, got {actual}) - the "
-                    f"file was deleted. url: {entry.url}, dest: {target}"
+                    f"manifest hash (expected {entry.sha256}, got {actual}) - "
+                    f"nothing was put in place. url: {entry.url}, dest: {target}"
                 )
             )
     raise AssertionError("unreachable")  # pragma: no cover

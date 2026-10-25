@@ -330,6 +330,91 @@ def test_an_entry_without_a_hash_is_downloaded_unverified_with_a_warning(
 
 
 @pytest.mark.unit
+def test_a_sha_mismatch_in_an_extra_root_never_deletes_the_file_of_the_user(
+    download_module, configs_module, monkeypatch, mock_folder_paths
+):
+    """A weight of the user (an extra model root) is never deleted.
+
+    The pack owns the files of its own installation; a weight in an extra
+    model root belongs to the user.  A file that does not match the manifest
+    is therefore kept untouched and the verified file is downloaded into the
+    primary root.
+    """
+    entry = _entry(configs_module)
+    extra = str(Path(mock_folder_paths.models_dir).parent / "extra-models")
+    os.makedirs(os.path.join(extra, "KEEP"), exist_ok=True)
+    mock_folder_paths.add_model_folder_path("keep_models", extra)
+    extra_file = os.path.join(extra, "KEEP", entry.name)
+    with open(extra_file, "wb") as handle:
+        handle.write(b"corrupted")
+
+    transport = _Transport()
+    monkeypatch.setattr(download_module, "download_url_to_file", transport)
+
+    path = download_module.ensure_required(entry)
+
+    # the file of the user is untouched
+    with open(extra_file, "rb") as handle:
+        assert handle.read() == b"corrupted"
+    # the verified file is in the primary root of the installation
+    primary = os.path.join(
+        mock_folder_paths.models_dir, "keep_models", "KEEP", entry.name
+    )
+    assert path == primary, path
+    assert download_module.sha256_of(path) == entry.sha256
+    assert transport.calls == [entry.url]
+
+
+@pytest.mark.unit
+def test_a_failed_download_keeps_the_file_of_the_user(
+    download_module, configs_module, monkeypatch, mock_folder_paths
+):
+    """A failed download destroys nothing - not in an extra root either."""
+    entry = _entry(configs_module)
+    extra = str(Path(mock_folder_paths.models_dir).parent / "extra-models")
+    os.makedirs(os.path.join(extra, "KEEP"), exist_ok=True)
+    mock_folder_paths.add_model_folder_path("keep_models", extra)
+    extra_file = os.path.join(extra, "KEEP", entry.name)
+    with open(extra_file, "wb") as handle:
+        handle.write(b"corrupted")
+
+    transport = _Transport(fail=True)
+    monkeypatch.setattr(download_module, "download_url_to_file", transport)
+
+    with pytest.raises(FileNotFoundError):
+        download_module.ensure_required(entry)
+
+    with open(extra_file, "rb") as handle:
+        assert handle.read() == b"corrupted", "the file of the user must survive"
+    # no partial file is left behind
+    assert not os.path.exists(extra_file + ".part")
+    assert not os.path.exists(extra_file + ".part.tmp")
+
+
+@pytest.mark.unit
+def test_a_failed_download_keeps_the_file_of_the_installation(
+    download_module, configs_module, monkeypatch
+):
+    """The download is atomic: the old file survives a failed download."""
+    entry = _entry(configs_module)
+    target = download_module.target_path(entry)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "wb") as handle:
+        handle.write(b"corrupted")
+
+    transport = _Transport(fail=True)
+    monkeypatch.setattr(download_module, "download_url_to_file", transport)
+
+    with pytest.raises(FileNotFoundError):
+        download_module.ensure_required(entry)
+
+    with open(target, "rb") as handle:
+        assert handle.read() == b"corrupted", "the old file must survive"
+    assert not os.path.exists(target + ".part")
+    assert not os.path.exists(target + ".part.tmp")
+
+
+@pytest.mark.unit
 def test_an_unpublished_entry_raises_an_actionable_error(
     download_module, configs_module
 ):
