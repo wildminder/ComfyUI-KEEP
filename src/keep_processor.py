@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from torchvision.transforms.functional import normalize
-from tqdm import tqdm # Import tqdm for console progress bars
+from .keep_console import capture_console_to_logger
 from .keep_image_utils import comfy_image_to_cv2, cv2_to_comfy_image
 from .keep_logger import logger
 from .keep_progress import ProgressReporter
@@ -48,7 +48,7 @@ def _soft_empty_cache() -> bool:
     try:
         from comfy import model_management  # lazy: src/ imports without ComfyUI
     except ImportError as exc:  # pragma: no cover - the nodes run inside ComfyUI
-        logger.debug(f"KEEP: the VRAM cache could not be released ({exc})")
+        logger.debug(f"the VRAM cache could not be released ({exc})")
         return False
     model_management.soft_empty_cache()
     return True
@@ -100,10 +100,13 @@ class KEEPFaceProcessor:
             raw_landmarks_list_np = []
             img_for_detection = input_img_list[0]
             self.face_helper.clean_all()
-            self.face_helper.read_image(img_for_detection)
-            num_det_faces = self.face_helper.get_face_landmarks_5(
-                only_center_face=only_center_face, resize=640, eye_dist_threshold=5,
-                only_keep_largest=True)
+            # The detection step calls into the vendored facelib: its console
+            # writes are routed to the logger of the pack (D4).
+            with capture_console_to_logger():
+                self.face_helper.read_image(img_for_detection)
+                num_det_faces = self.face_helper.get_face_landmarks_5(
+                    only_center_face=only_center_face, resize=640, eye_dist_threshold=5,
+                    only_keep_largest=True)
 
             if num_det_faces >= 1:
                 raw_landmarks_list_np.append(self.face_helper.all_landmarks_5[0].reshape((10,)))
@@ -120,9 +123,12 @@ class KEEPFaceProcessor:
         if not has_aligned:
             if avg_landmarks_list is None or not avg_landmarks_list: return img_to_crop
             self.face_helper.clean_all()
-            self.face_helper.read_image(img_to_crop)
-            self.face_helper.all_landmarks_5 = [avg_landmarks_list[0]]
-            self.face_helper.align_warp_face()
+            # The crop step calls into the vendored facelib: its console
+            # writes are routed to the logger of the pack (D4).
+            with capture_console_to_logger():
+                self.face_helper.read_image(img_to_crop)
+                self.face_helper.all_landmarks_5 = [avg_landmarks_list[0]]
+                self.face_helper.align_warp_face()
         else:
             img_resized = cv2.resize(img_to_crop, (512, 512), interpolation=cv2.INTER_LINEAR)
             self.face_helper.is_gray = is_gray(img_resized, threshold=10)
@@ -147,9 +153,10 @@ class KEEPFaceProcessor:
             self.face_helper.is_gray = is_gray(img_resized, threshold=10)
         else:
             if avg_landmarks_list is None or not avg_landmarks_list: return img_for_pasting
-            self.face_helper.read_image(img_for_pasting)
-            self.face_helper.all_landmarks_5 = [avg_landmarks_list[0]]
-            self.face_helper.align_warp_face()
+            with capture_console_to_logger():
+                self.face_helper.read_image(img_for_pasting)
+                self.face_helper.all_landmarks_5 = [avg_landmarks_list[0]]
+                self.face_helper.align_warp_face()
 
         if not restored_faces_cv2 or not restored_faces_cv2[0].any(): return cv2_image_orig
         
@@ -165,12 +172,15 @@ class KEEPFaceProcessor:
             else:
                 bg_img_final = bg_img_upscaled_by_model
 
-            self.face_helper.get_inverse_affine(None)
-            final_restored_image = self.face_helper.paste_faces_to_input_image(
-                upsample_img=bg_img_final, 
-                draw_box=draw_box, 
-                face_upsampler=self.face_upscale_model
-            )
+            # The paste step calls into the vendored facelib: its console
+            # writes are routed to the logger of the pack (D4).
+            with capture_console_to_logger():
+                self.face_helper.get_inverse_affine(None)
+                final_restored_image = self.face_helper.paste_faces_to_input_image(
+                    upsample_img=bg_img_final,
+                    draw_box=draw_box,
+                    face_upsampler=self.face_upscale_model
+                )
         else:
             final_restored_image = self.face_helper.restored_faces[0]
             if self.face_upscale_model:
@@ -210,18 +220,22 @@ class KEEPFaceProcessor:
         
         avg_landmarks_sequence = None
         if not has_aligned_frames:
+            logger.info("Detecting face landmarks")
             raw_landmarks_list_video = []
-            for i in tqdm(range(num_input_frames), desc="Detecting face landmarks"):
-                img = input_frames_bgr[i]
-                self.face_helper.clean_all()
-                self.face_helper.read_image(img)
-                num_det_faces = self.face_helper.get_face_landmarks_5(
-                    only_center_face=only_center_face, resize=640, eye_dist_threshold=5,
-                    only_keep_largest=True)
-                if num_det_faces >= 1:
-                    raw_landmarks_list_video.append(self.face_helper.all_landmarks_5[0].reshape((10,)))
-                else:
-                    raw_landmarks_list_video.append(np.array([np.nan] * 10))
+            # The detection step calls into the vendored facelib: its console
+            # writes are routed to the logger of the pack (D4).
+            with capture_console_to_logger():
+                for i in range(num_input_frames):
+                    img = input_frames_bgr[i]
+                    self.face_helper.clean_all()
+                    self.face_helper.read_image(img)
+                    num_det_faces = self.face_helper.get_face_landmarks_5(
+                        only_center_face=only_center_face, resize=640, eye_dist_threshold=5,
+                        only_keep_largest=True)
+                    if num_det_faces >= 1:
+                        raw_landmarks_list_video.append(self.face_helper.all_landmarks_5[0].reshape((10,)))
+                    else:
+                        raw_landmarks_list_video.append(np.array([np.nan] * 10))
             raw_landmarks_np_video = np.array(raw_landmarks_list_video)
             if np.all(np.isnan(raw_landmarks_np_video)):
                 return image_sequence_tensor 
@@ -233,34 +247,39 @@ class KEEPFaceProcessor:
              progress.update(num_input_frames)
 
         all_cropped_face_tensors = []
-        for i in tqdm(range(num_input_frames), desc="Cropping and aligning faces"):
-            img_bgr = input_frames_bgr[i]
-            self.face_helper.clean_all()
-            self.face_helper.read_image(img_bgr)
-            if not has_aligned_frames:
-                if avg_landmarks_sequence is None or i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
+        logger.info("Cropping and aligning faces")
+        # The crop step calls into the vendored facelib: its console writes
+        # are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            for i in range(num_input_frames):
+                img_bgr = input_frames_bgr[i]
+                self.face_helper.clean_all()
+                self.face_helper.read_image(img_bgr)
+                if not has_aligned_frames:
+                    if avg_landmarks_sequence is None or i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
+                        all_cropped_face_tensors.append(torch.zeros(3, 512, 512, dtype=torch.float32, device=self.device) * 0.5)
+                        continue
+                    self.face_helper.all_landmarks_5 = [avg_landmarks_sequence[i]]
+                    self.face_helper.align_warp_face()
+                else:
+                    img_resized = cv2.resize(img_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
+                    self.face_helper.is_gray = is_gray(img_resized, threshold=10)
+                    self.face_helper.cropped_faces = [img_resized]
+                if not self.face_helper.cropped_faces:
                     all_cropped_face_tensors.append(torch.zeros(3, 512, 512, dtype=torch.float32, device=self.device) * 0.5)
                     continue
-                self.face_helper.all_landmarks_5 = [avg_landmarks_sequence[i]]
-                self.face_helper.align_warp_face()
-            else:
-                img_resized = cv2.resize(img_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
-                self.face_helper.is_gray = is_gray(img_resized, threshold=10)
-                self.face_helper.cropped_faces = [img_resized]
-            if not self.face_helper.cropped_faces:
-                all_cropped_face_tensors.append(torch.zeros(3, 512, 512, dtype=torch.float32, device=self.device) * 0.5)
-                continue
-            cropped_face_cv2 = self.face_helper.cropped_faces[0]
-            cropped_face_t = img2tensor(cropped_face_cv2 / 255., bgr2rgb=True, float32=True)
-            normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
-            all_cropped_face_tensors.append(cropped_face_t)
+                cropped_face_cv2 = self.face_helper.cropped_faces[0]
+                cropped_face_t = img2tensor(cropped_face_cv2 / 255., bgr2rgb=True, float32=True)
+                normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+                all_cropped_face_tensors.append(cropped_face_t)
 
         if not all_cropped_face_tensors:
             return image_sequence_tensor
 
         batched_cropped_faces = torch.stack(all_cropped_face_tensors, dim=0).unsqueeze(0).to(self.device)
         temp_restored_face_tensors = []
-        for start_idx in tqdm(range(0, num_input_frames, max_clip_length), desc="Restoring faces with KEEP"):
+        logger.info("Restoring faces with KEEP")
+        for start_idx in range(0, num_input_frames, max_clip_length):
             end_idx = min(start_idx + max_clip_length, num_input_frames)
             current_clip_faces = batched_cropped_faces[:, start_idx:end_idx, ...]
             if current_clip_faces.shape[1] == 0: continue
@@ -284,57 +303,61 @@ class KEEPFaceProcessor:
         _soft_empty_cache()
 
         output_frames_cv2 = []
-        for i in tqdm(range(num_input_frames), desc="Pasting faces and finalizing frames"):
-            original_frame_bgr = input_frames_bgr[i]
-            if i >= len(all_restored_faces_cv2):
-                final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
-                output_frames_cv2.append(final_pasted_frame)
-                continue
-            restored_face_patch_cv2 = all_restored_faces_cv2[i]
-            self.face_helper.clean_all()
-            self.face_helper.read_image(original_frame_bgr)
-            self.face_helper.add_restored_face(restored_face_patch_cv2.astype('uint8'))
-
-            if not has_aligned_frames:
-                if avg_landmarks_sequence is None or i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
+        logger.info("Pasting faces and finalizing frames")
+        # The paste step calls into the vendored facelib: its console writes
+        # are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            for i in range(num_input_frames):
+                original_frame_bgr = input_frames_bgr[i]
+                if i >= len(all_restored_faces_cv2):
                     final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
                     output_frames_cv2.append(final_pasted_frame)
                     continue
-                self.face_helper.all_landmarks_5 = [avg_landmarks_sequence[i]]
-                self.face_helper.align_warp_face() 
-                
-                bg_img_upscaled_by_model = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
-                h, w, _ = original_frame_bgr.shape
-                target_h, target_w = int(h * final_upscale_factor), int(w * final_upscale_factor)
-                if bg_img_upscaled_by_model.shape[0] != target_h or bg_img_upscaled_by_model.shape[1] != target_w:
-                    bg_img_final = cv2.resize(bg_img_upscaled_by_model, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-                else:
-                    bg_img_final = bg_img_upscaled_by_model
-                
-                self.face_helper.upscale_factor = final_upscale_factor
-                self.face_helper.get_inverse_affine(None)
-                final_pasted_frame = self.face_helper.paste_faces_to_input_image(
-                    upsample_img=bg_img_final,
-                    draw_box=draw_box,
-                    face_upsampler=self.face_upscale_model
-                )
-            else:
-                restored_face_with_model = self.face_helper.restored_faces[0]
-                if self.face_upscale_model:
-                    restored_face_with_model = self._run_upscaler(self.face_upscale_model, restored_face_with_model)
-                
-                h_restored, w_restored, _ = restored_face_with_model.shape
-                target_h, target_w = int(512 * final_upscale_factor), int(512 * final_upscale_factor)
-                if h_restored != target_h or w_restored != target_w:
-                    final_pasted_frame = cv2.resize(restored_face_with_model, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-                else:
-                    final_pasted_frame = restored_face_with_model
+                restored_face_patch_cv2 = all_restored_faces_cv2[i]
+                self.face_helper.clean_all()
+                self.face_helper.read_image(original_frame_bgr)
+                self.face_helper.add_restored_face(restored_face_patch_cv2.astype('uint8'))
 
-                if len(final_pasted_frame.shape) == 2: 
-                    final_pasted_frame = cv2.cvtColor(final_pasted_frame, cv2.COLOR_GRAY2BGR)
+                if not has_aligned_frames:
+                    if avg_landmarks_sequence is None or i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
+                        final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
+                        output_frames_cv2.append(final_pasted_frame)
+                        continue
+                    self.face_helper.all_landmarks_5 = [avg_landmarks_sequence[i]]
+                    self.face_helper.align_warp_face()
 
-            output_frames_cv2.append(final_pasted_frame)
-            progress.update(1)
+                    bg_img_upscaled_by_model = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
+                    h, w, _ = original_frame_bgr.shape
+                    target_h, target_w = int(h * final_upscale_factor), int(w * final_upscale_factor)
+                    if bg_img_upscaled_by_model.shape[0] != target_h or bg_img_upscaled_by_model.shape[1] != target_w:
+                        bg_img_final = cv2.resize(bg_img_upscaled_by_model, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                    else:
+                        bg_img_final = bg_img_upscaled_by_model
+
+                    self.face_helper.upscale_factor = final_upscale_factor
+                    self.face_helper.get_inverse_affine(None)
+                    final_pasted_frame = self.face_helper.paste_faces_to_input_image(
+                        upsample_img=bg_img_final,
+                        draw_box=draw_box,
+                        face_upsampler=self.face_upscale_model
+                    )
+                else:
+                    restored_face_with_model = self.face_helper.restored_faces[0]
+                    if self.face_upscale_model:
+                        restored_face_with_model = self._run_upscaler(self.face_upscale_model, restored_face_with_model)
+
+                    h_restored, w_restored, _ = restored_face_with_model.shape
+                    target_h, target_w = int(512 * final_upscale_factor), int(512 * final_upscale_factor)
+                    if h_restored != target_h or w_restored != target_w:
+                        final_pasted_frame = cv2.resize(restored_face_with_model, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                    else:
+                        final_pasted_frame = restored_face_with_model
+
+                    if len(final_pasted_frame.shape) == 2:
+                        final_pasted_frame = cv2.cvtColor(final_pasted_frame, cv2.COLOR_GRAY2BGR)
+
+                output_frames_cv2.append(final_pasted_frame)
+                progress.update(1)
             
         output_tensors = [cv2_to_comfy_image(frame) for frame in output_frames_cv2]
         if not output_tensors:

@@ -81,14 +81,25 @@ def test_the_package_imports_under_the_mocks():
 
 
 @pytest.mark.mock_integration
-def test_the_logger_has_exactly_one_handler():
-    """The logger of the package owns exactly one handler."""
+def test_the_logger_owns_the_handlers_of_its_tier():
+    """The logger of the package is in the mode of the tier it runs in.
+
+    * **with ComfyUI** - the pack logger owns **no** handler and only
+      propagates: ComfyUI's root logger formats the record;
+    * **without ComfyUI** (the mock tier) - the pack owns exactly **one**
+      private handler and does not propagate.
+    """
     conftest = importlib.import_module("conftest")
     package = conftest.execute_package_init()
     logger_module = importlib.import_module("ComfyUI_KEEP.src.keep_logger")
     assert package.logger is logger_module.logger
-    assert len(package.logger.handlers) == 1, package.logger.handlers
     assert package.logger.level == 20  # INFO
+    if logger_module.comfyui_is_present():
+        assert package.logger.handlers == [], package.logger.handlers
+        assert package.logger.propagate is True
+    else:
+        assert len(package.logger.handlers) == 1, package.logger.handlers
+        assert package.logger.propagate is False
 
 
 @pytest.mark.mock_integration

@@ -57,7 +57,7 @@ def report_progress(value: float, max_value: float) -> bool:
         api.execution.set_progress(value, max_value)
         return True
     except Exception as exc:  # noqa: BLE001 - a progress report never breaks a run
-        logger.debug(f"KEEP: the progress could not be reported ({exc})")
+        logger.debug(f"the progress could not be reported ({exc})")
         return False
 
 

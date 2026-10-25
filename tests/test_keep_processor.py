@@ -5,12 +5,16 @@ KEEP net) and assert the things the processor is responsible for:
 
 * the chunk math of the sequence path (``max_clip_length``),
 * the paste-back (the output frame count and shape),
-* the ``tiled_scale`` wrapper of the optional ComfyUI upscalers.
+* the ``tiled_scale`` wrapper of the optional ComfyUI upscalers,
+* the **console routing**: the four steps are logged and the console writes
+  of the vendored facelib reach the logger of the pack.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import logging
 import types
 
 import numpy as np
@@ -239,3 +243,153 @@ def test_the_sequence_releases_the_vram_at_every_chunk_boundary(
         assert events[position + 1] == "empty_cache", (
             f"the chunk boundary did not release the VRAM: {events}"
         )
+
+
+# ---------------------------------------------------------------------------
+# D4 - the console routing of the processor
+# ---------------------------------------------------------------------------
+class _DetectingFaceHelper(_StubFaceHelper):
+    """A face helper that **detects** a face - and prints like the facelib.
+
+    The vendored helper writes to the console (``print()``) while it reads
+    the image, while it detects, while it aligns a face and while it pastes
+    it back: the processor must route those writes to the logger of the pack.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.landmarks = np.zeros(10, dtype=np.float32)
+
+    def get_face_landmarks_5(self, **kwargs):
+        self.calls.append("get_face_landmarks_5")
+        print("model_rootpath is None. Using default relative path")
+        self.all_landmarks_5 = [self.landmarks]
+        return 1
+
+    def align_warp_face(self):
+        super().align_warp_face()
+        print("Warning: Could not estimate affine matrix for landmark set 0.")
+
+    def paste_faces_to_input_image(self, *args, **kwargs):
+        super().paste_faces_to_input_image(*args, **kwargs)
+        print("Warning: Mismatch between restored_faces and inverse_affine_matrices.")
+        return np.zeros((512, 512, 3), dtype=np.uint8)
+
+
+@contextlib.contextmanager
+def _pack_records():
+    """The records the logger of the pack receives while the block runs."""
+    pack_logger = importlib.import_module("ComfyUI_KEEP.src.keep_logger").logger
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture()
+    pack_logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        pack_logger.removeHandler(handler)
+
+
+@pytest.mark.unit
+def test_the_four_steps_of_the_sequence_are_logged(processor_module):
+    """The sequence path logs its four steps - tagged, once each."""
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _DetectingFaceHelper())
+    )
+    frames = torch.rand((2, 16, 16, 3), dtype=torch.float32)
+
+    with _pack_records() as records:
+        processor.process_image_sequence(
+            image_sequence_tensor=frames,
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_box=False,
+        )
+
+    steps = [
+        "[KEEP] Detecting face landmarks",
+        "[KEEP] Cropping and aligning faces",
+        "[KEEP] Restoring faces with KEEP",
+        "[KEEP] Pasting faces and finalizing frames",
+    ]
+    messages = [record.getMessage() for record in records]
+    # the records of the console routing are in between - the four steps are
+    # logged once each and in this order
+    assert [message for message in messages if message in steps] == steps
+
+
+@pytest.mark.unit
+def test_the_console_writes_of_the_detection_reach_the_logger(processor_module):
+    """A print of the vendored detector becomes a tagged record."""
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _DetectingFaceHelper())
+    )
+    frames = torch.rand((1, 16, 16, 3), dtype=torch.float32)
+
+    with _pack_records() as records:
+        processor.process_image_sequence(
+            image_sequence_tensor=frames,
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_box=False,
+        )
+
+    messages = [record.getMessage() for record in records]
+    assert (
+        "[KEEP] model_rootpath is None. Using default relative path" in messages
+    ), messages
+
+
+@pytest.mark.unit
+def test_every_console_write_of_the_facelib_reaches_the_logger(processor_module):
+    """The prints of the detection, of the alignment and of the paste-back."""
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _DetectingFaceHelper())
+    )
+    frames = torch.rand((1, 16, 16, 3), dtype=torch.float32)
+
+    with _pack_records() as records:
+        processor.process_image_sequence(
+            image_sequence_tensor=frames,
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_box=False,
+        )
+
+    messages = [record.getMessage() for record in records]
+    for text in (
+        "model_rootpath is None. Using default relative path",
+        "Warning: Could not estimate affine matrix for landmark set 0.",
+        "Warning: Mismatch between restored_faces and inverse_affine_matrices.",
+    ):
+        assert f"[KEEP] {text}" in messages, (text, messages)
+
+
+@pytest.mark.unit
+def test_the_console_writes_of_the_image_path_reach_the_logger(processor_module):
+    """The single image path routes the detection prints as well."""
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _DetectingFaceHelper())
+    )
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    with _pack_records() as records:
+        processor.process_image(
+            cv2_image_orig=image,
+            final_upscale_factor=1.0,
+            has_aligned=False,
+            only_center_face=True,
+            draw_box=False,
+        )
+
+    messages = [record.getMessage() for record in records]
+    assert (
+        "[KEEP] model_rootpath is None. Using default relative path" in messages
+    ), messages
