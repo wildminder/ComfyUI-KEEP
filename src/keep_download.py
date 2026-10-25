@@ -31,7 +31,9 @@ The rules are:
 The transport is ``torch.hub.download_url_to_file``; the module level name is
 the seam the tests replace (no network in the test suite).  It is called
 **without** its own progress bar: the bar of ``torch.hub`` is written to
-stderr, untagged, and would bypass the logger of the pack.
+stderr, untagged, and would bypass the logger of the pack.  A **completed**
+download instead reports one step to the progress bar of the ComfyUI host
+(``comfy.utils.ProgressBar``) - a no-op when the pack runs without a server.
 """
 
 from __future__ import annotations
@@ -183,12 +185,35 @@ def _place(part: str, target: str) -> None:
         ) from exc
 
 
+def _host_progress_bar(total: float) -> ProgressBar | None:
+    """The progress bar of the ComfyUI host (``None`` without ComfyUI).
+
+    The import is **lazy** (function level) and guarded: the engines of the
+    pack must import without a ComfyUI server (the plan's section 3 rule),
+    and a progress bar must never break a download.  Outside a server run the
+    bar of the host records the updates and no-ops (its hook is ``None``).
+    """
+    try:
+        from comfy.utils import ProgressBar  # lazy: src/ imports without ComfyUI
+    except Exception as exc:  # noqa: BLE001 - a progress bar never breaks a download
+        logger.debug(f"the host progress bar is not available ({exc})")
+        return None
+    return ProgressBar(total=total)
+
+
+def _report_download_done(bar: ProgressBar | None) -> None:
+    """The one bar step of a **completed** download (a failed one stays at 0)."""
+    if bar is not None:
+        bar.update_absolute(1)
+
+
 def download_weight(entry: WeightEntry, progress: bool = True) -> str:
     """Download the entry to its destination and verify it.
 
-    ``progress`` is **inert**: the transport is always called without its own
-    (untagged) progress bar.  The parameter stays in the signature because the
-    callers of the pack pass it.
+    When ``progress`` is true, a **completed** download advances the progress
+    bar of the ComfyUI host by one step (one step per weight file; the loader
+    node downloads a handful of weights, so the bar of the node advances per
+    weight).  The transport itself still runs without its own (untagged) bar.
 
     The download is **atomic**: the transport writes into a temporary file and
     the file is only put in place after it was verified.  A failed download
@@ -232,6 +257,7 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
             )
             target = _primary_target(entry)
 
+    bar = _host_progress_bar(1) if progress else None
     part = target + PART_SUFFIX
     for attempt in (1, 2):
         logger.info(f"downloading {entry.name} from {entry.url} to {target}")
@@ -252,11 +278,13 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
         if not entry.sha256:
             _warn_unverified(entry)
             _place(part, target)
+            _report_download_done(bar)
             return target
 
         actual = sha256_of(part)
         if actual == entry.sha256:
             _place(part, target)
+            _report_download_done(bar)
             return target
 
         logger.warning(
@@ -278,7 +306,8 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
 def ensure_weight(entry: WeightEntry, progress: bool = True) -> str | None:
     """The path of the weight - the cached file, or a fresh download.
 
-    ``progress`` is **inert** (see :func:`download_weight`).
+    ``progress`` is passed to :func:`download_weight` (a completed download
+    advances the progress bar of the ComfyUI host by one step).
 
     ``None`` when the entry is **optional** and cannot be provided; a
     ``FileNotFoundError`` when a **required** entry cannot be provided.

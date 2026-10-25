@@ -11,7 +11,10 @@ tier runs **without a network**:
 * a weight in an extra model root is used where it is (the primary root wins);
 * an entry without a hash is downloaded **unverified** - with a loud warning;
 * an entry that is not published upstream raises an actionable error naming the
-  file, the expected path and the dead URL.
+  file, the expected path and the dead URL;
+* a **completed** download reports one step to the progress bar of the ComfyUI
+  host - a failed download (and ``progress=False``, and a cached file) reports
+  nothing.
 """
 
 from __future__ import annotations
@@ -299,6 +302,98 @@ def test_the_transport_is_called_without_a_progress_bar(
     download_module.ensure_required(entry)
 
     assert transport.progress == [False], transport.progress
+
+
+class _RecordedBar:
+    """A host bar double: it records every ``update_absolute``."""
+
+    def __init__(self, total) -> None:
+        self.total = total
+        self.updates: list[float] = []
+
+    def update_absolute(self, value, total=None, preview=None) -> None:
+        self.updates.append(value)
+
+
+class _BarFactory:
+    """The double that replaces ``_host_progress_bar`` - it records the builds."""
+
+    def __init__(self) -> None:
+        self.totals: list[float] = []
+        self.bars: list[_RecordedBar] = []
+
+    def __call__(self, total):
+        self.totals.append(total)
+        bar = _RecordedBar(total)
+        self.bars.append(bar)
+        return bar
+
+
+@pytest.mark.unit
+def test_a_completed_download_reports_one_progress_step(
+    download_module, configs_module, monkeypatch
+):
+    """A finished download advances the bar of the host by exactly one step."""
+    entry = _entry(configs_module)
+    monkeypatch.setattr(download_module, "download_url_to_file", _Transport())
+    factory = _BarFactory()
+    monkeypatch.setattr(download_module, "_host_progress_bar", factory)
+
+    download_module.ensure_required(entry)
+
+    assert factory.totals == [1], factory.totals
+    assert len(factory.bars) == 1, "one bar per weight file"
+    assert factory.bars[0].updates == [1], factory.bars[0].updates
+
+
+@pytest.mark.unit
+def test_progress_false_builds_no_host_bar(
+    download_module, configs_module, monkeypatch
+):
+    """``progress=False`` must not touch the progress bar of the host at all."""
+    entry = _entry(configs_module)
+    monkeypatch.setattr(download_module, "download_url_to_file", _Transport())
+    factory = _BarFactory()
+    monkeypatch.setattr(download_module, "_host_progress_bar", factory)
+
+    download_module.ensure_required(entry, progress=False)
+
+    assert factory.totals == [], factory.totals
+
+
+@pytest.mark.unit
+def test_a_failed_download_reports_no_progress(
+    download_module, configs_module, monkeypatch
+):
+    """A failed download leaves the bar of the host at 0 - it must not report."""
+    entry = _entry(configs_module)
+    monkeypatch.setattr(download_module, "download_url_to_file", _Transport(fail=True))
+    factory = _BarFactory()
+    monkeypatch.setattr(download_module, "_host_progress_bar", factory)
+
+    with pytest.raises(FileNotFoundError):
+        download_module.ensure_required(entry)
+
+    assert factory.totals == [1], "the bar is built before the fetch"
+    assert factory.bars[0].updates == [], "a failed download must not report progress"
+
+
+@pytest.mark.unit
+def test_a_cached_weight_builds_no_progress_bar(
+    download_module, configs_module, monkeypatch
+):
+    """A weight that is already there downloads nothing - and reports nothing."""
+    entry = _entry(configs_module)
+    target = download_module.target_path(entry)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "wb") as handle:
+        handle.write(b"payload")
+    factory = _BarFactory()
+    monkeypatch.setattr(download_module, "_host_progress_bar", factory)
+
+    download_module.ensure_required(entry)
+
+    assert factory.totals == [], factory.totals
 
 
 @pytest.mark.unit
