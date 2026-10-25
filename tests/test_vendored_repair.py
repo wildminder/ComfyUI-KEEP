@@ -536,7 +536,14 @@ _DISTRIBUTIONS = {
 
 #: The modules the **ComfyUI host** provides - they are not dependencies of
 #: this package and therefore not part of ``requirements.txt``.
-_HOST_MODULES = ("comfy", "comfy_api", "folder_paths")
+#:
+#: ``app`` and ``utils`` are the top-level packages of the server: ``app``
+#: carries the logger of the host (``app.logger.setup_logger`` - the pack
+#: probes it to decide whether it may own a handler) and ``utils`` carries
+#: the loader of the extra model paths (``utils.extra_config`` - the pack
+#: asks the host to interpret ``extra_model_paths.yaml``).  Both are
+#: imported **lazily** and both are absent without a server.
+_HOST_MODULES = ("comfy", "comfy_api", "folder_paths", "app", "utils")
 
 #: The vendored packages - imported relatively (P2.5), never a dependency.
 _VENDORED_MODULES = ("basicsr", "facelib")
