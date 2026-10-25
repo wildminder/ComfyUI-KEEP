@@ -34,6 +34,22 @@ def configs_module():
     return importlib.import_module("ComfyUI_KEEP.src.keep_model_configs")
 
 
+@pytest.fixture
+def keep_records(download_module, caplog):
+    """The records of the pack logger - in **both** logger modes.
+
+    Without a ComfyUI the pack logger owns a private handler and does not
+    propagate, so the records never reach the root logger of pytest: the
+    capture handler is attached to the pack logger itself.
+    """
+    logger = download_module.logger
+    logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
 def _entry(configs_module, name="KEEP-b76feb75.pth", payload=b"payload", **overrides):
     """A manifest entry with the sha256 of ``payload``."""
     fields = {
@@ -55,9 +71,11 @@ class _Transport:
         self.payload = payload
         self.fail = fail
         self.calls: list[str] = []
+        self.progress: list[bool] = []
 
     def __call__(self, url, dst, hash_prefix=None, progress=True):
         self.calls.append(url)
+        self.progress.append(progress)
         if self.fail:
             # the real transport leaves a temporary file behind
             with open(dst + ".tmp", "wb") as handle:
@@ -187,7 +205,10 @@ def test_a_weight_of_an_extra_model_root_is_used_where_it_is(
     assert path == extra_file, path
     assert transport.calls == [], "the file must not be downloaded again"
     # nothing was written into the primary root
-    assert not os.path.exists(download_module.target_path(entry))
+    primary = os.path.join(
+        mock_folder_paths.models_dir, "keep_models", "KEEP", entry.name
+    )
+    assert not os.path.exists(primary), primary
 
 
 @pytest.mark.unit
@@ -202,7 +223,9 @@ def test_the_primary_root_wins_over_an_extra_model_root(
     with open(os.path.join(extra, "KEEP", entry.name), "wb") as handle:
         handle.write(b"payload")
 
-    primary_file = download_module.target_path(entry)
+    primary_file = os.path.join(
+        mock_folder_paths.models_dir, "keep_models", "KEEP", entry.name
+    )
     os.makedirs(os.path.dirname(primary_file), exist_ok=True)
     with open(primary_file, "wb") as handle:
         handle.write(b"payload")
@@ -217,8 +240,70 @@ def test_the_primary_root_wins_over_an_extra_model_root(
 
 
 @pytest.mark.unit
+def test_a_missing_weight_is_downloaded_next_to_the_pack(
+    download_module, configs_module, monkeypatch, mock_folder_paths
+):
+    """The target follows the root that holds the **other** weights of the pack.
+
+    A user who keeps the weights of the pack in an extra model root must not
+    get a second copy of them in the primary root of the installation.
+    """
+    entry = _entry(configs_module)
+    extra = str(Path(mock_folder_paths.models_dir).parent / "extra-models")
+    os.makedirs(os.path.join(extra, "KEEP"), exist_ok=True)
+    mock_folder_paths.add_model_folder_path("keep_models", extra)
+    # the sibling of the entry - the other weight of the pack - lives there
+    with open(os.path.join(extra, "KEEP", "KEEP_Asian-4765ebe0.pth"), "wb") as handle:
+        handle.write(b"payload")
+
+    transport = _Transport()
+    monkeypatch.setattr(download_module, "download_url_to_file", transport)
+
+    path = download_module.ensure_required(entry)
+
+    assert path == os.path.join(extra, "KEEP", entry.name), path
+    assert transport.calls == [entry.url]
+    # nothing was written into the primary root
+    primary = os.path.join(
+        mock_folder_paths.models_dir, "keep_models", "KEEP", entry.name
+    )
+    assert not os.path.exists(primary), primary
+
+
+@pytest.mark.unit
+def test_the_download_target_is_the_primary_root_when_no_root_holds_the_pack(
+    download_module, configs_module, monkeypatch, mock_folder_paths
+):
+    """Without a pack home the primary root is the target."""
+    entry = _entry(configs_module)
+    transport = _Transport()
+    monkeypatch.setattr(download_module, "download_url_to_file", transport)
+
+    path = download_module.ensure_required(entry)
+
+    primary = os.path.join(
+        mock_folder_paths.models_dir, "keep_models", "KEEP", entry.name
+    )
+    assert path == primary, path
+
+
+@pytest.mark.unit
+def test_the_transport_is_called_without_a_progress_bar(
+    download_module, configs_module, monkeypatch
+):
+    """``torch.hub`` writes its own (untagged) bar to stderr - it is off."""
+    entry = _entry(configs_module)
+    transport = _Transport()
+    monkeypatch.setattr(download_module, "download_url_to_file", transport)
+
+    download_module.ensure_required(entry)
+
+    assert transport.progress == [False], transport.progress
+
+
+@pytest.mark.unit
 def test_an_entry_without_a_hash_is_downloaded_unverified_with_a_warning(
-    download_module, configs_module, monkeypatch, caplog
+    download_module, configs_module, monkeypatch, keep_records
 ):
     """The Asian entry: no verification, but a loud warning."""
     entry = _entry(
@@ -232,12 +317,12 @@ def test_an_entry_without_a_hash_is_downloaded_unverified_with_a_warning(
     transport = _Transport()
     monkeypatch.setattr(download_module, "download_url_to_file", transport)
 
-    with caplog.at_level("WARNING"):
+    with keep_records.at_level("WARNING"):
         path = download_module.ensure_optional(entry)
 
     assert path is not None and os.path.isfile(path)
     assert transport.calls == [entry.url]
-    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    warnings = [record for record in keep_records.records if record.levelname == "WARNING"]
     assert warnings, "the missing verification must be reported loudly"
     message = " ".join(record.getMessage() for record in warnings)
     assert entry.name in message

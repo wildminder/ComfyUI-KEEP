@@ -10,6 +10,10 @@ The rules are:
 * the destination is resolved through :mod:`src.keep_paths` - the registered
   model folders of ComfyUI, the **primary root first**, so a weight that lives
   in an extra model root is used where it is instead of being downloaded again;
+* a **missing** weight is downloaded next to the **other weights of the pack**:
+  the target is the root that already holds them
+  (:func:`src.keep_paths.resolve_download_root`), not the primary root of a
+  fresh installation;
 * the on-disk layout is the **legacy** one (``models/keep_models/KEEP``,
   ``models/facedetection``, ``models/gmflow``);
 * a downloaded file is verified against the sha256 of the manifest - a mismatch
@@ -21,7 +25,9 @@ The rules are:
   names the URL and the destination.
 
 The transport is ``torch.hub.download_url_to_file``; the module level name is
-the seam the tests replace (no network in the test suite).
+the seam the tests replace (no network in the test suite).  It is called
+**without** its own progress bar: the bar of ``torch.hub`` is written to
+stderr, untagged, and would bypass the logger of the pack.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ import os
 from torch.hub import download_url_to_file
 
 from . import keep_paths
-from .keep_logger import logger
+from .keep_logger import logger, tagged
 from .keep_model_configs import WEIGHT_MANIFEST, WeightEntry
 
 #: The names of the entries that were already reported as "no hash" - the
@@ -49,10 +55,24 @@ def sha256_of(path: str) -> str:
     return digest.hexdigest()
 
 
+def folder_siblings(entry: WeightEntry) -> list[str]:
+    """The paths of the pack's weights in the folder of the entry.
+
+    They are the **siblings** of the entry - the other weights of the same
+    model folder.  They decide where a missing weight is downloaded to: next
+    to them (see :func:`src.keep_paths.resolve_download_root`).
+    """
+    return [
+        other.relative_path
+        for other in WEIGHT_MANIFEST
+        if other.dest_folder == entry.dest_folder
+    ]
+
+
 def target_path(entry: WeightEntry) -> str:
-    """The path the entry is downloaded to (the primary root + the layout)."""
+    """The path the entry is downloaded to (the root that holds the pack)."""
     return keep_paths.resolve_model_target(
-        entry.dest_folder, entry.name, entry.subdir
+        entry.dest_folder, entry.name, entry.subdir, folder_siblings(entry)
     )
 
 
@@ -80,7 +100,7 @@ def _warn_unverified(entry: WeightEntry) -> None:
         return
     _WARNED_UNVERIFIED.add(entry.name)
     logger.warning(
-        f"KEEP: {entry.name} has no verified sha256 in the manifest "
+        f"{entry.name} has no verified sha256 in the manifest "
         f"(unverified={entry.unverified}, available={entry.available}) - the "
         "download is NOT verified. Do not trust the file; place it manually "
         f"from a source you trust. The expected destination is "
@@ -95,16 +115,25 @@ def _remove_partials(target: str) -> None:
             try:
                 os.remove(path)
             except OSError as exc:  # pragma: no cover - a locked file
-                logger.warning(f"KEEP: the partial file {path} could not be removed: {exc}")
+                logger.warning(f"the partial file {path} could not be removed: {exc}")
 
 
-def _fetch(entry: WeightEntry, target: str, progress: bool) -> None:
-    """The transport call (the seam the tests replace)."""
-    download_url_to_file(entry.url, target, hash_prefix=None, progress=progress)
+def _fetch(entry: WeightEntry, target: str) -> None:
+    """The transport call (the seam the tests replace).
+
+    The transport is called **without** a progress bar: the bar of
+    ``torch.hub`` is written to stderr, untagged, and would bypass the logger
+    of the pack.
+    """
+    download_url_to_file(entry.url, target, hash_prefix=None, progress=False)
 
 
 def download_weight(entry: WeightEntry, progress: bool = True) -> str:
     """Download the entry to its destination and verify it.
+
+    ``progress`` is **inert**: the transport is always called without its own
+    (untagged) progress bar.  The parameter stays in the signature because the
+    callers of the pack pass it.
 
     Returns the path of the downloaded file.  Raises ``FileNotFoundError`` when
     the download fails (the message names the URL and the destination) and
@@ -118,26 +147,28 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
         if verify(entry, existing):
             if not entry.sha256:
                 _warn_unverified(entry)
-            logger.debug(f"KEEP: {entry.name} is already present ({existing})")
+            logger.debug(f"{entry.name} is already present ({existing})")
             return existing
         logger.warning(
-            f"KEEP: the sha256 of {existing} does not match the manifest - the "
+            f"the sha256 of {existing} does not match the manifest - the "
             "file is deleted and downloaded again"
         )
         _remove_partials(existing)
 
     for attempt in (1, 2):
-        logger.info(f"KEEP: downloading {entry.name} from {entry.url} to {target}")
+        logger.info(f"downloading {entry.name} from {entry.url} to {target}")
         try:
-            _fetch(entry, target, progress)
+            _fetch(entry, target)
         except Exception as exc:  # noqa: BLE001 - the error is re-raised below
             _remove_partials(target)
             raise FileNotFoundError(
-                f"KEEP: the weight {entry.name!r} could not be downloaded.\n"
-                f"  url:  {entry.url}\n"
-                f"  dest: {target}\n"
-                f"  reason: {exc}\n"
-                "Download the file manually into the destination and try again."
+                tagged(
+                    f"the weight {entry.name!r} could not be downloaded.\n"
+                    f"  url:  {entry.url}\n"
+                    f"  dest: {target}\n"
+                    f"  reason: {exc}\n"
+                    "Download the file manually into the destination and try again."
+                )
             ) from exc
 
         if not entry.sha256:
@@ -149,21 +180,25 @@ def download_weight(entry: WeightEntry, progress: bool = True) -> str:
             return target
 
         logger.warning(
-            f"KEEP: the sha256 of the downloaded {entry.name} does not match "
+            f"the sha256 of the downloaded {entry.name} does not match "
             f"the manifest (expected {entry.sha256}, got {actual})"
         )
         _remove_partials(target)
         if attempt == 2:
             raise ValueError(
-                f"KEEP: the downloaded {entry.name!r} does not match the "
-                f"manifest hash (expected {entry.sha256}, got {actual}) - the "
-                f"file was deleted. url: {entry.url}, dest: {target}"
+                tagged(
+                    f"the downloaded {entry.name!r} does not match the "
+                    f"manifest hash (expected {entry.sha256}, got {actual}) - the "
+                    f"file was deleted. url: {entry.url}, dest: {target}"
+                )
             )
     raise AssertionError("unreachable")  # pragma: no cover
 
 
 def ensure_weight(entry: WeightEntry, progress: bool = True) -> str | None:
     """The path of the weight - the cached file, or a fresh download.
+
+    ``progress`` is **inert** (see :func:`download_weight`).
 
     ``None`` when the entry is **optional** and cannot be provided; a
     ``FileNotFoundError`` when a **required** entry cannot be provided.
@@ -175,20 +210,22 @@ def ensure_weight(entry: WeightEntry, progress: bool = True) -> str | None:
         if existing is not None:
             if verify(entry, existing):
                 logger.info(
-                    f"KEEP: {entry.name} is not published upstream - the manually "
+                    f"{entry.name} is not published upstream - the manually "
                     f"placed file {existing} is used"
                 )
                 return existing
         if entry.required:
             raise FileNotFoundError(
-                f"KEEP: the weight {entry.name!r} is not published upstream "
-                f"(HTTP 404) and is not installed.\n"
-                f"  url:  {entry.url}\n"
-                f"  dest: {target_path(entry)}\n"
-                "Place the file manually at the destination and try again."
+                tagged(
+                    f"the weight {entry.name!r} is not published upstream "
+                    f"(HTTP 404) and is not installed.\n"
+                    f"  url:  {entry.url}\n"
+                    f"  dest: {target_path(entry)}\n"
+                    "Place the file manually at the destination and try again."
+                )
             )
         logger.warning(
-            f"KEEP: the optional weight {entry.name!r} is not published "
+            f"the optional weight {entry.name!r} is not published "
             f"upstream (HTTP 404) - it is skipped. url: {entry.url}"
         )
         return None
@@ -199,7 +236,7 @@ def ensure_weight(entry: WeightEntry, progress: bool = True) -> str | None:
         if entry.required:
             raise
         logger.warning(
-            f"KEEP: the optional weight {entry.name!r} could not be provided - "
+            f"the optional weight {entry.name!r} could not be provided - "
             "it is skipped"
         )
         return None
@@ -210,9 +247,11 @@ def ensure_required(entry: WeightEntry, progress: bool = True) -> str:
     path = ensure_weight(entry, progress=progress)
     if path is None:  # pragma: no cover - a required entry never returns None
         raise FileNotFoundError(
-            f"KEEP: the required weight {entry.name!r} could not be provided.\n"
-            f"  url:  {entry.url}\n"
-            f"  dest: {target_path(entry)}"
+            tagged(
+                f"the required weight {entry.name!r} could not be provided.\n"
+                f"  url:  {entry.url}\n"
+                f"  dest: {target_path(entry)}"
+            )
         )
     return path
 
@@ -227,4 +266,4 @@ def manifest_entry(name: str) -> WeightEntry:
     for entry in WEIGHT_MANIFEST:
         if entry.name == name:
             return entry
-    raise KeyError(f"KEEP: no manifest entry named {name!r}")
+    raise KeyError(tagged(f"no manifest entry named {name!r}"))
