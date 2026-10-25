@@ -208,15 +208,52 @@ def _apply_layout_convention(yaml_path: str) -> list[str]:
     return roots
 
 
+def _cli_extra_model_paths() -> list[str]:
+    """The yaml files ComfyUI got on the command line.
+
+    The host reads them the same way (``main.py``): ``args`` carries a list
+    of lists (``--extra-model-paths-config a.yaml b.yaml``) that is flattened
+    before the files are loaded.
+    """
+    try:
+        from comfy.cli_args import args  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 - no ComfyUI, no command line
+        logger.debug(f"the command line of ComfyUI is not available: {exc}")
+        return []
+    configured = getattr(args, "extra_model_paths_config", None)
+    if not configured:
+        return []
+    paths: list[str] = []
+    for group in configured:
+        if isinstance(group, (list, tuple)):
+            paths.extend(str(item) for item in group)
+        else:
+            paths.append(str(group))
+    return paths
+
+
+def _host_yaml_paths() -> list[str]:
+    """Every yaml the host reads: the default one and the command line ones."""
+    paths: list[str] = []
+    default = _default_extra_model_paths()
+    if default:
+        paths.append(default)
+    for path in _cli_extra_model_paths():
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
 def apply_extra_model_paths(
     yaml_path: str | None = None, *, force: bool = False
 ) -> list[str]:
     """Register the extra model roots of the pack (the yaml of the host).
 
     ComfyUI reads ``extra_model_paths.yaml`` itself; the pack reads the
-    **same** file, so the weights of a user who keeps them in an extra model
-    root are found where they are instead of being downloaded into the
-    primary root again.
+    **same** files - the default one **and** the ones that were given on the
+    command line (``--extra-model-paths-config``), so the weights of a user
+    who keeps them in an extra model root are found where they are instead of
+    being downloaded into the primary root again.
 
     Two discovery paths:
 
@@ -227,7 +264,7 @@ def apply_extra_model_paths(
       points at ``<base_path>/models/<pack folder>``, which is where the
       weights of such a user really live.
 
-    The yaml is parsed **once per change** (its mtime is the cache key);
+    Every yaml is parsed **once per change** (its mtime is the cache key);
     ``force=True`` re-applies it.  A missing yaml, a broken yaml or a
     missing ComfyUI is a debug message and never an error - the pack then
     works with its primary root alone.
@@ -239,13 +276,21 @@ def apply_extra_model_paths(
         return []
 
     if yaml_path:
-        path = os.path.abspath(os.path.expanduser(yaml_path))
+        paths = [os.path.abspath(os.path.expanduser(yaml_path))]
     else:
-        path = _default_extra_model_paths()
-    if not path:
+        paths = _host_yaml_paths()
+    if not paths:
         logger.debug("the path of the extra model paths yaml is unknown")
         return []
 
+    roots: list[str] = []
+    for path in paths:
+        roots.extend(_apply_extra_model_paths_of(path, force=force))
+    return list(dict.fromkeys(roots))
+
+
+def _apply_extra_model_paths_of(path: str, *, force: bool) -> list[str]:
+    """Register the extra model roots of **one** yaml of the host."""
     try:
         mtime = os.path.getmtime(path)
     except OSError as exc:

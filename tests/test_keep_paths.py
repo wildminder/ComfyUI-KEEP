@@ -497,6 +497,39 @@ def test_the_explicit_keys_are_read_by_the_loader_of_the_host(
 
 
 @pytest.mark.unit
+def test_the_yaml_of_the_command_line_is_read_too(
+    keep_paths, mock_folder_paths, tmp_path, monkeypatch
+):
+    """The yaml of ``--extra-model-paths-config`` is read like the default one.
+
+    The host reads the files of the command line the same way (``main.py``:
+    the list of lists is flattened before the files are loaded), so the pack
+    follows: a user who has **no** default yaml still gets the extra roots
+    of the pack.
+    """
+    base = tmp_path / "cli-owner"
+    base.mkdir()
+    yaml_path = _write_yaml(tmp_path / "cli_models.yaml", _owner_yaml(str(base)))
+
+    # the stand-in for the command line of ComfyUI
+    package = types.ModuleType("comfy")
+    package.__path__ = []  # type: ignore[attr-defined]
+    cli_args = types.ModuleType("comfy.cli_args")
+    cli_args.args = types.SimpleNamespace(  # type: ignore[attr-defined]
+        extra_model_paths_config=[[yaml_path]]
+    )
+    package.cli_args = cli_args  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "comfy", package)
+    monkeypatch.setitem(sys.modules, "comfy.cli_args", cli_args)
+
+    keep_paths.apply_extra_model_paths()
+
+    for name in ("keep_models", "facedetection", "gmflow"):
+        expected = os.path.join(str(base), "models", name)
+        assert expected in keep_paths.get_model_folder_paths(name), name
+
+
+@pytest.mark.unit
 def test_the_yaml_is_applied_once_per_change(
     keep_paths, mock_folder_paths, tmp_path, monkeypatch
 ):
