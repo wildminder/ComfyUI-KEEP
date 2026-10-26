@@ -74,6 +74,38 @@ GRAY_THRESHOLD = 10
 #: (4) and the uint8 output (3).
 STAGING_BYTES_PER_PIXEL = 31
 
+#: The fixed-point grid of cv2's ``warpAffine`` (``imgwarp.cpp``): the
+#: sampling coordinate is quantised to 1/32 px (``INTER_TAB_SIZE``) and the
+#: matrix is pre-scaled to 1/1024 units (``AB_BITS``).
+CV_WARP_TAB_SIZE = 32
+CV_WARP_AB_SCALE = 1024
+CV_WARP_ROUND_DELTA = CV_WARP_AB_SCALE // CV_WARP_TAB_SIZE // 2
+
+#: The margin of the ROI around the transformed face footprint (1 px - it
+#: absorbs the float rounding of the bounding box).
+ROI_MARGIN = 1
+
+#: The transfer counters of the paste - the round's evidence for
+#: "ROI-sized, not canvas-sized".  ``h2d_bytes`` and ``d2h_bytes`` count the
+#: ROI background upload and the blended ROI download; the ParseNet inputs
+#: are counted apart (``face_h2d_bytes``) - they are not ROI-sized by
+#: nature.  The counters describe the **last** paste call.
+PASTE_TRANSFER_STATS: dict[str, int] = {
+    "frames": 0,
+    "h2d_bytes": 0,
+    "d2h_bytes": 0,
+    "face_h2d_bytes": 0,
+    "canvas_bytes": 0,
+    "roi_frames": 0,
+    "fallback_frames": 0,
+}
+
+
+def reset_paste_transfer_stats() -> None:
+    """Reset the transfer counters (they describe the last paste call)."""
+    for key in PASTE_TRANSFER_STATS:
+        PASTE_TRANSFER_STATS[key] = 0
+
 
 # ---------------------------------------------------------------------------
 # The VRAM-aware chunk sizes (design section 7.7, step 3)
@@ -326,7 +358,9 @@ def parse_soft_masks_batched(
     return torch.cat(masks, dim=0)
 
 
-def _quantize_and_clip(blended: torch.Tensor) -> torch.Tensor:
+def _quantize_and_clip(
+    blended: torch.Tensor, maximum: torch.Tensor | None = None
+) -> torch.Tensor:
     """The quantizing tail of the vendored paste (``:497-507``).
 
     The vendored code picks its clip by the maximum of the blended image:
@@ -334,8 +368,20 @@ def _quantize_and_clip(blended: torch.Tensor) -> torch.Tensor:
     below 1.001 is treated as a 0..1 float and multiplied by 255.  The
     blend of two uint8 images can only reach the first and the third case;
     the second one is kept for the fidelity of the branch.
+
+    Args:
+        blended: the blended image - ``(N, C, H, W)`` of the full canvas or
+            ``(C, H, W)`` of one ROI.
+        maximum: the frame-global maximum of the blend, when it is known
+            already (the ROI paste computes it over the whole frame, not
+            over its ROI).  ``None`` measures it on the given tensor.
     """
-    maximum = blended.amax(dim=(1, 2, 3), keepdim=True)
+    if maximum is None:
+        maximum = (
+            blended.amax(dim=(1, 2, 3), keepdim=True)
+            if blended.ndim == 4
+            else blended.amax()
+        )
     rescale = torch.where(
         maximum > 255.001, 255.0 / maximum.clamp(min=1e-12), torch.ones_like(maximum)
     )
@@ -351,6 +397,7 @@ def paste_faces_batch(
     parse_net,
     parse_chunk: int | None = None,
     frame_chunk: int | None = None,
+    use_roi: bool = True,
 ) -> list[np.ndarray]:
     """The batched paste-back of the restored faces (design section 7.7).
 
@@ -407,12 +454,15 @@ def paste_faces_batch(
     out_size = (width, height)  # the cv2 dsize order
     if frame_chunk is None:
         frame_chunk = paste_chunk_size(height, width, device)
+    reset_paste_transfer_stats()
+    PASTE_TRANSFER_STATS["frames"] = num_frames
 
     pasted: list[np.ndarray] = []
     for start in range(0, num_frames, max(1, int(frame_chunk))):
         stop = min(start + max(1, int(frame_chunk)), num_frames)
+        chunk = _paste_chunk_roi if use_roi else _paste_chunk
         pasted.extend(
-            _paste_chunk(
+            chunk(
                 faces[start:stop],
                 list(inverse_affines[start:stop]),
                 background[start:stop],
@@ -466,3 +516,313 @@ def _paste_chunk(
     blended = _quantize_and_clip(blended).round_().to(torch.uint8)
 
     return list(blended.permute(0, 2, 3, 1).contiguous().cpu().numpy())
+
+
+# ---------------------------------------------------------------------------
+# The ROI paste (the round of the paste-stage CPU optimization)
+# ---------------------------------------------------------------------------
+
+def opencv_warp_inverse(matrix: np.ndarray) -> np.ndarray:
+    """The sampling matrix of ``cv2.warpAffine`` (its own double inversion).
+
+    ``cv::warpAffine`` inverts the matrix itself (``imgwarp.cpp``) and its
+    operation order differs from ``cv2.invertAffineTransform`` in the last
+    bits - and those last bits are exactly where the knife-edge pixels of
+    the 1/32 grid live.  The device warp therefore uses **this** matrix.
+    """
+    m = np.asarray(matrix, dtype=np.float64).reshape(6)
+    det = m[0] * m[4] - m[1] * m[3]
+    det = 1.0 / det if det != 0 else 0.0
+    a11 = m[4] * det
+    a22 = m[0] * det
+    n0, n1 = a11, m[1] * -det
+    n3, n4 = m[3] * -det, a22
+    b1 = -n0 * m[2] - n1 * m[5]
+    b2 = -n3 * m[2] - n4 * m[5]
+    return np.array([[n0, n1, b1], [n3, n4, b2]], dtype=np.float64)
+
+
+def warp_fixed_point_terms(
+    matrix: np.ndarray, width: int, height: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The per-column / per-row 1/1024-unit terms of cv2's warpAffine.
+
+    ``cv::warpAffine`` pre-scales the matrix to 1/1024 units
+    (``saturate_cast<int>`` - a ``cvRound``, i.e. round-half-to-even) and
+    splits the coordinate into a per-column and a per-row part; the row
+    part carries the ``+16`` half-step bias that turns the blockline's
+    arithmetic shift into a rounding to the 1/32 grid.
+    """
+    inv = opencv_warp_inverse(matrix)
+    xs = np.arange(int(width), dtype=np.float64)
+    ys = np.arange(int(height), dtype=np.float64)
+    col_x = np.rint(inv[0, 0] * xs * CV_WARP_AB_SCALE)
+    col_y = np.rint(inv[1, 0] * xs * CV_WARP_AB_SCALE)
+    row_x = np.rint((inv[0, 1] * ys + inv[0, 2]) * CV_WARP_AB_SCALE) + CV_WARP_ROUND_DELTA
+    row_y = np.rint((inv[1, 1] * ys + inv[1, 2]) * CV_WARP_AB_SCALE) + CV_WARP_ROUND_DELTA
+    return (
+        col_x.astype(np.int64),
+        col_y.astype(np.int64),
+        row_x.astype(np.int64),
+        row_y.astype(np.int64),
+    )
+
+
+def face_roi_box(
+    inverse_affine: np.ndarray, canvas_hw: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """The ROI of the transformed face (the bbox of its source footprint).
+
+    The ROI covers the transformed source footprint ``[-1, 512]`` - the
+    ``-1`` covers the bilinear neighbour cv2 taps at the source's border,
+    so the ROI holds every pixel the full-canvas warp can give a non-zero
+    value.  The parse mask's support (``[9, 503]``) lies inside it, so the
+    blend outside the ROI is the untouched background.
+
+    Returns:
+        ``(x0, y0, x1, y1)`` - the clipped box in canvas coordinates.
+    """
+    # the paste's "inverse affine" already maps the face onto the canvas
+    # (it is the inverse of the crop affine) - ``cv2.warpAffine`` samples
+    # the face with its own inverse.
+    forward = np.asarray(inverse_affine, dtype=np.float64)
+    height, width = int(canvas_hw[0]), int(canvas_hw[1])
+    xs: list[float] = []
+    ys: list[float] = []
+    for source_x, source_y in ((-1.0, -1.0), (-1.0, 512.0), (512.0, -1.0), (512.0, 512.0)):
+        xs.append(forward[0, 0] * source_x + forward[0, 1] * source_y + forward[0, 2])
+        ys.append(forward[1, 0] * source_x + forward[1, 1] * source_y + forward[1, 2])
+    x0 = max(0, int(np.floor(min(xs))) - ROI_MARGIN)
+    y0 = max(0, int(np.floor(min(ys))) - ROI_MARGIN)
+    x1 = min(width, int(np.ceil(max(xs))) + ROI_MARGIN)
+    y1 = min(height, int(np.ceil(max(ys))) + ROI_MARGIN)
+    return x0, y0, max(x0, x1), max(y0, y1)
+
+
+def warp_face_roi(
+    face_u8: torch.Tensor,
+    terms: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    roi: tuple[int, int, int, int],
+) -> torch.Tensor:
+    """The ROI face warp - cv2's fixed-point bilinear, in int32 on the device.
+
+    The warp reproduces ``cv2.warpAffine`` **bit-exactly**: the 1/32
+    sampling grid, the 5-bit weights, cv2's ``(+512) >> 10`` rounding and
+    its ``BORDER_CONSTANT`` rule (an out-of-bounds tap contributes 0 and
+    keeps its weight).  The coordinates are built the way cv2 builds them:
+    the matrix is pre-scaled to 1/1024 units, the row term carries the
+    ``+16`` half-step bias and the blockline shifts the 1/1024 value down
+    to the 1/32 grid with an arithmetic shift.
+
+    Args:
+        face_u8: the ``(C, H, W)`` uint8 source face.
+        terms: the 1/1024-unit terms of the warp
+            (:func:`warp_fixed_point_terms`).
+        roi: the ``(x0, y0, x1, y1)`` destination box (absolute canvas
+            coordinates).
+
+    Returns:
+        ``(C, roi_h, roi_w)`` uint8.
+    """
+    x0, y0, x1, y1 = (int(value) for value in roi)
+    col_x, col_y, row_x, row_y = terms
+    device = face_u8.device
+    channels, src_h, src_w = (int(value) for value in face_u8.shape)
+    roi_h, roi_w = y1 - y0, x1 - x0
+
+    def column(values: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(values[x0:x1].astype(np.int32)).to(device)
+
+    def row(values: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(values[y0:y1].astype(np.int32)).to(device)
+
+    x_full = row(row_x)[:, None] + column(col_x)[None, :]
+    y_full = row(row_y)[:, None] + column(col_y)[None, :]
+    x32 = torch.div(x_full, CV_WARP_TAB_SIZE, rounding_mode="floor")
+    y32 = torch.div(y_full, CV_WARP_TAB_SIZE, rounding_mode="floor")
+    sx0 = torch.div(x32, CV_WARP_TAB_SIZE, rounding_mode="floor")
+    sy0 = torch.div(y32, CV_WARP_TAB_SIZE, rounding_mode="floor")
+    fx = x32 - CV_WARP_TAB_SIZE * sx0
+    fy = y32 - CV_WARP_TAB_SIZE * sy0
+
+    source = face_u8.reshape(channels, src_h * src_w)
+
+    def tap(offset_x: int, offset_y: int) -> torch.Tensor:
+        """One tap of the bilinear (0 outside the source, like cv2)."""
+        sx = sx0 + offset_x
+        sy = sy0 + offset_y
+        inside = (sx >= 0) & (sx < src_w) & (sy >= 0) & (sy < src_h)
+        flat = (sy.clamp(0, src_h - 1) * src_w + sx.clamp(0, src_w - 1)).reshape(-1)
+        values = source[:, flat].to(torch.int32).reshape(channels, roi_h, roi_w)
+        return values * inside.to(torch.int32)
+
+    w00 = (CV_WARP_TAB_SIZE - fx) * (CV_WARP_TAB_SIZE - fy)
+    w01 = fx * (CV_WARP_TAB_SIZE - fy)
+    w10 = (CV_WARP_TAB_SIZE - fx) * fy
+    w11 = fx * fy
+    total = (
+        w00 * tap(0, 0)
+        + w01 * tap(1, 0)
+        + w10 * tap(0, 1)
+        + w11 * tap(1, 1)
+        + 512
+    ) >> 10
+    return total.clamp_(0, 255).to(torch.uint8)
+
+
+def _background_max_outside(frame: np.ndarray, roi: tuple[int, int, int, int]) -> float:
+    """The maximum of the background outside the ROI (the four bands).
+
+    The blend outside the ROI is the background itself, so the frame-global
+    maximum of the vendored tail is the maximum of the ROI blend and this
+    value.  It is only needed when the ROI blend is near black - the rare
+    branch of the vendored tail.
+    """
+    x0, y0, x1, y1 = roi
+    height, width = frame.shape[:2]
+    maximum = 0.0
+    if y0 > 0:
+        maximum = max(maximum, float(frame[:y0].max()))
+    if y1 < height:
+        maximum = max(maximum, float(frame[y1:].max()))
+    if x0 > 0:
+        maximum = max(maximum, float(frame[y0:y1, :x0].max()))
+    if x1 < width:
+        maximum = max(maximum, float(frame[y0:y1, x1:].max()))
+    return maximum
+
+
+def _paste_frame_full_canvas(
+    face: np.ndarray,
+    inverse_affine: np.ndarray,
+    warped_mask: torch.Tensor,
+    background: np.ndarray,
+    device: torch.device,
+    out_size: tuple[int, int],
+) -> np.ndarray:
+    """The full-canvas paste of one frame (the near-black fallback).
+
+    The vendored tail multiplies the **whole canvas** by 255 when the
+    blended frame is near black (``face_restoration_helper.py:504-505``) -
+    a frame-global operation the ROI cannot reproduce.  Such a frame falls
+    back to the full-canvas path, which is bit-exact by construction.
+
+    Args:
+        warped_mask: the **warped** parse mask of the frame - the full
+            canvas ``(H, W)``, from the batched warp of the chunk.
+    """
+    warped_face = cv2.warpAffine(face, inverse_affine, out_size)
+    warped_face_t = (
+        torch.from_numpy(np.ascontiguousarray(warped_face))
+        .to(device)
+        .permute(2, 0, 1)
+        .to(torch.float32)
+    )
+    background_t = (
+        torch.from_numpy(np.ascontiguousarray(background))
+        .to(device)
+        .permute(2, 0, 1)
+        .to(torch.float32)
+    )
+    blended = warped_mask * warped_face_t + (1.0 - warped_mask) * background_t
+    pasted = _quantize_and_clip(blended).round_().to(torch.uint8)
+    return pasted.permute(1, 2, 0).contiguous().cpu().numpy()
+
+
+def _paste_chunk_roi(
+    faces: np.ndarray,
+    inverse_affines: list[np.ndarray],
+    background: np.ndarray,
+    device: torch.device,
+    parse_net,
+    out_size: tuple[int, int],
+    parse_chunk: int | None,
+) -> list[np.ndarray]:
+    """One chunk of the ROI paste (the steps of :func:`paste_faces_batch`).
+
+    Every frame is pasted in the ROI of its transformed face: the face warp
+    runs on the device (cv2's fixed-point bilinear, bit-exact), the parse
+    mask is warped on the device (the full-canvas grid, sliced), the blend
+    runs on the device inside the ROI and only the ROI patch travels
+    between the host and the device.  The frame is assembled on the host
+    from the untouched background and the ROI patch.
+    """
+    faces_u8 = torch.from_numpy(np.ascontiguousarray(faces)).to(device)
+    PASTE_TRANSFER_STATS["face_h2d_bytes"] += faces_u8.numel() * faces_u8.element_size()
+    faces_bchw = faces_u8.permute(0, 3, 1, 2)  # (N, 3, 512, 512) BGR
+
+    # 1. the parse mask of the faces
+    masks = parse_soft_masks_batched(parse_net, faces_bchw, device, parse_chunk)
+
+    # 2. the ROI of every frame
+    height, width = background.shape[1:3]
+    PASTE_TRANSFER_STATS["canvas_bytes"] = int(height * width * 3)
+    rois = [
+        face_roi_box(inverse_affines[index], (height, width))
+        for index in range(len(inverse_affines))
+    ]
+    terms = [
+        warp_fixed_point_terms(inverse_affines[index], width, height)
+        for index in range(len(inverse_affines))
+    ]
+
+    # the warped parse masks of the ROIs - one batched call for the whole
+    # chunk (the sampling arithmetic of the kernel depends on the batch, so
+    # a per-frame call would drift by a last bit)
+    warped_masks = warp_affine_batch(masks, inverse_affines, out_size, rois=rois)
+
+    blends: list[torch.Tensor] = []
+    maxima: list[torch.Tensor] = []
+    for index, roi in enumerate(rois):
+        x0, y0, x1, y1 = roi
+        warped_face = warp_face_roi(faces_bchw[index], terms[index], roi).to(torch.float32)
+        warped_mask = warped_masks[index][0]
+        patch = np.ascontiguousarray(background[index][y0:y1, x0:x1])
+        patch_t = torch.from_numpy(patch).to(device)
+        PASTE_TRANSFER_STATS["h2d_bytes"] += patch_t.numel() * patch_t.element_size()
+        patch_t = patch_t.permute(2, 0, 1).to(torch.float32)
+        blends.append(warped_mask * warped_face + (1.0 - warped_mask) * patch_t)
+        maxima.append(blends[-1].amax())
+
+    # one synchronisation for the whole chunk: the frame-global maximum of
+    # the vendored tail is the only place where the whole frame matters
+    frame_maxima = torch.stack(maxima).cpu().numpy()
+
+    pasted: list[np.ndarray] = []
+    full_masks: list[torch.Tensor] | None = None
+    for index, roi in enumerate(rois):
+        x0, y0, x1, y1 = roi
+        maximum = maxima[index]
+        if float(frame_maxima[index]) <= 1.001:
+            outside = _background_max_outside(background[index], roi)
+            if outside <= 1.001:
+                # the whole frame is near black: the vendored tail scales the
+                # **whole canvas** by 255 - the full-canvas fallback
+                PASTE_TRANSFER_STATS["fallback_frames"] += 1
+                if full_masks is None:
+                    # the batched full-canvas warp of the masks - the
+                    # fallback has to use the very same sampling as the
+                    # full-canvas path
+                    full_masks = list(warp_affine_batch(masks, inverse_affines, out_size))
+                pasted.append(
+                    _paste_frame_full_canvas(
+                        faces[index],
+                        inverse_affines[index],
+                        full_masks[index][0],
+                        background[index],
+                        device,
+                        out_size,
+                    )
+                )
+                continue
+            maximum = torch.tensor(
+                max(float(frame_maxima[index]), outside), device=device
+            )
+        quantized = _quantize_and_clip(blends[index], maximum=maximum).round_().to(torch.uint8)
+        patch = quantized.permute(1, 2, 0).contiguous().cpu().numpy()
+        PASTE_TRANSFER_STATS["d2h_bytes"] += patch.nbytes
+        frame = background[index].copy()
+        frame[y0:y1, x0:x1] = patch
+        pasted.append(frame)
+        PASTE_TRANSFER_STATS["roi_frames"] += 1
+    return pasted

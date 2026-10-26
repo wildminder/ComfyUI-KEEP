@@ -18,7 +18,12 @@ What it pins:
 - the **pixels** - the vendored-fallback branch (no parse net) is bit-exact
   against the base; the batched paste branch stays inside the documented
   tolerance of the parse mask blur (the only replaced op with a non-zero
-  deviation).
+  deviation);
+- the **ROI path** - the shipped paste runs in the ROI of the transformed
+  face, and the suite asserts the ROI marker (the product's own transfer
+  accounting) over both paste branches (with and without a parse net) and
+  the small-frame case: the pixels alone cannot prove that the ROI path
+  ran, because it produces the same image as the full-canvas paste.
 
 The test is skipped when the base implementation cannot be reached (a
 distribution without the git history) - it never fails silently.
@@ -312,4 +317,180 @@ def test_the_failed_affine_degrades_instead_of_crashing(
     assert diff.max() <= 1.0, (
         f"the failed-affine frame is not its own background: "
         f"{diff.max():.2f}/255 off"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The ROI path (the paste-stage CPU optimization round)
+#
+# The shipped paste runs in the **ROI** of the transformed face: the face
+# warp, the parse-mask warp and the blend run there and only the ROI
+# patch travels between the host and the device.  The ROI path produces
+# the same pixels as the full-canvas paste it replaces - so the pixels
+# alone cannot prove that it ran.  The **ROI marker** is what proves it:
+# the product's own transfer accounting (``PASTE_TRANSFER_STATS``), which
+# the suite resets before a run and reads after it.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def gpu_paste():
+    """The paste module of the shipped pipeline (the ROI marker lives there)."""
+    return importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+
+
+def _run_marked(gpu_paste, module, helper, frames, **kwargs):
+    """Run the pipeline and return its output and the ROI marker.
+
+    ``PASTE_TRANSFER_STATS`` describes the **last** paste call, so the
+    counters are reset before the run - a stale counter of an earlier
+    call must never be read as the evidence of this one.
+    """
+    gpu_paste.reset_paste_transfer_stats()
+    output = _run(module, helper, frames, **kwargs)
+    return output, dict(gpu_paste.PASTE_TRANSFER_STATS)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("frame_hw", [(720, 1280), (300, 400)])
+def test_the_batched_paste_takes_the_roi_path(
+    helper_module, base_module, shipped_module, gpu_paste, frame_hw
+):
+    """The shipped paste runs in the ROI of the transformed face.
+
+    The ROI paste (the paste-stage CPU optimization round) is the shipped
+    path of the batched paste: the face warp, the parse-mask warp and the
+    blend run on the ROI of the transformed face and only the ROI patch
+    travels between the host and the device.
+
+    The **ROI marker** - the product's own transfer accounting - is what
+    proves that the path was taken.  The pixels alone would not: the
+    full-canvas paste produces the same image (the next test pins that),
+    so a suite that only compared the output would stay green with the
+    ROI path switched off.
+
+    Both frame sizes are covered: the normal 720x1280 and the
+    ``min(h, w) < 512`` frame, whose canvas is the 512 px upscaled frame
+    of the vendored ``read_image``.  The tolerance against the base
+    implementation stays the documented :data:`PASTE_TOLERANCE` (1/255) -
+    the ROI path must not widen it.
+    """
+    height, width = frame_hw
+    frames = _synthetic_frames(2, height, width)
+
+    base_out = _run(base_module, _DetectingHelper(helper_module, True), frames)
+    shipped_out, marker = _run_marked(
+        gpu_paste, shipped_module, _DetectingHelper(helper_module, True), frames
+    )
+
+    base = base_out.numpy()
+    shipped = shipped_out.numpy()
+    assert shipped.shape == base.shape, (
+        f"the ROI paste changed the output shape for {height}x{width}: "
+        f"{shipped.shape} != {base.shape}"
+    )
+    diff = np.abs(base.astype(np.float32) - shipped.astype(np.float32))
+    assert diff.max() <= PASTE_TOLERANCE / 255.0 + 1e-6, (
+        f"the ROI paste drifted {diff.max() * 255:.2f}/255 from the base "
+        f"for {height}x{width}"
+    )
+
+    # the ROI marker: both frames took the ROI path, none of them fell
+    # back to the full canvas (the near-black branch)
+    assert marker["frames"] == 2, marker
+    assert marker["roi_frames"] == 2, marker
+    assert marker["fallback_frames"] == 0, marker
+    # the transfers are ROI-sized, not canvas-sized: the ROI patch of every
+    # frame is smaller than the canvas it was cut from (the counters sum
+    # the frames of the call)
+    assert marker["h2d_bytes"] == marker["d2h_bytes"], marker
+    assert 0 < marker["h2d_bytes"] < 2 * marker["canvas_bytes"], marker
+    assert marker["h2d_bytes"] / marker["frames"] < marker["canvas_bytes"], marker
+    # the restored faces are uploaded whole - they are not ROI-sized by nature
+    assert marker["face_h2d_bytes"] == 2 * 512 * 512 * 3, marker
+
+
+@pytest.mark.unit
+def test_the_vendored_paste_branch_does_not_take_the_roi_path(
+    helper_module, base_module, shipped_module, gpu_paste
+):
+    """Without a parse net the paste stays with the vendored helper.
+
+    The ROI path is the **default branch** of the paste stage; the
+    vendored ``paste_faces_to_input_image`` stays the fallback of the
+    processor (a face helper without a parse net).  The ROI marker has
+    to stay empty there - a filled marker would mean that the ROI path
+    ran on a branch that has no parse mask to warp - and the pixels have
+    to stay **bit-exact** against the base (the vendored fallback is the
+    reference of the suite).
+    """
+    frames = _synthetic_frames(2, 720, 1280)
+
+    base_out = _run(base_module, _DetectingHelper(helper_module, False), frames)
+    shipped_out, marker = _run_marked(
+        gpu_paste, shipped_module, _DetectingHelper(helper_module, False), frames
+    )
+
+    assert marker["frames"] == 0, marker
+    assert marker["roi_frames"] == 0, marker
+    assert marker["fallback_frames"] == 0, marker
+    assert marker["h2d_bytes"] == 0, marker
+    assert marker["d2h_bytes"] == 0, marker
+    assert marker["canvas_bytes"] == 0, marker
+
+    diff = np.abs(
+        base_out.numpy().astype(np.float32) - shipped_out.numpy().astype(np.float32)
+    )
+    assert diff.max() == 0.0, (
+        f"the vendored paste branch drifted {diff.max() * 255:.2f}/255 "
+        f"from the base"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("frame_hw", [(720, 1280), (300, 400)])
+def test_the_roi_path_is_bit_identical_to_the_full_canvas_path(
+    helper_module, shipped_module, gpu_paste, monkeypatch, frame_hw
+):
+    """The end-to-end output of the ROI path == the output of the full canvas.
+
+    The full-canvas paste (``use_roi=False``) is the reference the ROI
+    path replaces.  Forcing it **inside the same pipeline** isolates the
+    ROI change - the crop, the restore and the background are the very
+    same operations - so the two outputs have to be the same bytes.
+
+    The pin is bit-exact: the ROI path may not change a pixel of the
+    shipped output - the two paths differ in **where** the paste
+    computes, not in **what** it computes.
+
+    The small-frame case (``min(h, w) < 512``) is covered as well: its
+    canvas is the 512 px upscaled frame of the vendored ``read_image``
+    (512x683 here), so the ROI is cut from a second canvas geometry.
+    """
+    height, width = frame_hw
+    frames = _synthetic_frames(2, height, width)
+
+    roi_out, roi_marker = _run_marked(
+        gpu_paste, shipped_module, _DetectingHelper(helper_module, True), frames
+    )
+    assert roi_marker["roi_frames"] == 2, roi_marker
+
+    original = shipped_module.paste_faces_batch
+
+    def _full_canvas_paste(*args, **kwargs):
+        kwargs["use_roi"] = False
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(shipped_module, "paste_faces_batch", _full_canvas_paste)
+    full_out, full_marker = _run_marked(
+        gpu_paste, shipped_module, _DetectingHelper(helper_module, True), frames
+    )
+
+    # the forced full-canvas paste is not the ROI path - the marker says so
+    assert full_marker["frames"] == 2, full_marker
+    assert full_marker["roi_frames"] == 0, full_marker
+    assert full_marker["h2d_bytes"] == 0, full_marker
+    assert full_marker["d2h_bytes"] == 0, full_marker
+
+    assert np.array_equal(roi_out.numpy(), full_out.numpy()), (
+        f"the ROI path changed the output of the {height}x{width} pipeline"
     )

@@ -148,7 +148,8 @@ def warp_affine_batch(
     matrices: Sequence[np.ndarray],
     out_size: tuple[int, int],
     border_value: float | Sequence[float] | None = None,
-) -> torch.Tensor:
+    rois: Sequence[tuple[int, int, int, int]] | None = None,
+) -> torch.Tensor | list[torch.Tensor]:
     """The batched ``cv2.warpAffine`` (bilinear) over a stack of images.
 
     Args:
@@ -166,11 +167,20 @@ def warp_affine_batch(
             blends the border value per tap exactly like cv2's
             ``BORDER_CONSTANT`` (a zero-padded ``grid_sample`` alone would
             lose the in-bounds fraction of the ring).
+        rois: the optional per-image ROI boxes ``(x0, y0, x1, y1)`` in the
+            **absolute** destination coordinates.  The op then returns the
+            ROI crop of the full-canvas warp - the *same* sampling grid,
+            sliced, so the result is bit-identical to the crop of the
+            full-canvas result (the ``grid_sample`` position depends only on
+            the grid value and the source size).  The ROIs differ in size
+            per image, so the result is a **list** of one ROI crop per
+            image in that case.
 
     Returns:
         ``(N, C, out_h, out_w)`` float32 - not quantized; the callers that
         replace a uint8 cv2 warp quantize with ``round / clamp / to(uint8)``
-        (see :func:`crop_faces_batch`).
+        (see :func:`crop_faces_batch`).  With ``rois``: a list of the
+        ``(1, C, roi_h, roi_w)`` crops.
     """
     if images.ndim != 4:
         raise ValueError(f"warp_affine_batch expects (N, C, H, W), got {tuple(images.shape)}")
@@ -183,6 +193,41 @@ def warp_affine_batch(
     source = images if images.dtype == torch.float32 else images.float()
 
     thetas = _thetas_from(matrices, (src_h, src_w), (out_h, out_w), source.device)
+    if rois is not None:
+        if len(rois) != images.shape[0]:
+            raise ValueError(
+                f"warp_affine_batch: {len(rois)} rois for {images.shape[0]} images"
+            )
+        # The grid is built **once**, exactly as the full-canvas path builds
+        # it - the batched ``affine_grid`` of the whole chunk - and only then
+        # sliced.  A per-frame grid is not bit-identical to the batched one
+        # (the sampling of the mask would drift by a last bit), and the ROI
+        # crop has to be bit-identical to the crop of the full-canvas warp.
+        grid = F.affine_grid(
+            thetas, (source.shape[0], source.shape[1], out_h, out_w), align_corners=False
+        )
+        boxes = [tuple(int(value) for value in roi) for roi in rois]
+        roi_h = max(box[3] - box[1] for box in boxes)
+        roi_w = max(box[2] - box[0] for box in boxes)
+        # The crops are sampled in **one batched** call: the sampling
+        # arithmetic of the kernel depends on the batch, so a per-frame call
+        # drifts by a last bit against the full-canvas warp.  The grids are
+        # padded to the largest ROI - the padding is cropped away.
+        padded = torch.zeros(
+            (source.shape[0], roi_h, roi_w, 2), device=source.device, dtype=grid.dtype
+        )
+        for index, (x0, y0, x1, y1) in enumerate(boxes):
+            padded[index, : y1 - y0, : x1 - x0] = grid[index, y0:y1, x0:x1, :]
+        sampled = F.grid_sample(
+            source, padded, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
+        if border_value is not None:
+            sampled = sampled + _border_fill(source, padded, border_value, src_h, src_w)
+        return [
+            sampled[index : index + 1, :, : box[3] - box[1], : box[2] - box[0]]
+            for index, box in enumerate(boxes)
+        ]
+
     grid = F.affine_grid(
         thetas, (source.shape[0], source.shape[1], out_h, out_w), align_corners=False
     )
@@ -192,16 +237,33 @@ def warp_affine_batch(
     if border_value is None:
         return sampled
 
+    # A zero-padded sample already carries the in-bounds fraction of the
+    # interpolation weights; the ones-map sample with the identical grid
+    # yields exactly that weight, so the missing part is border * (1 - w) -
+    # the same per-tap blend cv2 performs against its border value.
+    return sampled + _border_fill(source, grid, border_value, src_h, src_w)
+
+
+def _border_fill(
+    source: torch.Tensor,
+    grid: torch.Tensor,
+    border_value: float | Sequence[float],
+    src_h: int,
+    src_w: int,
+) -> torch.Tensor:
+    """The border value of the out-of-bounds taps of one warped image.
+
+    The ones-map sample with the identical grid yields the in-bounds weight
+    of every pixel, so ``border * (1 - weight)`` is the part of the border
+    value that the zero padding dropped (the per-tap blend of cv2's
+    ``BORDER_CONSTANT``).
+    """
     border = torch.as_tensor(border_value, dtype=source.dtype, device=source.device)
     if border.numel() not in (1, source.shape[1]):
         raise ValueError(
             f"border_value must be a scalar or one value per channel "
             f"({source.shape[1]}), got {border.numel()}"
         )
-    # A zero-padded sample already carries the in-bounds fraction of the
-    # interpolation weights; the ones-map sample with the identical grid
-    # yields exactly that weight, so the missing part is border * (1 - w) -
-    # the same per-tap blend cv2 performs against its border value.
     weight = F.grid_sample(
         torch.ones(
             (source.shape[0], 1, src_h, src_w), device=source.device, dtype=source.dtype
@@ -211,7 +273,7 @@ def warp_affine_batch(
         padding_mode="zeros",
         align_corners=False,
     )
-    return sampled + border.reshape(1, -1, 1, 1) * (1.0 - weight)
+    return border.reshape(1, -1, 1, 1) * (1.0 - weight)
 
 
 def crop_faces_batch(

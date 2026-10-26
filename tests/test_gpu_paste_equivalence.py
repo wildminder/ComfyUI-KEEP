@@ -26,6 +26,15 @@ Bound provenance:
 - the blend and its quantizing tail are the elementwise chain of
   ``:495-507`` - bit-exact against the vendored arithmetic, the residual
   of the paste comes from the two warps above.
+
+The **ROI paste** (the paste-stage CPU optimization round) is pinned here
+as well: the ROI face warp (cv2's fixed-point bilinear, re-implemented in
+int32 on the device), the ROI mask warp (the full-canvas grid, sliced),
+the ROI blend, the support of the warped parse mask, the transfer
+accounting and the frame-global maximum of the quantizing tail.  Those
+pins are **bit-exact** - the ROI path has to reproduce the crop of the
+full-canvas result byte for byte (a tolerance would be a QA failure, not
+an acceptance).
 """
 
 from __future__ import annotations
@@ -378,6 +387,472 @@ def test_the_batched_paste_rejects_a_wrong_face_size(gpu_paste):
             device=torch.device("cpu"),
             parse_net=_StubParseNet(),
         )
+
+
+# ---------------------------------------------------------------------------
+# The ROI paste (the paste-stage CPU optimization round)
+#
+# The ROI paste replaces the full-canvas paste of the same pipeline: the
+# face warp, the mask warp and the blend run on the **ROI** of the
+# transformed face and only the ROI patch travels between the host and the
+# device.  The pins below are the acceptance criteria of the round:
+#
+# 1. the ROI face warp is bit-exact against ``cv2.warpAffine`` (the smooth
+#    and the noise corpus, at an interior and at an edge-touching ROI),
+# 2. the ROI mask warp is bit-exact against the crop of the full-canvas
+#    mask warp,
+# 3. the ROI blend is bit-exact against the crop of the full-canvas blend,
+# 4. the support of the warped parse mask stays inside the ROI (no seam),
+# 5. the transfer counters are ROI-sized, not canvas-sized,
+# 6. the frame-global maximum branch of the quantizing tail: a near-black
+#    frame falls back to the full-canvas path, and a near-black ROI inside
+#    a bright frame does not.
+# ---------------------------------------------------------------------------
+
+#: The canvas of the ROI pins - big enough for a face and small enough for
+#: a fast test.
+ROI_CANVAS_HW = (360, 640)
+
+
+def _face_u8(corpus: str, seed: int) -> np.ndarray:
+    """One 512x512 BGR face of a corpus (the smooth and the noise one).
+
+    The face is the input of the paste's face warp; the corpus is the
+    smooth + noise pair the other pins of this file use - the noise face is
+    the adversarial case for the fixed-point sampling (its gradients reach
+    255 per pixel).
+    """
+    rng = np.random.default_rng(seed)
+    if corpus == "noise":
+        return rng.integers(0, 256, size=(512, 512, 3), dtype=np.uint8)
+    small = rng.uniform(0.0, 255.0, size=(32, 32, 3)).astype(np.float32)
+    smooth = cv2.resize(small, (512, 512), interpolation=cv2.INTER_CUBIC)
+    return np.clip(smooth, 0, 255).astype(np.uint8)
+
+
+def _face_to_canvas(
+    canvas_hw: tuple[int, int], position: str = "interior", scale: float = 0.25
+) -> np.ndarray:
+    """The face -> canvas matrix of the paste, at a controlled ROI position.
+
+    The paste warps the face onto the canvas with the matrix of
+    ``get_inverse_affine`` (``cv2.invertAffineTransform(affine) *
+    upscale_factor``) - the map is the **forward** one (face -> canvas),
+    because ``cv2.warpAffine`` inverts it internally.
+
+    The face is scaled down (a quarter of the face size) and rotated,
+    so the ROI is a small part of the canvas - the transfer claim needs
+    one - and the fixed-point sampling has a non-trivial fraction.
+    ``interior`` puts the face in the middle of the canvas, ``edge`` hangs
+    it over the top-left corner, so the ROI is clipped by the canvas.
+    """
+    height, width = canvas_hw
+    angle = np.deg2rad(7.0)
+    matrix = np.zeros((2, 3), dtype=np.float64)
+    matrix[:, :2] = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+    ) * scale
+    if position == "interior":
+        center = np.array([width * 0.55, height * 0.45], dtype=np.float64)
+    else:
+        center = np.array([26.0, 20.0], dtype=np.float64)
+    matrix[:, 2] = center - matrix[:, :2] @ np.array([256.0, 256.0])
+    return matrix
+
+
+def _soft_masks(gpu_paste, faces: np.ndarray, parse_net) -> torch.Tensor:
+    """The soft parse masks of the faces (the product's own chain)."""
+    faces_t = torch.from_numpy(np.ascontiguousarray(faces)).permute(0, 3, 1, 2)
+    return gpu_paste.parse_soft_masks_batched(
+        parse_net, faces_t, torch.device("cpu"), chunk_size=2
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("corpus", ["smooth", "noise"])
+@pytest.mark.parametrize("position", ["interior", "edge"])
+def test_the_roi_face_warp_is_bit_exact_against_cv2(
+    gpu_paste, corpus, position
+):
+    """The device ROI face warp == the crop of ``cv2.warpAffine``.
+
+    The ROI warp is cv2's own bilinear, re-implemented in int32 on the
+    device (the 1/32 sampling grid, the four taps, the ``(+512) >> 10``
+    rounding and the ``BORDER_CONSTANT`` rule).  The pin is **bit-exact**:
+    the device warp and the ROI crop of the full-canvas ``cv2.warpAffine``
+    are the same bytes.
+
+    The two corpora are the two sides of the fixed-point sampling (a
+    smooth face hides a wrong rounding, a noise face does not) and the two
+    positions are the two sides of the ROI (an interior ROI and one the
+    canvas clips, where the border taps fall outside the source).
+    """
+    height, width = ROI_CANVAS_HW
+    face = _face_u8(corpus, seed=61 + len(corpus))
+    matrix = _face_to_canvas(ROI_CANVAS_HW, position)
+    roi = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
+    terms = gpu_paste.warp_fixed_point_terms(matrix, width, height)
+
+    warped = gpu_paste.warp_face_roi(
+        torch.from_numpy(face).permute(2, 0, 1).contiguous(), terms, roi
+    ).numpy()
+    reference = cv2.warpAffine(face, matrix, (width, height))
+    x0, y0, x1, y1 = roi
+
+    assert np.array_equal(warped, reference[y0:y1, x0:x1].transpose(2, 0, 1)), (
+        f"the ROI face warp drifted from cv2 on the {corpus} corpus "
+        f"at the {position} ROI"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="no CUDA device for the GPU pin"
+)
+def test_the_roi_face_warp_is_bit_exact_on_the_gpu(gpu_paste):
+    """The ROI face warp on the GPU == the CPU warp == cv2's crop.
+
+    The emulation is pure int32 (the 1/32 grid, the four taps, the
+    ``(+512) >> 10`` rounding), so it is **device independent** - and the
+    production path runs it on the GPU.  The pin asserts that the two
+    devices and cv2 agree byte for byte on the adversarial corpus.
+    """
+    height, width = ROI_CANVAS_HW
+    face = _face_u8("noise", seed=67)
+    matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
+    roi = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
+    terms = gpu_paste.warp_fixed_point_terms(matrix, width, height)
+    source = torch.from_numpy(face).permute(2, 0, 1).contiguous()
+
+    on_gpu = gpu_paste.warp_face_roi(source.cuda(), terms, roi).cpu().numpy()
+    on_cpu = gpu_paste.warp_face_roi(source, terms, roi).numpy()
+    x0, y0, x1, y1 = roi
+    reference = cv2.warpAffine(face, matrix, (width, height))[
+        y0:y1, x0:x1
+    ].transpose(2, 0, 1)
+
+    assert np.array_equal(on_gpu, on_cpu), "the GPU face warp differs from the CPU one"
+    assert np.array_equal(on_gpu, reference), "the GPU face warp differs from cv2"
+
+
+@pytest.mark.unit
+def test_the_roi_mask_warp_is_bit_exact_against_the_full_canvas_warp(
+    gpu_paste, gpu_ops
+):
+    """The ROI mask warp == the crop of the full-canvas mask warp.
+
+    The mask warp is exact by construction: ``grid_sample``'s sampling
+    position depends only on the grid value and the source size, so the
+    ROI's grid is the full-canvas grid **sliced** - the same taps, the same
+    weights, the same zero padding.  The pin is bit-exact on the float32
+    mask (there is no quantisation in between).
+    """
+    height, width = ROI_CANVAS_HW
+    faces = np.stack([_face_u8("noise", 71), _face_u8("smooth", 73)])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "edge"),
+    ]
+    masks = _soft_masks(gpu_paste, faces, _StubParseNet(seed=79))
+    rois = [gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW) for matrix in matrices]
+
+    full = gpu_ops.warp_affine_batch(masks, matrices, (width, height))
+    cropped = gpu_ops.warp_affine_batch(
+        masks, matrices, (width, height), rois=rois
+    )
+
+    for index, (x0, y0, x1, y1) in enumerate(rois):
+        assert torch.equal(cropped[index][0], full[index][:, y0:y1, x0:x1]), (
+            f"frame {index}: the ROI mask warp drifted from the full-canvas warp"
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("corpus", ["smooth", "noise"])
+def test_the_roi_blend_is_bit_exact_against_the_full_canvas_blend(
+    gpu_paste, gpu_ops, corpus
+):
+    """The ROI blend == the crop of the full-canvas blend.
+
+    The blend is ``mask * face + (1 - mask) * background`` - an elementwise
+    float32 chain, so the ROI form is bit-exact when its three inputs are
+    (the face warp pin, the mask warp pin and the untouched background
+    patch).
+    """
+    height, width = ROI_CANVAS_HW
+    face = _face_u8(corpus, seed=83)
+    matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
+    roi = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
+    x0, y0, x1, y1 = roi
+    rng = np.random.default_rng(89)
+    background = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
+    masks = _soft_masks(gpu_paste, face[None], _StubParseNet(seed=97))
+    terms = gpu_paste.warp_fixed_point_terms(matrix, width, height)
+
+    # the full-canvas reference: cv2's face warp, the device mask warp
+    warped_face = torch.from_numpy(
+        cv2.warpAffine(face, matrix, (width, height))
+    ).permute(2, 0, 1).float()
+    warped_mask = gpu_ops.warp_affine_batch(masks, [matrix], (width, height))
+    background_t = torch.from_numpy(background).permute(2, 0, 1).float()
+    full = warped_mask * warped_face + (1.0 - warped_mask) * background_t
+
+    # the ROI form: the device face warp, the sliced mask, the ROI patch
+    roi_face = gpu_paste.warp_face_roi(
+        torch.from_numpy(face).permute(2, 0, 1).contiguous(), terms, roi
+    ).float()
+    roi_mask = gpu_ops.warp_affine_batch(
+        masks, [matrix], (width, height), rois=[roi]
+    )[0][0]
+    patch = torch.from_numpy(
+        np.ascontiguousarray(background[y0:y1, x0:x1])
+    ).permute(2, 0, 1).float()
+    blended = roi_mask * roi_face + (1.0 - roi_mask) * patch
+
+    assert np.array_equal(blended.numpy(), full[0][:, y0:y1, x0:x1].numpy()), (
+        f"the ROI blend drifted from the full-canvas blend on the {corpus} corpus"
+    )
+
+
+@pytest.mark.unit
+def test_the_warped_parse_mask_stays_inside_the_roi(gpu_paste, gpu_ops):
+    """The support of the warped parse mask stays inside the ROI.
+
+    The parse mask is zeroed in a 10 px border of the face, so its support
+    is ``[10, 501]²`` and the bilinear can only spread it to ``[9, 502]²`` -
+    strictly inside the transformed footprint of the face, hence inside the
+    ROI.  The pin asserts it instead of assuming it: every pixel outside
+    the ROI is exactly zero (no seam at the ROI's border) and the ROI's
+    border ring is zero on the sides the canvas does not clip.
+    """
+    height, width = ROI_CANVAS_HW
+    faces = np.stack([_face_u8("noise", 101), _face_u8("smooth", 103)])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "edge"),
+    ]
+    masks = _soft_masks(gpu_paste, faces, _StubParseNet(seed=107))
+    rois = [gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW) for matrix in matrices]
+    full = gpu_ops.warp_affine_batch(masks, matrices, (width, height))
+
+    for index, (x0, y0, x1, y1) in enumerate(rois):
+        warped = full[index][0]
+        outside = warped.clone()
+        outside[y0:y1, x0:x1] = 0
+        assert outside.abs().max().item() == 0.0, (
+            f"frame {index}: the warped parse mask reaches outside the ROI"
+        )
+        # the ROI's border ring - zero on the sides the canvas does not clip
+        ring = []
+        if x0 > 0:
+            ring.append(warped[y0:y1, x0])
+        if x1 < width:
+            ring.append(warped[y0:y1, x1 - 1])
+        if y0 > 0:
+            ring.append(warped[y0, x0:x1])
+        if y1 < height:
+            ring.append(warped[y1 - 1, x0:x1])
+        for pixels in ring:
+            assert pixels.abs().max().item() == 0.0, (
+                f"frame {index}: the ROI's border ring of the warped mask is not zero"
+            )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("corpus", ["smooth", "noise"])
+@pytest.mark.parametrize("position", ["interior", "edge"])
+def test_the_roi_paste_is_bit_identical_to_the_full_canvas_paste(
+    gpu_paste, corpus, position
+):
+    """The whole ROI paste == the whole full-canvas paste, byte for byte.
+
+    The ROI path is the shipped path (``use_roi=True``); the full-canvas
+    path (``use_roi=False``) is the reference the ROI path replaces.  The
+    pin is bit-exact: the face warp, the mask warp, the blend and the host
+    assembly reproduce the full-canvas result on every pixel.
+
+    The two frames of the chunk have **different** ROIs (a different
+    scale), so the per-frame ROI of the chunk - and the padded batched
+    mask warp that serves it - is exercised.
+    """
+    height, width = ROI_CANVAS_HW
+    rng = np.random.default_rng(109)
+    faces = np.stack([_face_u8(corpus, seed=113), _face_u8(corpus, seed=127)])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, position),
+        _face_to_canvas(ROI_CANVAS_HW, position, scale=0.3),
+    ]
+    background = rng.integers(
+        0, 256, size=(2, height, width, 3), dtype=np.uint8
+    )
+    parse_net = _StubParseNet(seed=131)
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=parse_net,
+        frame_chunk=2,
+    )
+
+    roi_paste = gpu_paste.paste_faces_batch(use_roi=True, **kwargs)
+    full_paste = gpu_paste.paste_faces_batch(use_roi=False, **kwargs)
+
+    for index, (roi_frame, full_frame) in enumerate(zip(roi_paste, full_paste)):
+        assert np.array_equal(roi_frame, full_frame), (
+            f"frame {index}: the ROI paste drifted from the full-canvas paste "
+            f"on the {corpus} corpus at the {position} ROI"
+        )
+
+
+@pytest.mark.unit
+def test_the_roi_transfers_are_roi_sized(gpu_paste):
+    """The transfer counters are ROI-sized, not canvas-sized.
+
+    The counters are the product's own accounting
+    (``PASTE_TRANSFER_STATS``) - the probe reads them for the before/after
+    table, so the claim "no full-canvas H2D / D2H of the background and of
+    the blended canvas" is checkable here: the background patch and the
+    blended patch that travel are the ROI ones.
+    """
+    height, width = ROI_CANVAS_HW
+    rng = np.random.default_rng(137)
+    faces = np.stack([_face_u8("noise", 139), _face_u8("smooth", 149)])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "edge"),
+    ]
+    background = rng.integers(
+        0, 256, size=(2, height, width, 3), dtype=np.uint8
+    )
+
+    gpu_paste.paste_faces_batch(
+        faces_bgr=faces,
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=151),
+        frame_chunk=2,
+    )
+    stats = gpu_paste.PASTE_TRANSFER_STATS
+    roi_bytes = 0
+    for matrix in matrices:
+        x0, y0, x1, y1 = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
+        roi_bytes += (x1 - x0) * (y1 - y0) * 3
+
+    assert stats["frames"] == 2
+    assert stats["roi_frames"] == 2
+    assert stats["fallback_frames"] == 0
+    assert stats["canvas_bytes"] == height * width * 3
+    assert stats["h2d_bytes"] == roi_bytes, stats
+    assert stats["d2h_bytes"] == roi_bytes, stats
+    assert stats["face_h2d_bytes"] == 2 * 512 * 512 * 3, stats
+    # the ROI transfers are a small part of the canvas transfers
+    assert stats["h2d_bytes"] < 2 * stats["canvas_bytes"], stats
+    assert stats["d2h_bytes"] < 2 * stats["canvas_bytes"], stats
+
+
+@pytest.mark.unit
+def test_a_dark_frame_takes_the_full_canvas_fallback(gpu_paste, face_helper):
+    """A near-black frame falls back to the full-canvas path.
+
+    The vendored tail multiplies the **whole canvas** by 255 when the
+    blended frame is near black (``face_restoration_helper.py:504-505``) -
+    a frame-global operation the ROI cannot reproduce.  Such a frame falls
+    back to the full-canvas path.
+
+    The pin: the fallback counter is on, the ROI paste is bit-identical to
+    the full-canvas paste and the output matches the vendored paste.  The
+    residual against the vendored paste is the mask-warp residual of the
+    other pins (the vendored mask is cv2's 1/32-quantised warp, the
+    product's is the float32 grid sample) - **not** a residual of the ROI
+    path, which is bit-identical to the full-canvas paste.  The near-black
+    branch multiplies the blend by 255, so that residual is amplified:
+    measured on this content, **5/255** (the un-amplified residual is
+    5/255/255, well inside the 8/255 the noise pin of the batched paste
+    measures).
+    """
+    height, width = ROI_CANVAS_HW
+    matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
+    rng = np.random.default_rng(157)
+    # a near-black frame: the blend stays <= 1, so the vendored tail takes
+    # its "values are likely 0-1 float" branch and scales the canvas by 255.
+    # The frame is not *all* zero: the vendored paste treats an all-zero
+    # input as "no image loaded" (``face_restoration_helper.py:356``).
+    face = rng.integers(0, 2, size=(512, 512, 3), dtype=np.uint8)
+    background = rng.integers(0, 2, size=(1, height, width, 3), dtype=np.uint8)
+    parse_net = _StubParseNet(seed=163)
+    kwargs = dict(
+        faces_bgr=face[None],
+        inverse_affines=[matrix],
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=parse_net,
+        frame_chunk=1,
+    )
+
+    roi_paste = gpu_paste.paste_faces_batch(use_roi=True, **kwargs)
+    stats = gpu_paste.PASTE_TRANSFER_STATS
+    assert stats["fallback_frames"] == 1, stats
+    assert stats["roi_frames"] == 0, stats
+
+    full_paste = gpu_paste.paste_faces_batch(use_roi=False, **kwargs)
+    assert np.array_equal(roi_paste[0], full_paste[0]), (
+        "the dark frame's ROI paste drifted from the full-canvas paste"
+    )
+
+    reference = _vendored_paste(
+        face_helper, background[0], face, cv2.invertAffineTransform(matrix),
+        1.0, parse_net,
+    )
+    diff = np.abs(reference.astype(int) - roi_paste[0].astype(int))
+    assert diff.max() <= 5, (
+        f"the dark frame drifted {diff.max()}/255 from the vendored paste"
+    )
+
+
+@pytest.mark.unit
+def test_a_dark_roi_in_a_bright_frame_keeps_the_frame_global_branch(gpu_paste):
+    """The near-black branch is decided on the **whole frame**.
+
+    A frame whose ROI is near black but whose background outside the ROI
+    is bright must **not** take the near-black branch: the factor of the
+    vendored tail comes from the frame-global maximum, so the ROI keeps its
+    values.  A ROI-local maximum would scale the ROI by 255 and ruin the
+    frame - the pin catches exactly that.
+    """
+    height, width = ROI_CANVAS_HW
+    matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
+    x0, y0, x1, y1 = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
+    rng = np.random.default_rng(167)
+    # a near-black ROI inside a bright frame
+    face = rng.integers(0, 2, size=(512, 512, 3), dtype=np.uint8)
+    background = np.full((1, height, width, 3), 200, dtype=np.uint8)
+    background[0, y0:y1, x0:x1] = 0
+    kwargs = dict(
+        faces_bgr=face[None],
+        inverse_affines=[matrix],
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=173),
+        frame_chunk=1,
+    )
+
+    roi_paste = gpu_paste.paste_faces_batch(use_roi=True, **kwargs)
+    stats = gpu_paste.PASTE_TRANSFER_STATS
+    assert stats["fallback_frames"] == 0, stats
+    assert stats["roi_frames"] == 1, stats
+
+    full_paste = gpu_paste.paste_faces_batch(use_roi=False, **kwargs)
+    assert np.array_equal(roi_paste[0], full_paste[0]), (
+        "the dark ROI's paste drifted from the full-canvas paste"
+    )
+    # the pixels outside the ROI keep their background value
+    outside = np.ones((height, width), dtype=bool)
+    outside[y0:y1, x0:x1] = False
+    assert np.array_equal(roi_paste[0][outside], background[0][outside]), (
+        "the pixels outside the ROI did not keep their background value"
+    )
 
 
 # ---------------------------------------------------------------------------
