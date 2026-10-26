@@ -17,6 +17,7 @@ import importlib
 import logging
 import types
 
+import cv2
 import numpy as np
 import pytest
 import torch
@@ -38,6 +39,13 @@ class _StubKeepNet:
         return torch.zeros_like(frames)
 
 
+#: The vendored 5-point 512 template (``face_restoration_helper.py:52-53``).
+FACE_TEMPLATE_512 = np.array(
+    [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
+     [201.26117, 371.41043], [313.08905, 371.15118]]
+)
+
+
 class _StubFaceHelper:
     """The facelib helper, reduced to the calls the processor makes."""
 
@@ -48,6 +56,10 @@ class _StubFaceHelper:
         self.cropped_faces: list = []
         self.restored_faces: list = []
         self.all_landmarks_5: list = []
+        self.affine_matrices: list = []
+        self.input_img = None
+        # the template the vendored helper estimates the crop affines with
+        self.face_template = FACE_TEMPLATE_512
         self.calls: list[str] = []
 
     def clean_all(self):
@@ -57,6 +69,15 @@ class _StubFaceHelper:
 
     def read_image(self, image):
         self.calls.append("read_image")
+        # the vendored helper keeps the image it read and upscales it when
+        # min(h, w) < 512 (``face_restoration_helper.py:179-184``) - the stub
+        # reproduces the upscale, or the paste canvas of the small frames
+        # would stay at the raw size (the round-1 defect).
+        self.input_img = image
+        if min(image.shape[:2]) < 512:
+            factor = 512.0 / min(image.shape[:2])
+            self.input_img = cv2.resize(
+                image, (0, 0), fx=factor, fy=factor, interpolation=cv2.INTER_LINEAR)
 
     def align_warp_face(self):
         self.calls.append("align_warp_face")
@@ -252,8 +273,13 @@ class _DetectingFaceHelper(_StubFaceHelper):
     """A face helper that **detects** a face - and prints like the facelib.
 
     The vendored helper writes to the console (``print()``) while it reads
-    the image, while it detects, while it aligns a face and while it pastes
-    it back: the processor must route those writes to the logger of the pack.
+    the image, while it detects and while it pastes a face back: the
+    processor must route those writes to the logger of the pack.
+
+    The zero landmarks of the stub are a degenerate set - the crop of the
+    redesigned path estimates the affine with the real vendored call, and
+    the ``LMEDS`` failure of that call is what prints the warning of the
+    facelib.
     """
 
     def __init__(self) -> None:
@@ -265,10 +291,6 @@ class _DetectingFaceHelper(_StubFaceHelper):
         print("model_rootpath is None. Using default relative path")
         self.all_landmarks_5 = [self.landmarks]
         return 1
-
-    def align_warp_face(self):
-        super().align_warp_face()
-        print("Warning: Could not estimate affine matrix for landmark set 0.")
 
     def paste_faces_to_input_image(self, *args, **kwargs):
         super().paste_faces_to_input_image(*args, **kwargs)
@@ -366,7 +388,7 @@ def test_every_console_write_of_the_facelib_reaches_the_logger(processor_module)
     messages = [record.getMessage() for record in records]
     for text in (
         "model_rootpath is None. Using default relative path",
-        "Warning: Could not estimate affine matrix for landmark set 0.",
+        "Warning: Could not estimate affine matrix for landmark set 0 (frame 0). Skipping this face.",
         "Warning: Mismatch between restored_faces and inverse_affine_matrices.",
     ):
         assert f"[KEEP] {text}" in messages, (text, messages)
@@ -393,3 +415,209 @@ def test_the_console_writes_of_the_image_path_reach_the_logger(processor_module)
     assert (
         "[KEEP] model_rootpath is None. Using default relative path" in messages
     ), messages
+
+
+# ---------------------------------------------------------------------------
+# The GPU video pipeline redesign - the batched sequence path
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_a_single_frame_chunk_is_duplicated_for_the_net(processor_module):
+    """The 1-frame chunk rule of the KEEP contract.
+
+    A chunk of one frame is fed to the net as two copies and the first
+    output frame is kept - the chunk boundaries are a quality contract and
+    must not move.
+    """
+    keep_net = _StubKeepNet()
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(keep_net, _StubFaceHelper())
+    )
+
+    frames = torch.rand((1, 16, 16, 3), dtype=torch.float32)
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=True,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    assert len(keep_net.calls) == 1, keep_net.calls
+    shape, need_upscale = keep_net.calls[0]
+    assert shape == (1, 2, 3, 512, 512), shape
+    assert need_upscale is False
+    assert tuple(output.shape) == (1, 512, 512, 3), output.shape
+
+
+@pytest.mark.unit
+def test_the_sequence_reads_and_measures_every_frame_once(processor_module):
+    """Read once, affine once.
+
+    The redesigned path reads every frame a single time (the detection) and
+    estimates its affine a single time (the crop) - the paste loop reuses
+    the matrix instead of running a second ``align_warp_face``.
+    """
+    keep_net = _StubKeepNet()
+    face_helper = _DetectingFaceHelper()
+    processor = processor_module.KEEPFaceProcessor(_make_pack(keep_net, face_helper))
+
+    frames = torch.rand((3, 16, 16, 3), dtype=torch.float32)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    assert face_helper.calls.count("read_image") == 3, face_helper.calls
+    assert "align_warp_face" not in face_helper.calls, face_helper.calls
+
+
+@pytest.mark.unit
+def test_the_progress_reports_four_steps_per_frame(processor_module, monkeypatch):
+    """The progress contract of the restructured path.
+
+    The total stays ``num_frames * 4`` and the four families of the updates
+    stay: the conversion (one batched update), the detection (one update),
+    the KEEP chunks (one update per chunk) and the paste (one update per
+    frame).
+    """
+    events: list = []
+
+    class _RecordingProgress:
+        def __init__(self, total):
+            events.append(("total", total))
+
+        def update(self, value):
+            events.append(("update", value))
+
+    monkeypatch.setattr(processor_module, "ProgressReporter", _RecordingProgress)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _DetectingFaceHelper())
+    )
+    frames = torch.rand((3, 16, 16, 3), dtype=torch.float32)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    assert events == [
+        ("total", 12),
+        ("update", 3),  # the batched convert-in
+        ("update", 3),  # the detection
+        ("update", 3),  # the single KEEP chunk
+        ("update", 1),  # the paste, frame by frame
+        ("update", 1),
+        ("update", 1),
+    ], events
+
+
+class _LandmarkFaceHelper(_StubFaceHelper):
+    """A face helper that detects a face at real, non-degenerate landmarks."""
+
+    def __init__(self, landmarks) -> None:
+        super().__init__()
+        self.landmarks = np.asarray(landmarks, dtype=np.float64).reshape(10)
+
+    def get_face_landmarks_5(self, **kwargs):
+        self.calls.append("get_face_landmarks_5")
+        self.all_landmarks_5 = [self.landmarks]
+        return 1
+
+
+class _RecordingKeepNet(_StubKeepNet):
+    """A KEEP net that keeps the frames it was called with."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frames: list = []
+
+    def __call__(self, frames, need_upscale=False):
+        self.frames.append(frames.detach().clone())
+        return super().__call__(frames, need_upscale=need_upscale)
+
+
+@pytest.mark.unit
+def test_the_batched_crop_matches_the_vendored_warp(processor_module):
+    """The crop of the redesigned path equals the vendored ``cv2.warpAffine``.
+
+    The reference is the warp of ``face_restoration_helper.py:326-328`` (the
+    512 template, the gray border) on the very frame the detector saw,
+    followed by the ``img2tensor`` + normalize tail of the processor.  The
+    measured residual of the batched warp against cv2 is at most **1/255**
+    on this content (``tests/test_gpu_batch_equivalence.py``); the bound
+    below leaves the headroom of the float round trip.
+
+    The test also pins the **affine reuse**: the paste loop receives the
+    matrix the crop computed - the second ``align_warp_face`` of the old
+    path is gone.
+    """
+    height, width = 512, 640
+    rng = np.random.default_rng(4)
+    small = rng.uniform(0.0, 255.0, size=(16, 20, 3)).astype(np.float32)
+    frame = np.clip(
+        cv2.resize(small, (width, height), interpolation=cv2.INTER_CUBIC), 0, 255
+    ).astype(np.uint8)
+    landmarks = FACE_TEMPLATE_512 + np.array([100.0, 50.0])
+
+    face_helper = _LandmarkFaceHelper(landmarks)
+    keep_net = _RecordingKeepNet()
+    processor = processor_module.KEEPFaceProcessor(_make_pack(keep_net, face_helper))
+
+    frames = torch.from_numpy(frame.astype(np.float32) / 255.0).unsqueeze(0)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    # the crop the net was called with (the 1-frame chunk is duplicated)
+    assert len(keep_net.frames) == 1, keep_net.frames
+    cropped = keep_net.frames[0][0, 0]
+    assert tuple(cropped.shape) == (3, 512, 512), cropped.shape
+
+    # the reference: the vendored warp + the img2tensor tail of the processor
+    # the warp source is the BGR conversion of the input (the converter of
+    # the pack - the same array the crop warps)
+    image_utils = importlib.import_module("ComfyUI_KEEP.src.keep_image_utils")
+    frame_bgr = image_utils.comfy_batch_to_bgr_u8(frames)[0]
+    affine = cv2.estimateAffinePartial2D(
+        landmarks, FACE_TEMPLATE_512, method=cv2.LMEDS
+    )[0]
+    reference_u8 = cv2.warpAffine(
+        frame_bgr, affine, (512, 512),
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(135, 133, 132),
+    )
+    reference = (
+        torch.from_numpy(np.ascontiguousarray(reference_u8[..., ::-1]) / 255.0)
+        .to(torch.float32)
+        .permute(2, 0, 1)
+        .sub_(0.5)
+        .div_(0.5)
+    )
+
+    # the crop is not the zero tensor of a no-face frame
+    assert cropped.abs().max() > 0.5, "the crop is empty"
+
+    difference = (cropped - reference).abs().max().item()
+    # a 1/255 difference of the uint8 crop is 1/32512.5 in the normalized scale
+    assert difference <= 2.0 / 255.0 / 127.5, (
+        f"the batched crop drifted {difference:.3e} from the vendored warp"
+    )
+
+    # the paste loop reused the matrix of the crop
+    assert len(face_helper.affine_matrices) == 1, face_helper.affine_matrices
+    assert np.allclose(face_helper.affine_matrices[0], affine), (
+        "the paste loop did not reuse the affine matrix of the crop"
+    )

@@ -26,6 +26,12 @@ line of the pack carries the tag) and the invariants of the repository (the
 vendored tree is read-only; the runtime dependencies stay the slimmed
 host-guarantee set - both files declare ``opencv-python-headless`` only).
 
+The **tripwires of the GPU redesign** live here as well (the guards G1-G6 of
+the section "The GPU video pipeline redesign"): the batched conversions, the
+read-once contract, the single affine, the chunk contract of the KEEP
+inference, the reachable vendored paste fallback and the progress contract of
+the sequence path.
+
 The guards scan the **sources of the pack** (``src/``, ``nodes/`` and the
 package entry point).  The vendored tree (``modules/deps``) is upstream code
 and is never touched - it is guarded by
@@ -40,9 +46,12 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -710,6 +719,269 @@ def test_the_runtime_dependencies_agree_on_the_slimmed_set():
 
     assert requirements == declared, (sorted(requirements), sorted(declared))
     assert requirements == {"opencv-python-headless"}, sorted(requirements)
+
+
+# ---------------------------------------------------------------------------
+# The GPU video pipeline redesign - the tripwires of the batching
+# ---------------------------------------------------------------------------
+# The redesign of the sequence path (the design document
+# ``.dev/docs/2026-10-25-keep-gpu-video-pipeline.md``, sections 7.1-7.8)
+# replaced the per-frame loops of ``process_image_sequence`` with batched
+# torch ops.  The **behavioural** pins live with the code that wrote them
+# (``tests/test_gpu_batch_equivalence.py``, ``tests/test_gpu_paste_equivalence.py``)
+# and in the processor tests (``tests/test_keep_processor.py``); the guards
+# below are the second line of defence - they catch the defect coming back
+# in a **different** place, the way the guards of the five defects do.
+#
+# ========== ================================================================
+# G1         the per-frame host<->device transfers of the conversions
+# G2         the read-once contract (one ``read_image`` per frame)
+# G3         the affine is estimated once (no second ``align_warp_face``)
+# G4         the KEEP chunk size is the quality contract (``max_clip_length``)
+# G5         the vendored paste fallback stays reachable
+# G6         the progress contract: ``num_frames * 4`` steps, four families
+# ========== ================================================================
+
+#: The module that owns the sequence path.
+PROCESSOR_MODULE = "keep_processor.py"
+
+#: The function of the sequence path that the redesign rewired.
+SEQUENCE_PATH = "process_image_sequence"
+
+
+def _sequence_node() -> ast.FunctionDef:
+    """The AST of ``process_image_sequence``."""
+    for node in ast.walk(_tree(SRC_DIR / PROCESSOR_MODULE)):
+        if isinstance(node, ast.FunctionDef) and node.name == SEQUENCE_PATH:
+            return node
+    raise AssertionError(f"{SEQUENCE_PATH} is not in {PROCESSOR_MODULE}")
+
+
+def _attribute_calls_in(node: ast.AST, attribute: str) -> list[ast.Call]:
+    """The attribute calls inside a node (``helper.read_image(...)``)."""
+    return [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == attribute
+    ]
+
+
+@pytest.mark.unit
+def test_the_sequence_path_does_not_go_back_to_the_per_frame_converters():
+    """G1 - the conversions of the sequence path stay batched.
+
+    The base path converted the frames one by one: ``comfy_image_to_cv2``
+    per frame, ``tensor2img`` per frame and ``cv2_to_comfy_image`` per
+    frame - one host<->device transfer per frame and per conversion.  That
+    is the cost the redesign removed; the batched forms must stay the ones
+    the sequence path calls.
+    """
+    node = _sequence_node()
+    for name in ("comfy_image_to_cv2", "cv2_to_comfy_image", "tensor2img"):
+        assert _calls_of(node, name) == [], (
+            f"the sequence path calls the per-frame {name} again"
+        )
+    for name in (
+        "comfy_batch_to_bgr_u8",
+        "tensor2img_batch",
+        "bgr_u8_batch_to_comfy",
+    ):
+        assert _calls_of(node, name), (
+            f"the sequence path does not call the batched {name}"
+        )
+
+
+@pytest.mark.unit
+def test_the_sequence_path_reads_every_frame_once():
+    """G2 - one ``read_image`` per frame.
+
+    The base path read every frame three times: the detection, the crop and
+    the paste.  The redesign reads it once (the detection) and the crop
+    warps the image the detector saw.  A second call site in the sequence
+    path would bring the per-frame copies back.
+    """
+    assert len(_attribute_calls_in(_sequence_node(), "read_image")) == 1, (
+        "the sequence path must read every frame exactly once"
+    )
+
+
+@pytest.mark.unit
+def test_the_sequence_path_estimates_the_affine_once():
+    """G3 - the crop owns the affine, the paste reuses it.
+
+    The base path ran ``align_warp_face`` twice per frame (the crop and the
+    paste) - two ``cv2.estimateAffinePartial2D`` calls for the same
+    landmarks.  The redesign estimates the matrices once (``estimate_affines``
+    - the same vendored call) and the paste loop reuses them.
+    """
+    node = _sequence_node()
+    assert _attribute_calls_in(node, "align_warp_face") == [], (
+        "the sequence path runs align_warp_face again"
+    )
+    assert _calls_of(node, "estimate_affines"), (
+        "the sequence path does not estimate the affines"
+    )
+
+
+@pytest.mark.unit
+def test_the_keep_chunks_follow_the_quality_contract():
+    """G4 - the chunk size of the KEEP inference is ``max_clip_length``.
+
+    ``max_clip_length`` is a **quality contract**: the temporal propagation
+    of KEEP changes the output pixels with the chunk boundaries, so the
+    boundaries must not move.  A VRAM-derived chunk size (the pattern of the
+    parse batching, which is a performance knob) would silently change the
+    output of the node.
+    """
+    chunk_loops = [
+        call
+        for call in _calls_of(_sequence_node(), "range")
+        if len(call.args) == 3
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == 0
+        and isinstance(call.args[1], ast.Name)
+        and call.args[1].id == "num_input_frames"
+    ]
+    assert len(chunk_loops) == 1, chunk_loops
+    step = chunk_loops[0].args[2]
+    assert isinstance(step, ast.Name) and step.id == "max_clip_length", (
+        f"the KEEP chunks step by {ast.unparse(step)} instead of max_clip_length"
+    )
+
+
+@pytest.mark.unit
+def test_the_vendored_paste_fallback_stays_reachable():
+    """G5 - the vendored paste is the fallback of the non-default branches.
+
+    The batched paste takes the default branch (no box, no face upsampler,
+    a color frame, a parse net).  Every other frame keeps the vendored
+    ``paste_faces_to_input_image`` - the call path must not be deleted, it
+    **is** the behaviour of the non-default branches.
+    """
+    tree = _tree(SRC_DIR / PROCESSOR_MODULE)
+    assert _attribute_calls(tree, "paste_faces_to_input_image"), (
+        "the vendored paste fallback is gone from the processor"
+    )
+
+
+#: The vendored 5-point 512 template (``face_restoration_helper.py:52-53``).
+FACE_TEMPLATE_512 = np.array(
+    [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
+     [201.26117, 371.41043], [313.08905, 371.15118]]
+)
+
+
+class _ProgressKeepNet:
+    """A KEEP net that returns zeros - the progress is the subject here."""
+
+    def __call__(self, frames, need_upscale=False):
+        return torch.zeros_like(frames)
+
+
+class _ProgressFaceHelper:
+    """The facelib helper, reduced to the calls the sequence path makes.
+
+    It detects **one** face on every frame (at the template landmarks, so
+    the affine of the crop is the identity and the batched crop really
+    runs) and it has **no** parse net: the batched paste does not take the
+    frame and the vendored fallback of the processor runs.  Both branches
+    report the same progress families.
+    """
+
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.upscale_factor = 1.0
+        self.is_gray = False
+        self.cropped_faces: list = []
+        self.restored_faces: list = []
+        self.all_landmarks_5: list = []
+        self.affine_matrices: list = []
+        self.input_img = None
+        self.face_template = FACE_TEMPLATE_512
+        self.calls: list[str] = []
+
+    def clean_all(self):
+        self.calls.append("clean_all")
+        self.cropped_faces = []
+        self.restored_faces = []
+
+    def read_image(self, image):
+        self.calls.append("read_image")
+        self.input_img = image
+
+    def get_face_landmarks_5(self, **kwargs):
+        self.calls.append("get_face_landmarks_5")
+        self.all_landmarks_5 = [FACE_TEMPLATE_512.copy()]
+        return 1
+
+    def add_restored_face(self, face, **kwargs):
+        self.calls.append("add_restored_face")
+        self.restored_faces = [face]
+
+    def get_inverse_affine(self, *args, **kwargs):
+        self.calls.append("get_inverse_affine")
+
+    def paste_faces_to_input_image(self, *args, **kwargs):
+        self.calls.append("paste_faces_to_input_image")
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+
+def _progress_pack(keep_net, face_helper):
+    """A model pack the processor can consume."""
+    return types.SimpleNamespace(
+        keep_net=keep_net,
+        face_helper=face_helper,
+        bg_upscale_model=None,
+        face_upscale_model=None,
+        device=torch.device("cpu"),
+        model_type_str="KEEP",
+    )
+
+
+@pytest.mark.unit
+def test_the_progress_reaches_the_total_of_the_frame_count(monkeypatch):
+    """G6 - the progress contract of the batched sequence path.
+
+    The reporter is created with ``num_frames * 4`` steps and the four
+    families of the updates stay: the conversion (one batched update of
+    ``N``), the detection (one update of ``N``), the KEEP chunks (one
+    update per chunk - they sum up to ``N``) and the paste (one update per
+    frame).  The pin drives the **real** reporter (``src/keep_progress.py``)
+    with five frames and two KEEP chunks, so the chunk family is measured
+    with more than one chunk - the case the single-chunk pin of the
+    processor tests does not reach.
+    """
+    progress_module = importlib.import_module("ComfyUI_KEEP.src.keep_progress")
+    processor_module = importlib.import_module("ComfyUI_KEEP.src.keep_processor")
+
+    reported: list[tuple[float, float]] = []
+
+    def _record(value, max_value):
+        reported.append((value, max_value))
+
+    monkeypatch.setattr(progress_module, "report_progress", _record)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _progress_pack(_ProgressKeepNet(), _ProgressFaceHelper())
+    )
+    frames = torch.rand((5, 16, 16, 3), dtype=torch.float32)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=2,
+    )
+
+    # the total is the frame count times the four families
+    assert {max_value for _, max_value in reported} == {20}, reported
+    # 5 (convert) + 5 (detection) + 2 + 2 + 1 (the KEEP chunks) + 5 x 1 (paste)
+    assert [value for value, _ in reported] == [
+        5, 10, 12, 14, 15, 16, 17, 18, 19, 20
+    ], reported
 
 
 # ---------------------------------------------------------------------------
