@@ -17,7 +17,11 @@ This module runs the default branch of that stage on the device:
   batched grid machinery of :mod:`.keep_gpu_ops`,
 - the blend is one tensor op,
 - the optional background upscaler runs as **one** ``tiled_scale`` call over
-  the batch instead of one call per frame.
+  the batch instead of one call per frame,
+- the **gray flags** of the frames run on the device as well - the float64
+  variances of the three channel differences, with the numpy computation as
+  the fallback of the borderline frames (the paste-stage CPU optimization
+  round, section 4.2).
 
 The **non-default branches stay with the vendored paste** (design section
 7.7, step 6): ``draw_box``, a face upsampler, the grayscale frames and a
@@ -68,6 +72,20 @@ PASTE_CHUNK_MAX = 16
 #: The gray threshold of the vendored ``is_gray``
 #: (``modules/deps/facelib/utils/misc.py:146``).
 GRAY_THRESHOLD = 10
+
+#: The band around the gray threshold in which the **device** result is not
+#: trusted: the frame falls back to the numpy computation.  The device
+#: reduction order differs from numpy's pairwise summation, so the two
+#: values can differ in the last bits - a frame whose result sits on the
+#: threshold must be decided by the numpy value, or a flag could flip.  The
+#: measured drift of the device variance against the numpy one is below
+#: ``1e-9`` on a 720p frame (the float64 sums of ~1e6 terms), so the band
+#: is three orders of magnitude above it.
+GRAY_BORDERLINE_EPSILON = 1e-6
+
+#: The pixels per chunk of the device gray flags - the VRAM budget of the
+#: float64 temporaries (eight bytes per pixel and per difference).
+GRAY_CHUNK_PIXELS = 4 << 20
 
 #: The bytes per pixel the paste staging holds per frame: the float32
 #: background (12), the float32 warped face (12), the float32 warped mask
@@ -166,18 +184,150 @@ def paste_chunk_size(
 # The gray flags of the frames
 # ---------------------------------------------------------------------------
 
-def is_gray_batch(frames_bgr_u8: np.ndarray) -> np.ndarray:
+def _is_gray_diff_sum_numpy(frame_bgr_u8: np.ndarray) -> float:
+    """The variance sum of one frame (the value the vendored ``is_gray`` compares).
+
+    The vendored helper (``facelib/utils/misc.py:146-160``) measures the
+    variance of the three channel differences and compares their mean with
+    the threshold.  This is that value, computed with numpy: the int16
+    differences and the float64 ``.var()`` are the ones of the vendored
+    call (PIL only changes the way the channels are read).
+
+    Args:
+        frame_bgr_u8: the ``(H, W, 3)`` uint8 BGR frame.
+
+    Returns:
+        The variance sum (the float64 value behind the flag).
+    """
+    frame = np.asarray(frame_bgr_u8)
+    blue = frame[..., 0].astype(np.int16)
+    green = frame[..., 1].astype(np.int16)
+    red = frame[..., 2].astype(np.int16)
+    return float(
+        (blue - green).var() + (green - red).var() + (red - blue).var()
+    ) / 3.0
+
+
+def _is_gray_batch_numpy(frames_bgr_u8: np.ndarray) -> np.ndarray:
+    """The gray flags of the frames, computed on the host (numpy).
+
+    Args:
+        frames_bgr_u8: the ``(N, H, W, 3)`` uint8 BGR frames.
+
+    Returns:
+        ``(N,)`` bool - the flag of every frame.
+    """
+    frames = np.asarray(frames_bgr_u8)
+    flags = np.zeros(frames.shape[0], dtype=bool)
+    for index in range(frames.shape[0]):
+        flags[index] = _is_gray_diff_sum_numpy(frames[index]) <= GRAY_THRESHOLD
+    return flags
+
+
+def _is_gray_diff_sums_device(
+    frames_bgr_u8: np.ndarray, device: torch.device
+) -> np.ndarray:
+    """The variance sum of every frame, computed on the device (float64).
+
+    The three channel differences are the vendored int16 ones (the channel
+    values are 0..255, so the difference never overflows) and their
+    variances are accumulated in **float64**, like the numpy ``.var()`` of
+    the host path.  The device reduction order differs from numpy's pairwise
+    summation, so the two values can differ in the last bits (the measured
+    drift is below ``1e-9`` on a 720p frame).
+
+    Args:
+        frames_bgr_u8: the ``(N, H, W, 3)`` uint8 BGR frames.
+        device: the CUDA device.
+
+    Returns:
+        ``(N,)`` float64 - the variance sum of every frame.
+    """
+    frames = np.asarray(frames_bgr_u8)
+    num_frames = int(frames.shape[0])
+    if num_frames == 0:
+        return np.zeros(0, dtype=np.float64)
+    host = np.ascontiguousarray(frames)
+    if not host.flags.writeable:
+        host = host.copy()
+    stack = torch.from_numpy(host).to(device)  # the (N, H, W, 3) uint8 frames
+    pixels = max(1, int(frames.shape[1]) * int(frames.shape[2]))
+    chunk = max(1, GRAY_CHUNK_PIXELS // pixels)
+    diff_sums = torch.empty(num_frames, dtype=torch.float64, device=device)
+    for start in range(0, num_frames, chunk):
+        stop = min(start + chunk, num_frames)
+        block = stack[start:stop].permute(0, 3, 1, 2)  # the (n, 3, H, W) uint8
+        variances = []
+        for first, second in ((0, 1), (1, 2), (2, 0)):
+            difference = (
+                block[:, first].to(torch.int16) - block[:, second].to(torch.int16)
+            )
+            variances.append(
+                difference.to(torch.float64).var(dim=(1, 2), correction=0)
+            )
+            del difference
+        diff_sums[start:stop] = (
+            variances[0] + variances[1] + variances[2]
+        ) / 3.0
+    values = diff_sums.cpu().numpy()
+    del stack, diff_sums
+    return values
+
+
+def _is_gray_batch_device(
+    frames_bgr_u8: np.ndarray, device: torch.device
+) -> np.ndarray:
+    """The gray flags of the frames, computed on the device (float64).
+
+    The variances run on the device (:func:`_is_gray_diff_sums_device`); a
+    frame whose result lands within :data:`GRAY_BORDERLINE_EPSILON` of the
+    threshold falls back to the numpy computation, and only the numpy value
+    decides it.  The flags are therefore **bit-exact** against the host path
+    - a tolerance would be a flag that can flip.
+
+    Args:
+        frames_bgr_u8: the ``(N, H, W, 3)`` uint8 BGR frames.
+        device: the CUDA device.
+
+    Returns:
+        ``(N,)`` bool - the flag of every frame.
+    """
+    frames = np.asarray(frames_bgr_u8)
+    values = _is_gray_diff_sums_device(frames, device)
+    flags = values <= GRAY_THRESHOLD
+    # the borderline frames - the numpy value decides them.
+    borderline = np.flatnonzero(
+        np.abs(values - GRAY_THRESHOLD) <= GRAY_BORDERLINE_EPSILON
+    )
+    for index in borderline:
+        flags[index] = _is_gray_diff_sum_numpy(frames[index]) <= GRAY_THRESHOLD
+    return flags
+
+
+def is_gray_batch(
+    frames_bgr_u8: np.ndarray, device: torch.device | None = None
+) -> np.ndarray:
     """The per-frame ``is_gray`` flags (``facelib/utils/misc.py:146-160``).
 
     The vendored helper measures the variance of the three channel
     differences of every frame - through PIL, so one round trip per frame.
-    This form computes the very same three variances with numpy, frame by
-    frame (the memory of one frame at a time): the flags are **bit-exact**
-    against the vendored call, because the arrays, their dtype and their
-    shape are the same.
+    This form computes the very same three variances, frame by frame (the
+    memory of one frame at a time): the flags are **bit-exact** against the
+    vendored call, because the arrays, their dtype and their shape are the
+    same.
+
+    On a CUDA device the variances run **on the device** (the host pass was
+    the largest host-side item of the paste stage - 41.02 ms of process CPU
+    per frame, the paste-stage CPU optimization round, section 4.2).  The
+    device computes the variances in float64 and falls back to the numpy
+    computation for the frames whose result lands on the threshold, so the
+    flags are the flags of the host path.
 
     Args:
         frames_bgr_u8: the ``(N, H, W, 3)`` uint8 BGR frames.
+        device: the compute device - a CUDA device runs the variances on
+            the device, a CPU device (and ``None``) keeps the host
+            computation.
 
     Returns:
         ``(N,)`` bool - the flag of every frame.
@@ -187,17 +337,9 @@ def is_gray_batch(frames_bgr_u8: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"is_gray_batch expects (N, H, W, 3), got {tuple(frames.shape)}"
         )
-    flags = np.zeros(frames.shape[0], dtype=bool)
-    for index in range(frames.shape[0]):
-        frame = frames[index]
-        blue = frame[..., 0].astype(np.int16)
-        green = frame[..., 1].astype(np.int16)
-        red = frame[..., 2].astype(np.int16)
-        diff_sum = (
-            (blue - green).var() + (green - red).var() + (red - blue).var()
-        ) / 3.0
-        flags[index] = diff_sum <= GRAY_THRESHOLD
-    return flags
+    if device is not None and torch.device(device).type == "cuda":
+        return _is_gray_batch_device(frames, torch.device(device))
+    return _is_gray_batch_numpy(frames)
 
 
 # ---------------------------------------------------------------------------

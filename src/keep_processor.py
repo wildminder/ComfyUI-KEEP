@@ -483,8 +483,12 @@ class KEEPFaceProcessor:
         with capture_console_to_logger():
             # The gray flags of the frames (the vendored ``is_gray`` of
             # ``facelib/utils/misc.py:146``) - the same variances, without
-            # the PIL round trip the per-frame paste made.
-            gray_flags = is_gray_batch(input_frames_bgr)
+            # the PIL round trip the per-frame paste made.  On CUDA they run
+            # on the device (the paste-stage CPU optimization round, section
+            # 4.2 - the host pass was the largest host-side item of the
+            # stage); the CPU device keeps the numpy computation.
+            gray_device = self.device if torch.device(self.device).type == "cuda" else None
+            gray_flags = is_gray_batch(input_frames_bgr, device=gray_device)
             # The batched paste (design section 7.7): the default branch of
             # the paste stage runs on the device - the chunked ParseNet
             # forward, the batched parse mask, the batched inverse warp and
