@@ -740,6 +740,9 @@ class _PasteProbe:
         self._wrap(mod, "paste_faces_batch", "p0_paste_total", capture=self.captured)
         # the ops the paste module calls by name (its own namespace)
         self._wrap(paste_mod, "warp_affine_batch", "p2_mask_warp")
+        # the GPU Lanczos resample of the background (the cv2.resize
+        # INTER_LANCZOS4 wrapper measures the CPU fallback on a CPU device)
+        self._wrap(paste_mod, "resize_lanczos_u8", "p6_bg_resize")
         self._wrap(paste_mod, "parse_soft_masks", "p8b_parse_post")
         # the blend: the blend arithmetic is queued before this call, so the
         # leading device sync of the timer flushes it - the measured wall

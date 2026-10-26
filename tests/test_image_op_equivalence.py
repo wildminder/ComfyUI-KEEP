@@ -4,8 +4,10 @@ The dependency slimming replaced the cv2 channel conversions, the INTER_LINEAR
 resizes and the single scipy smoothing with torch-native implementations
 (design §5 of ``.dev/docs/2026-10-25-keep-dependency-slimming.md``).  Every
 replacement is pinned here against the library it replaced, with the tolerance
-the probes measured - measured, not assumed.  The LANCZOS4 resizes stay on
-cv2 (no torch/kornia lanczos exists) and have no replacement to pin.
+the probes measured - measured, not assumed.  The background LANCZOS4 resize
+is replaced by the owner-accepted GPU Lanczos (the tolerance-accepted route of
+2026-10-26) and is pinned against PIL (the filter it implements) and against
+cv2 (the accepted drift).
 """
 
 from __future__ import annotations
@@ -190,3 +192,101 @@ def test_gaussian_smooth_keeps_the_float32_dtype_of_the_landmarks(processor):
     reference = scipy_gaussian.gaussian_filter1d(values, sigma=5, axis=0)
     diff = np.abs(reference.astype(np.float64) - smoothed.astype(np.float64)).max()
     assert diff <= 1e-4, f"the difference is {diff:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# The GPU Lanczos resample (the owner-accepted replacement of the background
+# cv2.resize INTER_LANCZOS4 - the tolerance-accepted route, 2026-10-26)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def gpu_ops():
+    return importlib.import_module("ComfyUI_KEEP.src.keep_gpu_ops")
+
+
+def _lanczos_corpus(height: int, width: int, seed: int) -> np.ndarray:
+    """A gradient + blob + noise frame - smooth content and adversarial content."""
+    y, x = np.mgrid[0:height, 0:width].astype(np.float64)
+    gx, gy = np.meshgrid(np.linspace(0, 1, width), np.linspace(0, 1, height))
+    blob = np.exp(-(((x - width * 0.4) / (width * 0.18)) ** 2 + ((y - height * 0.45) / (height * 0.18)) ** 2))
+    rng = np.random.default_rng(seed)
+    channel = 255 * (0.35 * gx + 0.35 * gy + 0.3 * blob) + rng.normal(0, 18, (height, width))
+    image = np.stack([channel, channel * 0.9, channel * 0.8], -1)
+    return np.clip(image, 0, 255).astype(np.uint8)[None, ...]
+
+
+@pytest.mark.unit
+def test_resize_lanczos_u8_matches_pil_lanczos(gpu_ops):
+    """The op reproduces PIL's LANCZOS - the filter it implements.
+
+    PIL is the semantic reference (three lobes, the support widened on a
+    downscale, the out-of-range taps dropped and renormalized); the measured
+    residual is the float32 coefficient and accumulation rounding.
+    """
+    from PIL import Image
+
+    frames = np.concatenate([_lanczos_corpus(240, 320, 7), _lanczos_corpus(240, 320, 11)])
+    for out_w, out_h in ((480, 360), (160, 120)):
+        out = gpu_ops.resize_lanczos_u8(frames, (out_w, out_h), torch.device("cpu")).numpy()
+        reference = np.stack(
+            [
+                np.asarray(
+                    Image.fromarray(frame).resize((out_w, out_h), resample=Image.Resampling.LANCZOS)
+                )
+                for frame in frames
+            ]
+        )
+        diff = np.abs(out.astype(np.int16) - reference.astype(np.int16))
+        assert diff.mean() <= 0.3, f"mean {diff.mean():.3f} at {out_w}x{out_h}"
+        assert diff.max() <= 12, f"max {diff.max()} at {out_w}x{out_h}"
+
+
+@pytest.mark.unit
+def test_resize_lanczos_u8_documents_the_accepted_cv2_drift(gpu_ops):
+    """The drift against cv2's INTER_LANCZOS4 - measured and accepted.
+
+    The owner chose the tolerance-accepted GPU resample (2026-10-26) over a
+    bit-exact port: the filter is PIL's three-lobe Lanczos, and against cv2's
+    fixed 8-tap ``INTER_LANCZOS4`` the measured envelope is mean 0.85 / max 8
+    on an upscale and mean 7.9 / max 54 on a downscale (cv2 does not widen
+    the kernel on a downscale - the difference is its aliasing).  The bounds
+    below are that envelope, not a permission to grow.
+    """
+    frames = np.concatenate([_lanczos_corpus(240, 320, 7), _lanczos_corpus(240, 320, 11)])
+    up = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu")).numpy()
+    up_ref = np.stack(
+        [cv2.resize(f, (480, 360), interpolation=cv2.INTER_LANCZOS4) for f in frames]
+    )
+    diff = np.abs(up.astype(np.int16) - up_ref.astype(np.int16))
+    assert diff.mean() <= 1.0, f"upscale mean {diff.mean():.3f}"
+    assert diff.max() <= 8, f"upscale max {diff.max()}"
+
+    down = gpu_ops.resize_lanczos_u8(frames, (160, 120), torch.device("cpu")).numpy()
+    down_ref = np.stack(
+        [cv2.resize(f, (160, 120), interpolation=cv2.INTER_LANCZOS4) for f in frames]
+    )
+    diff = np.abs(down.astype(np.int16) - down_ref.astype(np.int16))
+    assert diff.mean() <= 8.5, f"downscale mean {diff.mean():.3f}"
+    assert diff.max() <= 54, f"downscale max {diff.max()}"
+
+
+@pytest.mark.unit
+def test_resize_lanczos_u8_chunking_is_transparent(gpu_ops, monkeypatch):
+    """The chunked device path is the per-frame path, exactly."""
+    frames = np.concatenate([_lanczos_corpus(240, 320, 7), _lanczos_corpus(240, 320, 11)])
+    whole = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu"))
+    monkeypatch.setattr(gpu_ops, "LANCZOS_CHUNK_PIXELS", 240 * 320)
+    per_frame = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu"))
+    assert torch.equal(whole, per_frame)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the GPU pin needs a CUDA device")
+def test_resize_lanczos_u8_on_the_gpu_matches_the_cpu_result(gpu_ops):
+    """The device result is the CPU result within the float32 reduction order."""
+    frames = _lanczos_corpus(240, 320, 7)
+    cpu = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu"))
+    gpu = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cuda"))
+    diff = (cpu.float() - gpu.float().cpu()).abs().max()
+    assert diff <= 4, f"the GPU result drifted {diff:.1f} levels"

@@ -395,3 +395,113 @@ def parse_soft_masks(out_mask: torch.Tensor) -> torch.Tensor:
     masks[:, :, :, :border] = 0
     masks[:, :, :, -border:] = 0
     return masks / 255.0
+
+
+# ---------------------------------------------------------------------------
+# The Lanczos resample - the owner-accepted GPU replacement of the
+# background ``cv2.resize(INTER_LANCZOS4)`` (the tolerance-accepted route:
+# the drift against cv2 is measured and pinned, not zero)
+# ---------------------------------------------------------------------------
+
+#: The lobes of the Lanczos kernel - the PIL / ``comfy.utils.lanczos``
+#: convention the owner chose over cv2's fixed 8-tap ``LANCZOS4``.
+LANCZOS_LOBES = 3
+
+#: The pixel budget of one resample chunk: the transient is two float32
+#: buffers of this many pixels (about 100 MB each at 720p).
+LANCZOS_CHUNK_PIXELS = 2 ** 21
+
+
+def _lanczos_kernel(x: np.ndarray) -> np.ndarray:
+    """The :data:`LANCZOS_LOBES`-lobe Lanczos window."""
+    out = np.zeros_like(x)
+    mask = np.abs(x) < LANCZOS_LOBES
+    xm = x[mask]
+    out[mask] = np.sinc(xm) * np.sinc(xm / LANCZOS_LOBES)
+    return out
+
+
+def _lanczos_axis_matrix(in_size: int, out_size: int) -> np.ndarray:
+    """The ``(out, in)`` resampling matrix of one axis (the PIL convention).
+
+    The kernel support widens by the scale factor on a downscale (a true
+    resampling filter - unlike cv2's fixed 8-tap ``INTER_LANCZOS4``, which
+    aliases) and the taps outside the source clamp to the edge pixel (PIL's
+    border rule).  The rows are normalized to sum to 1.
+    """
+    scale = in_size / out_size
+    filter_scale = max(1.0, scale)
+    support = LANCZOS_LOBES * filter_scale
+    taps = int(np.ceil(2 * support)) + 2
+    pos = (np.arange(out_size, dtype=np.float64) + 0.5) * scale - 0.5
+    base = np.floor(pos)
+    offsets = np.arange(-(taps // 2 - 1), taps // 2 + 1, dtype=np.float64)
+    weights = (
+        _lanczos_kernel((offsets[None, :] - (pos - base)[:, None]) / filter_scale)
+        / filter_scale
+    )
+    weights /= weights.sum(axis=1, keepdims=True)
+    idx = np.rint(base[:, None] + offsets[None, :]).astype(np.int64)
+    # PIL's edge rule: the out-of-range taps are **dropped** and the
+    # surviving weights renormalized (not clamped into the edge pixel).
+    # The dropped taps scatter into a trash column - clipping them back
+    # into range would let their zero weights overwrite the legitimate
+    # weight of the edge tap (fancy indexing keeps the last write).
+    valid = (idx >= 0) & (idx < in_size)
+    weights = weights * valid
+    weights /= weights.sum(axis=1, keepdims=True)
+    matrix = np.zeros((out_size, in_size + 1), dtype=np.float32)
+    matrix[np.arange(out_size)[:, None], np.where(valid, idx, in_size)] = weights
+    return matrix[:, :in_size]
+
+
+def resize_lanczos_u8(
+    frames: np.ndarray | torch.Tensor,
+    size: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """The Lanczos resample of a uint8 BGR stack, on the device.
+
+    The GPU replacement of the background ``cv2.resize(INTER_LANCZOS4)``
+    loops.  ``size`` keeps the cv2 ``(width, height)`` order (the
+    :func:`~ComfyUI_KEEP.src.keep_image_utils.resize_bgr_u8` contract); the
+    frames are ``(N, H, W, 3)`` uint8, as a host array (uploaded once per
+    chunk) or a device tensor (sliced, no transfer).  The result is the
+    device tensor ``(N, out_h, out_w, 3)`` uint8 - the caller downloads it
+    when it needs the host copy.
+
+    The filter is the PIL / ``comfy.utils.lanczos`` one (three lobes, the
+    support widened on a downscale, edge-clamped taps): the owner accepted
+    its drift against cv2's ``INTER_LANCZOS4`` for the background resize -
+    measured mean 0.9 levels on an upscale and 7.9 on a downscale, pinned in
+    ``tests/test_image_op_equivalence.py``.
+
+    Args:
+        frames: the ``(N, H, W, 3)`` uint8 BGR frames - a host array or a
+            device tensor.
+        size: the ``(width, height)`` of the result (the cv2 dsize order).
+        device: the compute device.
+
+    Returns:
+        The ``(N, out_h, out_w, 3)`` uint8 BGR tensor on ``device``.
+    """
+    out_w, out_h = int(size[0]), int(size[1])
+    if isinstance(frames, np.ndarray):
+        source = torch.from_numpy(np.ascontiguousarray(frames)).to(device)
+    else:
+        source = frames.to(device)
+    num, height, width, channels = (int(value) for value in source.shape)
+    wy = torch.from_numpy(_lanczos_axis_matrix(height, out_h)).to(device)
+    wx = torch.from_numpy(_lanczos_axis_matrix(width, out_w)).to(device)
+    pixels = max(1, height * width)
+    chunk = max(1, LANCZOS_CHUNK_PIXELS // pixels)
+    out = torch.empty((num, out_h, out_w, channels), dtype=torch.uint8, device=device)
+    for start in range(0, num, chunk):
+        stop = min(start + chunk, num)
+        block = source[start:stop].permute(0, 3, 1, 2).to(torch.float32)
+        rows = torch.matmul(wy, block)  # (m, c, out_h, w)
+        resampled = torch.matmul(rows, wx.t())  # (m, c, out_h, out_w)
+        out[start:stop] = (
+            resampled.round_().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1)
+        )
+    return out

@@ -45,7 +45,7 @@ import cv2
 import numpy as np
 import torch
 
-from .keep_gpu_ops import parse_soft_masks, warp_affine_batch
+from .keep_gpu_ops import parse_soft_masks, resize_lanczos_u8, warp_affine_batch
 
 #: The size the ParseNet works on (``face_restoration_helper.py:452`` -
 #: ``cv2.resize(current_restored_face, (512, 512))``).
@@ -348,7 +348,7 @@ def is_gray_batch(
 
 def _tiled_scale_batch(
     model, frames_bgr_u8: np.ndarray, device: torch.device
-) -> np.ndarray:
+) -> torch.Tensor:
     """The batched ``tiled_scale`` of the background frames.
 
     ``comfy.utils.tiled_scale`` loops over the images of the batch
@@ -360,7 +360,9 @@ def _tiled_scale_batch(
     The value scale is the one of the per-frame ``_run_upscaler``: the RGB
     float in 0..1 in, the clamped float out, quantized with the
     **truncating** uint8 cast of ``comfy_image_to_cv2`` and flipped back to
-    BGR.
+    BGR.  The result stays **on the device** - the resize of
+    :func:`batched_bg_frames` (and with it the only download of the
+    background) happens after it.
     """
     from comfy.utils import tiled_scale  # lazy: the pack imports without ComfyUI
 
@@ -377,7 +379,7 @@ def _tiled_scale_batch(
     )
     scaled = torch.clamp(scaled, min=0, max=1.0)
     quantized = (scaled * 255.0).to(torch.uint8).permute(0, 2, 3, 1)
-    return quantized[..., [2, 1, 0]].contiguous().cpu().numpy()
+    return quantized[..., [2, 1, 0]].contiguous()
 
 
 def batched_bg_frames(
@@ -391,10 +393,12 @@ def batched_bg_frames(
 
     Without a background model (the production default) the background is
     the frame itself; with one it is the **one** batched ``tiled_scale``
-    call of :func:`_tiled_scale_batch`.  The LANCZOS4 resize to the target
-    size stays on cv2 (there is no torch lanczos - the documented precedent
-    of ``tests/test_image_op_equivalence.py``) and runs only when the shape
-    mismatches, exactly like the per-frame path of the processor.
+    call of :func:`_tiled_scale_batch`, kept on the device.  The resize to
+    the target size runs **on the device** (:func:`resize_lanczos_u8` - the
+    owner-accepted GPU Lanczos, the tolerance-accepted route) when the
+    device is CUDA; a CPU device keeps the per-frame cv2 loop (the einsum
+    resample is slower than cv2 there).  The background is downloaded once,
+    after the last resize.
 
     Args:
         canvas_hw: the ``(height, width)`` of the paste canvas - the size of
@@ -411,34 +415,47 @@ def batched_bg_frames(
     frames = np.asarray(frames_bgr_u8)
     height, width = frames.shape[1:3]
     target_h, target_w = int(height * upscale_factor), int(width * upscale_factor)
+    on_device = device.type == "cuda"
     if bg_upscale_model is None:
-        background = frames
+        background: np.ndarray | torch.Tensor = frames
     else:
         background = _tiled_scale_batch(bg_upscale_model, frames, device)
+        if not on_device:
+            background = background.numpy()
     if background.shape[1] != target_h or background.shape[2] != target_w:
-        background = np.stack(
-            [
-                cv2.resize(
-                    background[index], (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
-                )
-                for index in range(background.shape[0])
-            ]
-        )
+        if on_device:
+            background = resize_lanczos_u8(background, (target_w, target_h), device)
+        else:
+            background = np.stack(
+                [
+                    cv2.resize(
+                        background[index], (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
+                    )
+                    for index in range(background.shape[0])
+                ]
+            )
     if canvas_hw is not None:
         canvas_h, canvas_w = canvas_hw
         canvas_target_h = int(canvas_h * upscale_factor)
         canvas_target_w = int(canvas_w * upscale_factor)
         if background.shape[1] != canvas_target_h or background.shape[2] != canvas_target_w:
-            background = np.stack(
-                [
-                    cv2.resize(
-                        background[index],
-                        (canvas_target_w, canvas_target_h),
-                        interpolation=cv2.INTER_LANCZOS4,
-                    )
-                    for index in range(background.shape[0])
-                ]
-            )
+            if on_device:
+                background = resize_lanczos_u8(
+                    background, (canvas_target_w, canvas_target_h), device
+                )
+            else:
+                background = np.stack(
+                    [
+                        cv2.resize(
+                            background[index],
+                            (canvas_target_w, canvas_target_h),
+                            interpolation=cv2.INTER_LANCZOS4,
+                        )
+                        for index in range(background.shape[0])
+                    ]
+                )
+    if isinstance(background, torch.Tensor):
+        background = background.cpu().numpy()
     return background
 
 
