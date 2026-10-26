@@ -8,6 +8,13 @@ The dependency slimming replaced the channel conversions of cv2 with torch
 indexing and added the torch bilinear ``resize_bgr_u8`` for the INTER_LINEAR
 resizes of the processor; the equivalences against the cv2 ops are pinned in
 ``tests/test_image_op_equivalence.py``.
+
+The GPU video pipeline redesign added the **batch** forms of the conversions
+(``*_batch``): the same elementwise math as the per-frame functions, run on
+the whole stack with a single host transfer instead of one per frame
+(design sections 7.1 / 7.4 / 7.8 of
+``.dev/docs/2026-10-25-keep-gpu-video-pipeline.md``); their equivalences are
+pinned in ``tests/test_gpu_batch_equivalence.py``.
 """
 
 from __future__ import annotations
@@ -63,3 +70,57 @@ def resize_bgr_u8(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
         .contiguous()
         .numpy()
     )
+
+
+# ---------------------------------------------------------------------------
+# The batch forms of the conversions (the GPU video pipeline redesign)
+# ---------------------------------------------------------------------------
+
+
+def comfy_batch_to_bgr_u8(comfy_batch: torch.Tensor) -> np.ndarray:
+    """A ComfyUI IMAGE batch ``(N, H, W, C)`` -> ``(N, H, W, 3)`` uint8 BGR.
+
+    The batch form of :func:`comfy_image_to_cv2` (design section 7.1): the
+    scale, the uint8 cast and the RGB -> BGR flip run on the tensor at its
+    device and the copy to the host happens **once** for the whole batch,
+    where the per-frame loop of the sequence path made one transfer per
+    frame.  The ops are the same elementwise math, so the output is bit-exact
+    against the per-frame loop (pinned in ``tests/test_gpu_batch_equivalence.py``).
+    """
+    if comfy_batch.ndim != 4:
+        raise ValueError(
+            f"comfy_batch_to_bgr_u8 expects (N, H, W, C), got {tuple(comfy_batch.shape)}"
+        )
+    u8 = (comfy_batch * 255).to(torch.uint8)
+    return u8[..., [2, 1, 0]].cpu().numpy()
+
+
+def bgr_u8_batch_to_comfy(u8_batch: np.ndarray | torch.Tensor) -> torch.Tensor:
+    """A uint8 BGR batch ``(N, H, W, 3)`` -> a ComfyUI IMAGE batch ``(N, H, W, 3)`` float32.
+
+    The batch form of :func:`cv2_to_comfy_image` (design section 7.8): a
+    numpy array or a torch uint8 tensor on any device is accepted; the flip
+    and the /255 scale run where the input lives and the result is returned
+    on the CPU - one transfer for the whole batch, where the per-frame loop
+    made N.  Bit-exact against the per-frame loop.
+    """
+    if isinstance(u8_batch, np.ndarray):
+        u8_batch = torch.from_numpy(np.ascontiguousarray(u8_batch))
+    rgb = u8_batch[..., [2, 1, 0]].to(torch.float32) / 255.0
+    return rgb.cpu()
+
+
+def bgr_u8_batch_to_normalized(u8_bchw: torch.Tensor) -> torch.Tensor:
+    """A uint8 BGR face stack ``(N, 3, H, W)`` -> the KEEP input ``(N, 3, H, W)`` in [-1, 1].
+
+    The batch form of the crop tail ``img2tensor(cropped / 255., bgr2rgb=True,
+    float32=True)`` + ``(t - 0.5) / 0.5`` (``keep_processor.py:311-313``):
+    the BGR -> RGB flip, the /255 scale and the normalize, batched on the
+    input's device.  The /255 runs in **float64** before the float32 cast -
+    ``img2tensor`` divides the uint8 image in numpy float64 and casts once,
+    and the float64 division reproduces that double rounding bit for bit (a
+    float32 division could differ by one ulp); the output is bit-exact
+    against the per-frame chain (pinned in ``tests/test_gpu_batch_equivalence.py``).
+    """
+    rgb = u8_bchw[:, [2, 1, 0]]
+    return (rgb.to(torch.float64) / 255.0).to(torch.float32).sub_(0.5).div_(0.5)
