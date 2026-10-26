@@ -84,6 +84,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.overrides import TorchFunctionMode
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -123,11 +124,21 @@ def resolve_comfyui_root(explicit: str | None) -> str | None:
 
 
 class Timer:
-    """Cumulative stage timer with torch.cuda synchronization."""
+    """Cumulative stage timer with torch.cuda synchronization.
+
+    Two clocks per stage: the **wall** time (``time.perf_counter``) and the
+    **process CPU** time (``time.process_time()`` - the CPU time of all the
+    threads of the process).  The owner's complaint is about the CPU *load*,
+    and the two numbers are very different here: an OpenCV ``parallel_for``
+    warp burns every core for the whole of its wall time, so its process CPU
+    time is a multiple of its wall time.
+    """
 
     def __init__(self, device: str):
         self.device = device
         self.totals: dict[str, float] = {}
+        #: the process CPU time per stage (the sum over the threads)
+        self.cpu_totals: dict[str, float] = {}
 
     def sync(self):
         if self.device == "cuda":
@@ -138,19 +149,31 @@ class Timer:
     def measure(self, name: str, fn):
         self.sync()
         start = time.perf_counter()
+        cpu_start = time.process_time()
         result = fn()
+        # the process CPU time of the **call** only: the device
+        # synchronisation waits with the driver's spin threads running, and
+        # that spin would otherwise be charged to the stage
+        cpu_elapsed = time.process_time() - cpu_start
         self.sync()
         self.totals[name] = self.totals.get(name, 0.0) + time.perf_counter() - start
+        self.cpu_totals[name] = self.cpu_totals.get(name, 0.0) + cpu_elapsed
         return result
 
     def table(self, num_frames: int) -> list[dict]:
         rows = []
         for name, seconds in self.totals.items():
+            cpu_seconds = self.cpu_totals.get(name, 0.0)
             rows.append(
                 {
                     "stage": name,
                     "total_s": round(seconds, 3),
                     "per_frame_ms": round(seconds * 1000.0 / num_frames, 2),
+                    "cpu_total_s": round(cpu_seconds, 3),
+                    "cpu_per_frame_ms": round(cpu_seconds * 1000.0 / num_frames, 2),
+                    # the CPU load of the stage: the process CPU time per
+                    # second of wall time (1.0 = one core, 8.0 = every core)
+                    "cpu_cores": round(cpu_seconds / seconds, 2) if seconds > 0 else None,
                     "share_pct": None,  # filled by the caller over the known stages
                 }
             )
@@ -607,6 +630,230 @@ class _StageProbe:
         return False
 
 
+class _PasteProbe:
+    """The paste sub-stages of the shipped pipeline (wall + process CPU).
+
+    The probe rebinds the attributes of the modules that **call** the
+    paste ops (``src.keep_processor``, ``src.keep_gpu_paste``) and of
+    ``cv2`` for the duration of the measurement, and restores them
+    afterwards - the same pattern as :class:`_StageProbe`.  No production
+    code is edited for the instrumentation.
+
+    The sub-stage names are the ones of the architect's plan (doc section
+    2): ``p1_face_warp``, ``p2_mask_warp``, ``p3_blend``, ``p6_bg_resize``,
+    ``p7_is_gray``, ``p8_parse_forward`` and ``p8b_parse_post``.
+    ``p4_bg_upload`` and ``p5_result_download`` are the **copies** - they
+    are measured by the transfer accounting pass (:class:`_TransferCounter`),
+    not by a function call.
+
+    The wrap follows the *caller's* namespace: ``src.keep_processor``
+    imported ``is_gray_batch`` and ``paste_faces_batch`` by name, so
+    rebinding them in ``src.keep_gpu_paste`` would not change what the
+    processor calls.
+    """
+
+    def __init__(self, timer: Timer, processor, processor_mod):
+        self.timer = timer
+        self.processor = processor
+        self.processor_mod = processor_mod
+        self._saved: list[tuple[object, str, object, bool]] = []
+        #: the ops that are not in the namespace of their owner
+        self.missing: list[str] = []
+        #: the call counter per sub-stage
+        self.counts: dict[str, int] = {}
+        #: the arguments of the last batched paste (the accounting pass)
+        self.captured: dict = {}
+
+    def _wrap(self, owner, attribute: str, stage: str, capture: dict | None = None) -> bool:
+        """Wrap one paste op with the sub-stage timer (and count the calls)."""
+        original = getattr(owner, attribute, None)
+        if original is None:
+            owner_name = getattr(owner, "__name__", type(owner).__name__)
+            self.missing.append(f"{owner_name}.{attribute}")
+            return False
+        timer = self.timer
+        probe = self
+
+        def wrapper(*args, **kwargs):
+            probe.counts[stage] = probe.counts.get(stage, 0) + 1
+            if capture is not None:
+                capture.update(kwargs)
+            return timer.measure(stage, lambda: original(*args, **kwargs))
+
+        self._saved.append(
+            (owner, attribute, original, attribute in getattr(owner, "__dict__", {}))
+        )
+        setattr(owner, attribute, wrapper)
+        return True
+
+    def _wrap_cv2(self) -> None:
+        """Wrap the two cv2 ops of the paste stage.
+
+        * ``cv2.warpAffine`` - the **face warp** of the paste.  The crop
+          warp of the shipped pipeline is told apart by the gray border of
+          the vendored crop (``(135, 133, 132)``), exactly like
+          :meth:`_StageProbe._wrap_cv2_crop`; the paste warps use the
+          default black border.
+        * ``cv2.resize`` with ``INTER_LANCZOS4`` - the conditional
+          background resize of the paste (the only LANCZOS4 resize of the
+          sequence path).
+        """
+        import cv2
+
+        original_warp = cv2.warpAffine
+        original_resize = cv2.resize
+        timer = self.timer
+        probe = self
+
+        def warp_wrapper(*args, **kwargs):
+            if _is_crop_border(kwargs.get("borderValue")):
+                return original_warp(*args, **kwargs)
+            probe.counts["p1_face_warp"] = probe.counts.get("p1_face_warp", 0) + 1
+            return timer.measure("p1_face_warp", lambda: original_warp(*args, **kwargs))
+
+        def resize_wrapper(*args, **kwargs):
+            interpolation = kwargs.get("interpolation")
+            if interpolation is None and len(args) > 2:
+                interpolation = args[2]
+            if interpolation != cv2.INTER_LANCZOS4:
+                return original_resize(*args, **kwargs)
+            probe.counts["p6_bg_resize"] = probe.counts.get("p6_bg_resize", 0) + 1
+            return timer.measure("p6_bg_resize", lambda: original_resize(*args, **kwargs))
+
+        self._saved.append(
+            (cv2, "warpAffine", original_warp, "warpAffine" in getattr(cv2, "__dict__", {}))
+        )
+        self._saved.append(
+            (cv2, "resize", original_resize, "resize" in getattr(cv2, "__dict__", {}))
+        )
+        cv2.warpAffine = warp_wrapper
+        cv2.resize = resize_wrapper
+
+    def __enter__(self) -> "_PasteProbe":
+        import src.keep_gpu_paste as paste_mod
+
+        mod = self.processor_mod
+        # the gray flags (the processor calls its own imported name)
+        self._wrap(mod, "is_gray_batch", "p7_is_gray")
+        # the batched paste (the whole path) - its arguments feed the
+        # transfer accounting pass
+        self._wrap(mod, "paste_faces_batch", "p0_paste_total", capture=self.captured)
+        # the ops the paste module calls by name (its own namespace)
+        self._wrap(paste_mod, "warp_affine_batch", "p2_mask_warp")
+        self._wrap(paste_mod, "parse_soft_masks", "p8b_parse_post")
+        # the blend: the blend arithmetic is queued before this call, so the
+        # leading device sync of the timer flushes it - the measured wall
+        # time is the blend's device work + the quantising tail
+        self._wrap(paste_mod, "_quantize_and_clip", "p3_blend")
+        self._wrap_cv2()
+        # the ParseNet forward (the floor of the paste stage)
+        parse_net = getattr(self.processor.face_helper, "face_parse", None)
+        if parse_net is not None:
+            self._wrap(parse_net, "forward", "p8_parse_forward")
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        for owner, attribute, original, was_instance_attribute in reversed(self._saved):
+            if was_instance_attribute:
+                setattr(owner, attribute, original)
+            else:
+                try:
+                    delattr(owner, attribute)
+                except AttributeError:  # pragma: no cover - defensive
+                    setattr(owner, attribute, original)
+        return False
+
+    def table(self, num_frames: int) -> list[dict]:
+        """The paste sub-stage table (wall + process CPU + the call counts)."""
+        rows = []
+        for name, seconds in self.timer.totals.items():
+            cpu_seconds = self.timer.cpu_totals.get(name, 0.0)
+            rows.append(
+                {
+                    "substage": name,
+                    "wall_s": round(seconds, 3),
+                    "wall_per_frame_ms": round(seconds * 1000.0 / num_frames, 2),
+                    "cpu_s": round(cpu_seconds, 3),
+                    "cpu_per_frame_ms": round(cpu_seconds * 1000.0 / num_frames, 2),
+                    "cpu_cores": round(cpu_seconds / seconds, 2) if seconds > 0 else None,
+                    "calls": self.counts.get(name, 0),
+                }
+            )
+        return rows
+
+
+class _TransferCounter(TorchFunctionMode):
+    """The host<->device byte counters of the paste path.
+
+    ``TorchFunctionMode`` intercepts the torch API calls, so the copies
+    that **change the device** (``Tensor.to(device)``, ``Tensor.cpu()``)
+    are seen with their tensor: their bytes are the tensor's size.  The
+    pageable copies are blocking, so their wall time is the real transfer
+    time and their process CPU time is the memcpy's CPU time.
+
+    The counters are the evidence for "the transfers are canvas-sized"
+    (the before-profile of the ROI round); after the ROI change the
+    production counters (``PASTE_TRANSFER_STATS``) are the authority and
+    the probe reads them as well.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.h2d_bytes = 0
+        self.d2h_bytes = 0
+        self.h2d_calls = 0
+        self.d2h_calls = 0
+        self.h2d_wall_s = 0.0
+        self.d2h_wall_s = 0.0
+        self.h2d_cpu_s = 0.0
+        self.d2h_cpu_s = 0.0
+        self.h2d_sizes: dict[str, int] = {}
+        self.d2h_sizes: dict[str, int] = {}
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        started = time.perf_counter()
+        cpu_started = time.process_time()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - started
+        cpu_elapsed = time.process_time() - cpu_started
+        self._account(func, args, kwargs, elapsed, cpu_elapsed)
+        return result
+
+    def _account(self, func, args, kwargs, elapsed: float, cpu_elapsed: float) -> None:
+        if func not in (torch.Tensor.to, torch.Tensor.cpu, torch.Tensor.cuda):
+            return
+        tensor = args[0] if args else None
+        if not isinstance(tensor, torch.Tensor):
+            return
+        source = tensor.device
+        if func is torch.Tensor.cpu:
+            target = torch.device("cpu")
+        elif func is torch.Tensor.cuda:
+            target = torch.device("cuda")
+        else:
+            device = kwargs.get("device", args[1] if len(args) > 1 else None)
+            if not isinstance(device, (str, torch.device)):
+                return  # a dtype conversion: no transfer
+            target = torch.device(device)
+        if target.type == source.type:
+            return  # no device change
+        nbytes = tensor.numel() * tensor.element_size()
+        key = f"{tuple(tensor.shape)}:{tensor.dtype}".replace(" ", "")
+        if target.type == "cuda":
+            self.h2d_bytes += nbytes
+            self.h2d_calls += 1
+            self.h2d_wall_s += elapsed
+            self.h2d_cpu_s += cpu_elapsed
+            self.h2d_sizes[key] = self.h2d_sizes.get(key, 0) + nbytes
+        else:
+            self.d2h_bytes += nbytes
+            self.d2h_calls += 1
+            self.d2h_wall_s += elapsed
+            self.d2h_cpu_s += cpu_elapsed
+            self.d2h_sizes[key] = self.d2h_sizes.get(key, 0) + nbytes
+
+
 def stage_rows(timer: Timer, num_frames: int) -> tuple[list[dict], float]:
     """The stage table of a timer (with the share of the known stages)."""
     rows = timer.table(num_frames)
@@ -910,9 +1157,11 @@ def main(argv=None) -> int:
 
         # the instrumented run: the same call, timed stage by stage
         timer_new = Timer(device)
+        paste_timer = Timer(device)
         with _StageProbe(timer_new, processor, processor_mod) as probe:
-            processor.process_image_sequence(
-                image_sequence, 1.0, False, True, False, max_clip_length=KEEP_CHUNK)
+            with _PasteProbe(paste_timer, processor, processor_mod) as paste_probe:
+                processor.process_image_sequence(
+                    image_sequence, 1.0, False, True, False, max_clip_length=KEEP_CHUNK)
         rows_new, total_new = stage_rows(timer_new, args.frames)
         measured_new = sum(timer_new.totals.values())
         report["pipeline"] = {
@@ -933,6 +1182,72 @@ def main(argv=None) -> int:
             # frame) - the proof that the crop stage is really timed
             "cv2_crop_calls": probe.cv2_crop_calls,
         }
+        report["paste_substages"] = {
+            "note": (
+                "the paste stage sub-stages of the shipped pipeline - the wall "
+                "time (device-synced) and the process CPU time (the CPU load) "
+                "of every sub-stage; p4_bg_upload and p5_result_download are "
+                "the copies and are measured by the accounting pass below"
+            ),
+            "substages": paste_probe.table(args.frames),
+            "unwrapped_ops": paste_probe.missing,
+            "wall_total_s": round(sum(paste_timer.totals.values()), 3),
+            "cpu_total_s": round(sum(paste_timer.cpu_totals.values()), 3),
+        }
+
+        # --- the transfer accounting pass (the byte counters) ---------------
+        # The batched paste is called again with the arguments the pipeline
+        # used, under a mode that counts the host<->device copies.  The
+        # pageable copies are blocking, so their wall time is the real
+        # transfer time.
+        captured = paste_probe.captured
+        transfer: dict = {
+            "note": (
+                "the host<->device copies of the batched paste, counted by a "
+                "TorchFunctionMode over a direct call of paste_faces_batch "
+                "with the arguments of the instrumented run"
+            ),
+            "the_batched_paste_ran": bool(captured.get("faces_bgr") is not None),
+        }
+        if captured.get("faces_bgr") is not None:
+            counter = _TransferCounter()
+            with counter:
+                processor_mod.paste_faces_batch(
+                    faces_bgr=captured["faces_bgr"],
+                    inverse_affines=captured["inverse_affines"],
+                    background_bgr=captured["background_bgr"],
+                    device=captured.get("device", processor.device),
+                    parse_net=captured.get("parse_net"),
+                )
+            frames = int(np.asarray(captured["faces_bgr"]).shape[0])
+            background = np.asarray(captured["background_bgr"])
+            transfer.update(
+                {
+                    "frames": frames,
+                    "h2d_bytes": counter.h2d_bytes,
+                    "d2h_bytes": counter.d2h_bytes,
+                    "h2d_calls": counter.h2d_calls,
+                    "d2h_calls": counter.d2h_calls,
+                    "h2d_wall_s": round(counter.h2d_wall_s, 3),
+                    "d2h_wall_s": round(counter.d2h_wall_s, 3),
+                    "h2d_cpu_s": round(counter.h2d_cpu_s, 3),
+                    "d2h_cpu_s": round(counter.d2h_cpu_s, 3),
+                    "h2d_bytes_per_frame": counter.h2d_bytes // max(frames, 1),
+                    "d2h_bytes_per_frame": counter.d2h_bytes // max(frames, 1),
+                    "canvas_bytes_per_frame": int(background[0].nbytes),
+                    "h2d_sizes": counter.h2d_sizes,
+                    "d2h_sizes": counter.d2h_sizes,
+                }
+            )
+        import src.keep_gpu_paste as paste_mod
+
+        production = getattr(paste_mod, "PASTE_TRANSFER_STATS", None)
+        if production is not None:
+            transfer["production_counters"] = (
+                dict(production) if isinstance(production, dict)
+                else {k: v for k, v in vars(production).items() if not k.startswith("_")}
+            )
+        report["paste_transfer_bytes"] = transfer
         if device == "cuda":
             report["pipeline"]["peak_vram_mb"] = round(
                 torch.cuda.max_memory_allocated() / (2**20), 1)
