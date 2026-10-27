@@ -1039,7 +1039,16 @@ def _paste_chunk_roi(
         x0, y0, x1, y1 = roi
         maximum = maxima[index]
         if float(frame_maxima[index]) <= 1.001:
-            outside = _background_max_outside(background[index], roi)
+            # the rare branch: the four bands of the background.  In the
+            # canvas mode the background is a device tensor - the helper is
+            # a numpy one, and the branch is rare by construction, so this
+            # one frame is downloaded rather than the helper being
+            # duplicated for the device.
+            outside = _background_max_outside(
+                background[index].cpu().numpy() if canvas is not None
+                and torch.is_tensor(background) else background[index],
+                roi)
+
             if outside <= 1.001:
                 # the whole frame is near black: the vendored tail scales the
                 # **whole canvas** by 255 - the full-canvas fallback

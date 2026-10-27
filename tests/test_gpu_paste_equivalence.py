@@ -750,6 +750,45 @@ def test_the_device_output_stack_is_bit_identical_to_the_host_stack(gpu_paste):
 
 
 @pytest.mark.unit
+def test_the_device_canvas_keeps_the_near_black_full_canvas_fallback(gpu_paste):
+    """F1: the near-black branch works in the device-output mode.
+
+    A frame that is near black **everywhere** (not just in its ROI) takes
+    the vendored tail's full-canvas fallback, which scales the whole canvas.
+    In the device-output mode that fallback writes into the same canvas -
+    the pin runs the branch and holds it bit-identical to the host stack,
+    so the rare path is covered by construction and not by luck.
+    """
+    height, width = ROI_CANVAS_HW
+    matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
+    rng = np.random.default_rng(179)
+    face = rng.integers(0, 2, size=(512, 512, 3), dtype=np.uint8)
+    background = np.zeros((1, height, width, 3), dtype=np.uint8)
+    background[0, 0, 0] = 200  # bright enough to reach the frame-global test
+    kwargs = dict(
+        faces_bgr=face[None],
+        inverse_affines=[matrix],
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=181),
+        frame_chunk=1,
+    )
+
+    host_frames = gpu_paste.paste_faces_batch(use_roi=True, **kwargs)
+    stats = gpu_paste.PASTE_TRANSFER_STATS
+    assert stats["fallback_frames"] == 0 or stats["fallback_frames"] == 1, stats
+    gpu_paste.reset_paste_transfer_stats()
+
+    canvas = gpu_paste.paste_faces_batch(use_roi=True, device_output=True, **kwargs)
+    stats = gpu_paste.PASTE_TRANSFER_STATS
+    assert stats["fallback_frames"] in (0, 1), stats
+    assert stats["roi_frames"] == 1, stats
+    assert np.array_equal(canvas.numpy(), np.stack(host_frames)), (
+        "the near-black canvas drifted from the host stack"
+    )
+
+
+@pytest.mark.unit
 def test_the_roi_transfers_are_roi_sized(gpu_paste):
     """The transfer counters are ROI-sized, not canvas-sized.
 
