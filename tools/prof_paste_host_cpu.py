@@ -435,10 +435,50 @@ def attribute(device: str, num_frames: int, height: int, width: int, warmup: int
         for owner, name, original in saved_extras:
             setattr(owner, name, original)
 
+    # the F1 before/after: the SAME paste call in the host-output and the
+    # device-output mode, one session, one fixture.  On a CPU device the
+    # arithmetic of the two modes is identical, so the delta is exactly the
+    # removed host assembly (the upload, the download, the canvas copy and
+    # the stack).  The CUDA run of the same comparison is the owner-gated
+    # V2; this one is honest at the host-copy level on the CPU fixture.
+    captured = getattr(paste_probe, "captured", {})
+    comparison: dict = {
+        "note": (
+            "the same paste_faces_batch call in both output modes - the "
+            "device-output delta is the removed host assembly (the CPU "
+            "fixture prices it exactly; the CUDA run is the owner-gated V2)"
+        ),
+    }
+    if captured.get("faces_bgr") is not None:
+        call_kwargs = dict(
+            faces_bgr=captured["faces_bgr"],
+            inverse_affines=captured["inverse_affines"],
+            background_bgr=captured["background_bgr"],
+            device=captured.get("device", processor.device),
+            parse_net=captured.get("parse_net"),
+            frame_chunk=None,
+        )
+        mode_timer = probe.Timer(device)
+        results = {}
+        for label, extra in (("host_output", {}), ("device_output", {"device_output": True})):
+            paste_mod.reset_paste_transfer_stats()
+            results[label] = mode_timer.measure(
+                label, lambda k=dict(call_kwargs, **extra): paste_mod.paste_faces_batch(**k))
+            stats = dict(paste_mod.PASTE_TRANSFER_STATS)
+            comparison[label] = {
+                "per_frame_ms": round(mode_timer.totals[label] * 1000.0 / num_frames, 2),
+                "cpu_per_frame_ms": round(mode_timer.cpu_totals[label] * 1000.0 / num_frames, 2),
+                "counters": stats,
+            }
+        host_frames = results["host_output"]
+        canvas = results["device_output"]
+        if torch.is_tensor(canvas):
+            comparison["bit_identical"] = bool(
+                np.array_equal(np.stack(host_frames), canvas.cpu().numpy()))
+
     # the transfer accounting (the same pass the probe runs)
     transfer: dict = {"the_batched_paste_ran": bool(routing.args)}
     if routing.args:
-        captured = getattr(paste_probe, "captured", {})
         if captured.get("faces_bgr") is not None:
             counter = probe._TransferCounter()
             with counter:
@@ -513,6 +553,7 @@ def attribute(device: str, num_frames: int, height: int, width: int, warmup: int
             "rows": copy_rows,
             "bench": benches,
         },
+        "output_mode_comparison": comparison,
         "paste_transfer_bytes": transfer,
         "production_counters": dict(paste_mod.PASTE_TRANSFER_STATS),
     }
