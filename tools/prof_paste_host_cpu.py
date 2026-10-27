@@ -34,6 +34,12 @@ What it adds:
    sub-2-tick op reports 0 CPU).  The host copies of the ROI patch, the
    download and the final ``np.stack`` are repeated until each accrues
    >= 200 ms of wall time and reported with their budget.
+5. **The factor-4 scenario** of ``output_mode_comparison`` (the
+   GPU-resident-output round, design section 5): the captured paste call
+   replayed at ``final_upscale_factor=4`` - host vs the F1 device canvas vs
+   the chunked helper, the bit-identity of every mode pair, and the
+   ``device_output_mode`` verdicts of the factor-4 canvases under a patched
+   ``free_memory_bytes`` (the CPU-only engagement proof).
 
 Run (embedded interpreter):
 
@@ -73,6 +79,12 @@ FACE_TEMPLATE = np.array(
 #: this much wall time, so its process-CPU number covers several system ticks
 #: (``time.process_time`` has ~15.6 ms of granularity on Windows)
 MICRO_BUDGET_S = 0.2
+
+#: The upscale factor of the factor-4 scenario of the output-mode comparison
+#: (``output_mode_factor4``): the paste replayed at ``final_upscale_factor=4``
+#: - the 16x-pixels regime where the F1 device canvas outgrows its budget and
+#: the chunked mode of the round engages.
+FACTOR4_SCALE = 4.0
 
 
 def load_probe():
@@ -377,6 +389,168 @@ def host_copy_benches(timer, device: str, height: int, width: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# The factor-4 scenario of the output-mode comparison (the design's section 5)
+# ---------------------------------------------------------------------------
+
+
+def output_mode_factor4(paste_mod, captured, routing_args, eligible, device, timer) -> dict:
+    """The run's paste call replayed at ``final_upscale_factor=4``.
+
+    The operands: the captured forward affine matrices re-inverted at 4x (the
+    vendored ``get_inverse_affine`` route -
+    ``cv2.invertAffineTransform(affine) * 4``; scaling the captured factor-1
+    inverses by 4.0 is the bit-identical fallback, a power-of-two multiply is
+    exact) and the captured background frames resized 4x **once** with the
+    vendored LANCZOS4 - the same background feeds every mode, so the
+    comparison isolates the output assembly from the resize (the device
+    Lanczos is the owner-accepted tolerance route and must not charge any
+    mode).  Three modes then paste the same faces on the same 4x background:
+    the host output, the F1 device canvas (``device_output=True``) and the
+    chunked helper (``frame_chunk=1``) - wall/CPU/counters per mode and the
+    bit-identity of every mode pair (uint8 level against the device canvas,
+    float32 IMAGE level against the conversions).
+
+    The ``device_output_mode`` verdicts for the factor-4 canvases close the
+    scenario: the selector runs on a ``torch.device("cuda")`` **object** with
+    ``free_memory_bytes`` patched - no CUDA is touched (the selector reads the
+    device type and the patched budget) - across the budget regimes: the
+    fixture canvas at a realistic free VRAM, tight and starved budgets, and
+    the production 720p point of the design (100 frames x 2880x5120, where
+    "chunked" engages).  CPU device only; the CUDA numbers stay owner-gated
+    (V2).
+    """
+    import cv2
+
+    import src.keep_gpu_ops as ops_mod
+
+    faces = np.asarray(captured["faces_bgr"])
+    background = captured["background_bgr"]
+    if torch.is_tensor(background):
+        background = background.cpu().numpy()
+    background = np.asarray(background)
+    num_eligible = int(faces.shape[0])
+
+    # the factor-4 inverse warps: the same re-invert the processor runs at
+    # production, from the captured forward affines of the eligible frames
+    forward_all = routing_args.get("affine_matrices") if routing_args else None
+    forward = [forward_all[i] for i in eligible] if forward_all else []
+    if forward and all(matrix is not None for matrix in forward):
+        inverse_route = "captured_forward_reinverted_at_4x"
+        inverse_affines_4x = ops_mod.inverse_affines(forward, upscale_factor=FACTOR4_SCALE)
+    else:
+        inverse_route = "captured_inverses_scaled_by_4x"
+        inverse_affines_4x = [matrix * FACTOR4_SCALE for matrix in captured["inverse_affines"]]
+
+    background_4x = np.stack(
+        [
+            cv2.resize(
+                background[index],
+                (int(background.shape[2] * FACTOR4_SCALE),
+                 int(background.shape[1] * FACTOR4_SCALE)),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+            for index in range(background.shape[0])
+        ]
+    )
+    canvas_hw = tuple(int(value) for value in background_4x.shape[1:3])
+
+    # the three modes on the same operands (the chunked helper receives the
+    # 4x background with upscale_factor=1.0 - no per-group resize, the shared
+    # background is the point)
+    call = dict(
+        faces_bgr=faces,
+        inverse_affines=inverse_affines_4x,
+        background_bgr=background_4x,
+        device=captured.get("device", torch.device(device)),
+        parse_net=captured.get("parse_net"),
+    )
+    modes = (
+        ("host_output", lambda: paste_mod.paste_faces_batch(**call)),
+        ("device_output", lambda: paste_mod.paste_faces_batch(**call, device_output=True)),
+        ("chunked", lambda: paste_mod.paste_faces_batch_chunked(
+            **call, upscale_factor=1.0, bg_upscale_model=None, canvas_hw=None,
+            frame_chunk=1)),
+    )
+    modes_report: dict = {}
+    results: dict = {}
+    for label, fn in modes:
+        paste_mod.reset_paste_transfer_stats()
+        results[label] = timer.measure(label, fn)
+        modes_report[label] = {
+            "per_frame_ms": round(timer.totals[label] * 1000.0 / num_eligible, 2),
+            "cpu_per_frame_ms": round(timer.cpu_totals[label] * 1000.0 / num_eligible, 2),
+            "counters": dict(paste_mod.PASTE_TRANSFER_STATS),
+        }
+    modes_report["host_output"]["frame_chunk"] = None
+    modes_report["device_output"]["frame_chunk"] = None
+    modes_report["chunked"]["frame_chunk"] = 1
+
+    # the bit-identity of every mode pair: the host stack is the reference
+    # (uint8 level), the conversions carry the float32 IMAGE level
+    host_stack = np.stack(results["host_output"])
+    device_canvas = results["device_output"]
+    chunks = results["chunked"]
+    host_rows = paste_mod.bgr_u8_batch_to_comfy(host_stack)
+    device_rows = paste_mod.comfy_convert_out(device_canvas)
+    bit_identical = {
+        "host_vs_device_output": bool(
+            np.array_equal(host_stack, device_canvas.cpu().numpy())),
+        "host_vs_chunked": bool(torch.equal(host_rows, chunks)),
+        "device_output_vs_chunked": bool(torch.equal(device_rows, chunks)),
+    }
+    bit_identical["all"] = all(bit_identical.values())
+
+    # the selector's verdicts for the factor-4 canvases: free_memory_bytes
+    # patched, a cuda device OBJECT (no CUDA is touched - the selector reads
+    # the device type and the patched budget), restored in the finally
+    verdict_cases = (
+        ("fixture_canvas_free_24GiB", 24 << 30, num_eligible, canvas_hw),
+        ("fixture_canvas_free_128MiB", 128 << 20, num_eligible, canvas_hw),
+        ("fixture_canvas_free_32MiB_starved", 32 << 20, num_eligible, canvas_hw),
+        ("production_720p_100_frames_free_24GiB", 24 << 30, 100, (2880, 5120)),
+    )
+    cuda_view = torch.device("cuda")
+    saved_free = paste_mod.free_memory_bytes
+    verdict_rows: list[dict] = []
+    try:
+        for case, free_bytes, frames, hw in verdict_cases:
+            paste_mod.free_memory_bytes = lambda _device, free=free_bytes: free
+            verdict_rows.append({
+                "case": case,
+                "free_memory_bytes": int(free_bytes),
+                "canvas_hw": list(hw),
+                "frames": int(frames),
+                "canvas_bytes_per_frame": int(hw[0]) * int(hw[1]) * 3,
+                "budget_bytes": paste_mod.device_canvas_budget(cuda_view),
+                "paste_chunk_frames": paste_mod.paste_chunk_size(hw[0], hw[1], cuda_view),
+                "verdict": paste_mod.device_output_mode(cuda_view, frames, hw[0], hw[1]),
+            })
+    finally:
+        paste_mod.free_memory_bytes = saved_free
+
+    return {
+        "note": (
+            "the run's paste call at final_upscale_factor=4: the same 4x "
+            "background feeds every mode (the comparison isolates the output "
+            "assembly; the host LANCZOS4 resize vs the device Lanczos is the "
+            "owner-accepted tolerance route, priced out by the shared "
+            "background) - bit_identical holds per mode pair (uint8 level "
+            "against the device canvas, float32 IMAGE level against the "
+            "conversions); the verdicts patch free_memory_bytes on a cuda "
+            "device object - no CUDA is touched, the CPU-only engagement "
+            "proof; the CUDA run stays the owner-gated V2"
+        ),
+        "frames": num_eligible,
+        "canvas_hw": list(canvas_hw),
+        "inverse_route": inverse_route,
+        "modes": modes_report,
+        "bit_identical": bit_identical,
+        "device_output_mode_verdict": verdict_rows[0]["verdict"],
+        "device_output_mode_verdicts": verdict_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 # The attribution run
 # ---------------------------------------------------------------------------
 
@@ -475,6 +649,15 @@ def attribute(device: str, num_frames: int, height: int, width: int, warmup: int
         if torch.is_tensor(canvas):
             comparison["bit_identical"] = bool(
                 np.array_equal(np.stack(host_frames), canvas.cpu().numpy()))
+
+        # the factor-4 scenario (the GPU-resident-output round, design
+        # section 5): the same paste call at final_upscale_factor=4 - host
+        # vs the device canvas vs the chunked helper, plus the
+        # device_output_mode verdicts of the factor-4 canvases
+        if routing.eligible:
+            comparison["factor4"] = output_mode_factor4(
+                paste_mod, captured, routing.args, routing.eligible, device,
+                probe.Timer(device))
 
     # the transfer accounting (the same pass the probe runs)
     transfer: dict = {"the_batched_paste_ran": bool(routing.args)}

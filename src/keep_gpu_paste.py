@@ -46,6 +46,7 @@ import numpy as np
 import torch
 
 from .keep_gpu_ops import parse_soft_masks, resize_lanczos_u8, warp_affine_batch
+from .keep_image_utils import bgr_u8_batch_to_comfy
 
 #: The size the ParseNet works on (``face_restoration_helper.py:452`` -
 #: ``cv2.resize(current_restored_face, (512, 512))``).
@@ -118,10 +119,25 @@ ROI_MARGIN = 1
 #: decides.
 PASTE_DEVICE_STACK_MAX_BYTES = 1 << 30
 
+#: The share of the free VRAM the device-output canvas may use.  The full
+#: mode holds the background AND the canvas on the device (about 2x the
+#: checked bytes) plus the convert-out transient, so a quarter of free VRAM
+#: keeps the engaged footprint inside the headroom.  Owner-tunable on CUDA.
+PASTE_DEVICE_STACK_SHARE = 0.25
+
 #: The key of :func:`_batched_paste`'s mapping that carries the device
 #: canvas and its frame indices in the device-output mode.  The host mode
 #: never sets it, so the ``{frame index: frame}`` contract is unchanged.
 DEVICE_CANVAS_KEY = "__device_canvas__"
+
+#: The key of :func:`_batched_paste`'s mapping that carries the converted
+#: IMAGE rows of the chunked device-output mode - the
+#: ``(N_eligible, canvas_h, canvas_w, 3)`` float32 host tensor of
+#: :func:`paste_faces_batch_chunked`.  The full mode sets
+#: :data:`DEVICE_CANVAS_KEY` (its rows are still one uint8 canvas), the
+#: host mode sets neither, so the ``{frame index: frame}`` contract is
+#: unchanged.
+DEVICE_OUTPUT_CHUNKS_KEY = "__device_output_chunks__"
 
 PASTE_TRANSFER_STATS: dict[str, int] = {
     "frames": 0,
@@ -194,6 +210,272 @@ def paste_chunk_size(
     if free > 0:
         budget = min(budget, int(free * STAGING_MEMORY_SHARE))
     return max(1, min(maximum, budget // per_frame))
+
+
+# ---------------------------------------------------------------------------
+# The device-output assembly (the round of the GPU-resident output)
+# ---------------------------------------------------------------------------
+
+def device_canvas_budget(device: torch.device) -> int:
+    """The VRAM budget of the device-output canvas (the design's D1).
+
+    The mirror of :func:`paste_chunk_size`: the share of the free VRAM
+    (:data:`PASTE_DEVICE_STACK_SHARE`) under the hard cap
+    (:data:`PASTE_DEVICE_STACK_MAX_BYTES`), with the cap itself when the
+    free memory is unavailable (a host without ComfyUI).  The cap keeps
+    the full mode's engagement exactly as tight as the F1 one was - the
+    share only degrades the budget gracefully on a small-free card.
+
+    Note: with a ComfyUI host ``free_memory_bytes`` returns the **host**
+    RAM for a CPU device (``comfy/model_management.py:1816-1818``), so a
+    CPU budget is the cap - the pins patch ``free_memory_bytes`` (the
+    shipped chunk-size pattern) for the determinism of smaller budgets.
+    """
+    free = free_memory_bytes(device)
+    if free <= 0:
+        return PASTE_DEVICE_STACK_MAX_BYTES
+    return min(PASTE_DEVICE_STACK_MAX_BYTES, int(free * PASTE_DEVICE_STACK_SHARE))
+
+
+def device_output_mode(
+    device: torch.device, num_frames: int, canvas_h: int, canvas_w: int
+) -> str:
+    """The output-assembly mode of one paste call: ``full`` | ``chunked`` | ``host``.
+
+    ``"full"`` - the F1 device canvas of the whole eligible batch
+    (:func:`paste_faces_batch` with ``device_output=True``); ``"chunked"``
+    - the same device assembly over frame groups, per group convert-out
+    downloaded into a preallocated host buffer
+    (:func:`paste_faces_batch_chunked`); ``"host"`` - the processor's host
+    assembly (a CPU device, or a canvas the budget cannot hold even one
+    chunk of - a genuinely starved card, since one chunk's canvas fits
+    whenever about 800 MB of free VRAM do).
+
+    The chunk operand is :func:`paste_chunk_size` of the canvas - the same
+    value the full mode derives internally - so the chunked mode's group
+    boundaries coincide with the full mode's internal chunk boundaries and
+    both modes run the same batch compositions (the CUDA batch
+    sensitivity of the mask warp and of the Lanczos resize rides on that).
+
+    The module stays torch / cv2 / numpy only - the caller logs the
+    disengagement (a ``"host"`` verdict on a CUDA device) at its call
+    site.
+    """
+    if torch.device(device).type != "cuda":
+        return "host"
+    canvas_bytes = int(canvas_h) * int(canvas_w) * 3
+    budget = device_canvas_budget(device)
+    if int(num_frames) * canvas_bytes <= budget:
+        return "full"
+    chunk = paste_chunk_size(canvas_h, canvas_w, device)
+    if int(chunk) * canvas_bytes <= budget:
+        return "chunked"
+    return "host"
+
+
+def paste_canvas_hw(
+    background_hw: tuple[int, int],
+    upscale_factor: float,
+    canvas_hw: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """The ``(height, width)`` the paste assembles at (the single source).
+
+    The canvas is the background at the target size of the paste - the
+    frame size times the upscale factor - widened to the canvas the
+    vendored ``read_image`` produced when that is larger (the frame
+    upscaled for ``min(h, w) < 512``; the vendored paste resizes the
+    background to it, ``face_restoration_helper.py:365-370``).  In
+    production the ``canvas_hw`` product is never smaller than the frame
+    one (``read_image`` only upscales), so the ``max`` is defensive.
+
+    Returns:
+        ``(canvas_h, canvas_w)`` - the shape of
+        :func:`paste_faces_batch`'s device-output canvas and of
+        :func:`paste_faces_batch_chunked`'s IMAGE rows.
+    """
+    target_h = int(background_hw[0] * upscale_factor)
+    target_w = int(background_hw[1] * upscale_factor)
+    if canvas_hw is None:
+        return target_h, target_w
+    return (
+        max(target_h, int(canvas_hw[0] * upscale_factor)),
+        max(target_w, int(canvas_hw[1] * upscale_factor)),
+    )
+
+
+def comfy_convert_out(
+    canvas: torch.Tensor,
+    out: torch.Tensor | None = None,
+    budget: int | None = None,
+) -> torch.Tensor:
+    """A uint8 BGR canvas -> a ComfyUI IMAGE batch, in budget-sized sub-chunks.
+
+    The convert-out of the device-output modes: the same
+    :func:`~.keep_image_utils.bgr_u8_batch_to_comfy` op chain - the RGB
+    gather, the float32 cast and the ``/255`` - runs where the canvas
+    lives and the float32 result downloads (the final IMAGE tensor the
+    ComfyUI contract forces).
+
+    The finding behind the sub-chunks: the chain is out-of-place and
+    peaks at about **9x the canvas bytes** of device transient per frame
+    (the gather 1x, the float cast 4x, the ``/255`` 4x) - at the full
+    mode's own 1 GiB engagement limit that is a ~9 GiB transient, so the
+    budget would not bound what it gates.  The conversion is elementwise
+    - measured batch-invariant on CPU (the design's D3/D4) - so the
+    sub-chunk of ``max(1, budget // (9 * frame_bytes))`` frames bounds
+    the transient by the budget on both tails without changing a pixel.
+    The float32 download equals the size of the final IMAGE tensor
+    anyway; the uint8-download-convert-on-host alternative was rejected -
+    it revives the host float math the round removes (the design's D4).
+
+    Args:
+        canvas: the ``(N, H, W, 3)`` uint8 BGR tensor (any device).
+        out: the preallocated ``(N, H, W, 3)`` float32 **host** tensor the
+            sub-chunk results are written into - ``None`` allocates it.
+        budget: the device bytes the transient may peak at; ``None`` (and
+            values at or below zero) converts the whole batch in one call.
+
+    Returns:
+        The ``(N, H, W, 3)`` float32 CPU IMAGE batch (``out``).
+    """
+    num_frames, height, width = (int(value) for value in canvas.shape[:3])
+    if out is None:
+        out = torch.empty(
+            (num_frames, height, width, int(canvas.shape[3])), dtype=torch.float32
+        )
+    if budget is None or int(budget) <= 0:
+        sub_chunk = max(1, num_frames)
+    else:
+        sub_chunk = max(1, int(budget) // (9 * height * width * int(canvas.shape[3])))
+    for start in range(0, num_frames, sub_chunk):
+        stop = min(start + sub_chunk, num_frames)
+        out[start:stop] = bgr_u8_batch_to_comfy(canvas[start:stop])
+    return out
+
+
+def paste_faces_batch_chunked(
+    faces_bgr: np.ndarray,
+    inverse_affines: Sequence[np.ndarray],
+    background_bgr: np.ndarray,
+    upscale_factor: float,
+    bg_upscale_model,
+    device: torch.device,
+    canvas_hw: tuple[int, int] | None,
+    parse_net,
+    frame_chunk: int | None = None,
+    parse_chunk: int | None = None,
+) -> torch.Tensor:
+    """The device-output paste of the whole eligible batch, in frame groups.
+
+    The chunked mode of :func:`device_output_mode`: the F1 device
+    assembly (:func:`paste_faces_batch` with ``device_output=True``) over
+    ``frame_chunk``-sized groups, with the background produced **per
+    group** (a whole-batch device background would itself be canvas-sized
+    and defeat the chunking) and the per-group convert-out
+    (:func:`comfy_convert_out`) downloaded into one preallocated host
+    float32 buffer.  The device footprint is one group's (raw upload +
+    Lanczos out + canvas + the convert transient <= the budget),
+    independent of the clip length - the point: the full mode's
+    ``N * H * W * 3`` canvas disengages past the budget and revives the
+    host assembly at 16x pixels.
+
+    The group size defaults to :func:`paste_chunk_size` of the canvas -
+    the same value the full mode derives internally, so the full mode's
+    internal chunk boundaries and the groups coincide and both modes run
+    the same batch compositions.  On CPU every op is measured
+    batch-invariant (the design's D3), so the modes are bit-identical for
+    any group size; on CUDA the boundary alignment is the structural
+    guarantee, with the Lanczos background resize's batch sensitivity
+    owner-gated - the one op that still sees the whole batch in the full
+    mode and groups in this one.
+
+    The vendored-fallback frames are not this function's business: only
+    the eligible rows are converted; the processor writes the fallback
+    rows host-side (one stack, one conversion) into its own buffer.
+
+    Args:
+        faces_bgr: the ``(N, 512, 512, 3)`` uint8 BGR restored faces of
+            the eligible frames.
+        inverse_affines: the ``N`` inverse warps of the paste - the
+            ``cv2.invertAffineTransform(affine) * upscale_factor`` of the
+            vendored ``get_inverse_affine``
+            (:func:`.keep_gpu_ops.inverse_affines`).
+        background_bgr: the ``(N, h, w, 3)`` uint8 BGR **raw** background
+            frames (the processor's ``background_stacked``) - the resize
+            to the canvas happens per group.
+        upscale_factor: the ``final_upscale_factor`` of the paste.
+        bg_upscale_model: the optional background upscaler (``None`` in
+            the production default).
+        device: the compute device.
+        canvas_hw: the ``(height, width)`` of the vendored ``read_image``
+            canvas (:func:`paste_canvas_hw`); ``None`` keeps the frame
+            target.
+        parse_net: the vendored ParseNet.
+        frame_chunk: the frames per group (``None`` sizes it from the
+            free VRAM - :func:`paste_chunk_size` of the canvas).
+        parse_chunk: the frames per ParseNet forward (``None`` sizes it
+            from the free VRAM).
+
+    Returns:
+        The ``(N, canvas_h, canvas_w, 3)`` float32 **CPU** tensor - the
+        ComfyUI IMAGE rows of the eligible frames.
+    """
+    faces = np.asarray(faces_bgr)
+    background = np.asarray(background_bgr)
+    num_frames = int(faces.shape[0])
+    if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
+        raise ValueError(
+            f"paste_faces_batch_chunked expects (N, {PARSE_FACE_SIZE}, "
+            f"{PARSE_FACE_SIZE}, 3) faces, got {tuple(faces.shape)}"
+        )
+    if len(inverse_affines) != num_frames:
+        raise ValueError(
+            f"paste_faces_batch_chunked: {len(inverse_affines)} inverse "
+            f"affines for {num_frames} faces"
+        )
+    if background.ndim != 4 or background.shape[0] != num_frames:
+        raise ValueError(
+            f"paste_faces_batch_chunked: {tuple(background.shape)} background "
+            f"frames for {num_frames} faces"
+        )
+    canvas_h, canvas_w = paste_canvas_hw(
+        background.shape[1:3], upscale_factor, canvas_hw
+    )
+    if frame_chunk is None:
+        frame_chunk = paste_chunk_size(canvas_h, canvas_w, device)
+    frame_chunk = max(1, int(frame_chunk))
+    budget = device_canvas_budget(device)
+    out = torch.empty((num_frames, canvas_h, canvas_w, 3), dtype=torch.float32)
+    reset_paste_transfer_stats()
+    totals: dict[str, int] = {key: 0 for key in PASTE_TRANSFER_STATS}
+    for start in range(0, num_frames, frame_chunk):
+        stop = min(start + frame_chunk, num_frames)
+        group_background = batched_bg_frames(
+            background[start:stop], upscale_factor, bg_upscale_model,
+            device, canvas_hw=canvas_hw, return_device=True,
+        )
+        canvas = paste_faces_batch(
+            faces[start:stop],
+            list(inverse_affines[start:stop]),
+            group_background,
+            device,
+            parse_net,
+            parse_chunk=parse_chunk,
+            frame_chunk=frame_chunk,
+            device_output=True,
+        )
+        # the group's paste call resets the counters - the chunked run
+        # sums the additive ones; ``frames`` and ``canvas_bytes`` are
+        # per-call values the tail sets for the whole helper call.
+        for key, value in PASTE_TRANSFER_STATS.items():
+            if key not in ("frames", "canvas_bytes"):
+                totals[key] += value
+        comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+    totals["frames"] = num_frames
+    totals["canvas_bytes"] = canvas_h * canvas_w * 3
+    PASTE_TRANSFER_STATS.clear()
+    PASTE_TRANSFER_STATS.update(totals)
+    return out
 
 
 # ---------------------------------------------------------------------------

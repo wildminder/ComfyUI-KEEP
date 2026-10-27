@@ -167,7 +167,13 @@ class KEEPFaceProcessor:
 
         Returns:
             ``{frame index: the pasted frame}`` - the frames that are not
-            in the mapping take the vendored path.
+            in the mapping take the vendored path.  A device-output mode
+            replaces the mapped frames with one sentinel key:
+            :data:`~.keep_gpu_paste.DEVICE_CANVAS_KEY` (the ``"full"``
+            mode's one uint8 canvas) or
+            :data:`~.keep_gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY` (the
+            ``"chunked"`` mode's float32 IMAGE rows) - the mapped indices
+            name the rows of that tensor, in order.
         """
         parse_net = getattr(self.face_helper, "face_parse", None)
         if parse_net is None or not getattr(self.face_helper, "use_parse", False):
@@ -197,26 +203,29 @@ class KEEPFaceProcessor:
         # group instead of one per frame.
         inverses = inverse_affines(
             [affine_matrices[i] for i in eligible], upscale_factor=final_upscale_factor)
-        # the device-output mode (F1 of the paste-step round): the background
-        # stays on the device and the pasted stack is returned as one uint8
-        # tensor instead of N host arrays - the assembly of the output stack
-        # (the per-frame download, the canvas copies, the ``np.stack`` and
-        # the convert-out's host math) moves to one indexed copy plus one
-        # convert-out.  The CPU device and an over-budget canvas keep the
-        # host output byte-for-byte.
-        canvas_shape = None
-        on_device = self.device.type == "cuda"
+        # The device-output mode (F1 of the paste-step round, the three-way
+        # selector of the GPU-resident-output round): the background stays on
+        # the device and the pasted stack comes back as one uint8 tensor
+        # ("full") or as the float32 IMAGE rows of the frame groups
+        # ("chunked") instead of N host arrays - the assembly of the output
+        # stack (the per-frame download, the canvas copies, the ``np.stack``
+        # and the convert-out's host math) moves to one indexed copy plus one
+        # convert-out.  The CPU device and a canvas the budget cannot hold
+        # keep the host output byte-for-byte; a "host" verdict on a CUDA
+        # device is logged - the silent fallback that hid the factor-4
+        # regression must not be silent again.
         background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
-        height, width = background_stacked.shape[1:3]
-        target_h, target_w = int(height * final_upscale_factor), int(width * final_upscale_factor)
-        canvas_h, canvas_w = target_h, target_w
-        if canvas_hw is not None:
-            canvas_h = max(target_h, int(canvas_hw[0] * final_upscale_factor))
-            canvas_w = max(target_w, int(canvas_hw[1] * final_upscale_factor))
-        canvas_bytes = len(eligible) * canvas_h * canvas_w * 3
-        if on_device and canvas_bytes <= paste_mod.PASTE_DEVICE_STACK_MAX_BYTES:
-            canvas_shape = (canvas_h, canvas_w)
-        if canvas_shape is not None:
+        canvas_h, canvas_w = paste_mod.paste_canvas_hw(
+            background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
+        mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
+        if mode == "host" and self.device.type == "cuda":
+            logger.info(
+                f"Device output assembly disengaged: {len(eligible)} frames on a "
+                f"{canvas_h}x{canvas_w} canvas exceed the "
+                f"{paste_mod.device_canvas_budget(self.device)}-byte device budget "
+                "- the host assembly runs"
+            )
+        if mode == "full":
             background = batched_bg_frames(
                 background_stacked, final_upscale_factor, self.bg_upscale_model,
                 self.device, canvas_hw=canvas_hw, return_device=True)
@@ -228,6 +237,17 @@ class KEEPFaceProcessor:
                 parse_net=parse_net,
                 device_output=True)
             return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
+        if mode == "chunked":
+            chunks = paste_mod.paste_faces_batch_chunked(
+                faces_bgr=np.stack([restored_faces[i] for i in eligible]),
+                inverse_affines=inverses,
+                background_bgr=background_stacked,
+                upscale_factor=final_upscale_factor,
+                bg_upscale_model=self.bg_upscale_model,
+                device=self.device,
+                canvas_hw=canvas_hw,
+                parse_net=parse_net)
+            return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
         background = batched_bg_frames(
             background_stacked, final_upscale_factor, self.bg_upscale_model,
             self.device, canvas_hw=canvas_hw)
@@ -551,12 +571,23 @@ class KEEPFaceProcessor:
                     (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
                     device=self.device)
                 device_canvas[list(batched_outputs)] = canvas
+            chunks_out = batched_outputs.pop(paste_mod.DEVICE_OUTPUT_CHUNKS_KEY, None)
+            if chunks_out is not None:
+                # one float32 host buffer of the whole batch: the chunked
+                # mode's per-group convert-outs already landed in it (the
+                # eligible rows are IMAGE rows) - one indexed copy places
+                # them; the vendored-fallback frames are converted host-side
+                # below (one stack, never per-frame transfers)
+                final_batch = torch.empty(
+                    (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
+                final_batch[list(batched_outputs)] = chunks_out
             for i in range(num_input_frames):
                 original_frame_bgr = input_frames_bgr[i]
                 if i in batched_outputs:
-                    # the device mode already holds the frame in the canvas;
-                    # the host mode keeps the mapping value
-                    if device_canvas is None:
+                    # both device modes already hold the frame (the canvas
+                    # or the chunk buffer); the host mode keeps the mapping
+                    # value
+                    if device_canvas is None and chunks_out is None:
                         output_frames_cv2.append(batched_outputs[i])
                     progress.update(1)
                     continue
@@ -586,6 +617,10 @@ class KEEPFaceProcessor:
                     if avg_landmarks_sequence is None or i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
                         final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
                         output_frames_cv2.append(final_pasted_frame)
+                        # the same bookkeeping as the sibling fallback rows:
+                        # the device-output tails index the fallback rows by
+                        # this list, so an unrecorded frame length-mismatches
+                        fallback_indices.append(i)
                         continue
                     # Affine once (design section 7.3): the crop step
                     # computed the matrix - the paste loop of today ran a
@@ -628,13 +663,26 @@ class KEEPFaceProcessor:
             
         # The batched convert-out (design section 7.8): one stack and one
         # transfer, where the per-frame loop made a tensor per frame.
+        if chunks_out is not None:
+            # the chunked device mode: the eligible rows are already IMAGE
+            # rows of final_batch; the vendored-fallback frames are still
+            # host arrays - one stack and one conversion written into the
+            # fallback rows (never per-frame transfers; the conversion is
+            # the same elementwise chain the device convert-out runs)
+            if output_frames_cv2:
+                final_batch[fallback_indices] = bgr_u8_batch_to_comfy(
+                    np.stack(output_frames_cv2))
+            return final_batch
         if device_canvas is not None:
             # F1: the fallback frames are still host arrays - one stacked
-            # upload, never one transfer per frame
+            # upload, never one transfer per frame; the convert-out runs on
+            # the device in budget-sized sub-chunks (the out-of-place chain
+            # peaks at about 9x the canvas bytes of device transient)
             if output_frames_cv2:
                 device_canvas[fallback_indices] = torch.from_numpy(
                     np.stack(output_frames_cv2)).to(self.device)
-            return bgr_u8_batch_to_comfy(device_canvas)
+            return paste_mod.comfy_convert_out(
+                device_canvas, budget=paste_mod.device_canvas_budget(self.device))
         if not output_frames_cv2:
              return image_sequence_tensor
         final_batch_tensor = bgr_u8_batch_to_comfy(np.stack(output_frames_cv2))

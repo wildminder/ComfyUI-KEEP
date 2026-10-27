@@ -35,6 +35,15 @@ accounting and the frame-global maximum of the quantizing tail.  Those
 pins are **bit-exact** - the ROI path has to reproduce the crop of the
 full-canvas result byte for byte (a tolerance would be a QA failure, not
 an acceptance).
+
+The **device-output assembly** (the GPU-resident-output round) is pinned
+here as well: the VRAM budget of the device canvas, the three-way mode
+selector, the sub-chunked convert-out, the factor-4 device canvas and the
+chunked device assembly.  The pins are **bit-exact** and run on the CPU
+device only: every op of the paste is batch-invariant there (measured -
+the parse forward, the warps, the blend and the elementwise convert
+chain), so the chunked mode equals the full mode equals the host stack
+for any chunk boundary.
 """
 
 from __future__ import annotations
@@ -72,6 +81,11 @@ def helper_module():
 @pytest.fixture(scope="module")
 def misc_module():
     return importlib.import_module("ComfyUI_KEEP.modules.deps.facelib.utils.misc")
+
+
+@pytest.fixture(scope="module")
+def image_utils():
+    return importlib.import_module("ComfyUI_KEEP.src.keep_image_utils")
 
 
 @pytest.fixture()
@@ -939,6 +953,253 @@ def test_a_dark_roi_in_a_bright_frame_keeps_the_frame_global_branch(gpu_paste):
 
 
 # ---------------------------------------------------------------------------
+# The device-output assembly (the GPU-resident-output round)
+#
+# The round that keeps the paste's output stack on the device past the F1
+# budget: the VRAM budget of the device canvas (``device_canvas_budget``),
+# the three-way mode selector (``device_output_mode``), the sub-chunked
+# convert-out (``comfy_convert_out``) and the chunked device assembly
+# (``paste_faces_batch_chunked``).  The pins are **bit-exact** and run on
+# the CPU device only: every op of the paste is batch-invariant there
+# (measured - the parse forward, the warps, the blend and the elementwise
+# convert chain), so the chunked mode equals the full mode equals the host
+# stack for any chunk boundary.  On CUDA the production group size is the
+# full mode's own ``paste_chunk_size``, which keeps the batch compositions
+# equal by construction; the Lanczos background resize stays the one
+# owner-gated residual.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_device_canvas_budget_follows_the_free_memory(gpu_paste, monkeypatch):
+    """The canvas budget: the free-VRAM share under the F1 hard cap.
+
+    The mirror of the chunk-size pins above: ``free_memory_bytes`` is
+    patched for determinism (with a ComfyUI host it returns the **host**
+    RAM for a CPU device - ``comfy/model_management.py:1816-1818`` - so a
+    CPU budget is the cap without the patch).  No number keeps the fixed
+    cap (the F1 engagement, unchanged); a quarter of 2 GiB degrades the
+    budget to 512 MiB (the small-free card); 64 GiB of free memory is
+    capped back at 1 GiB (the share never engages past the F1 one).
+    """
+    device = torch.device("cpu")
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 0)
+    assert gpu_paste.device_canvas_budget(device) == gpu_paste.PASTE_DEVICE_STACK_MAX_BYTES
+
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 2 << 30)
+    assert gpu_paste.device_canvas_budget(device) == 1 << 29, (
+        "a quarter of 2 GiB is 512 MiB - below the cap, so the share decides"
+    )
+
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 64 << 30)
+    assert gpu_paste.device_canvas_budget(device) == gpu_paste.PASTE_DEVICE_STACK_MAX_BYTES
+
+
+@pytest.mark.unit
+def test_the_device_output_mode_selects_full_chunked_or_host(gpu_paste, monkeypatch):
+    """The three-way selector: full inside the budget, chunked past it.
+
+    A ``torch.device("cuda")`` **object** drives the CUDA branch - the
+    selector only reads ``.type`` and the patched memory, so no CUDA is
+    touched (the CPU-only rule of the round).  The factor-4 numbers are
+    the owner's complaint: 100 frames on a 2880x5120 canvas are ~4.1 GiB
+    of uint8, past the 1 GiB cap, so the full mode disengages; one chunk
+    of 4 frames (the 2 GiB staging over ~436 MiB per frame) still fits, so
+    the chunked mode engages; a starved card (the budget below one
+    frame's canvas) keeps the host assembly.  The last two assertions pin
+    the boundary itself: ``num_frames * canvas_bytes == budget`` stays
+    ``full`` (the ``<=``), one frame past it falls to ``chunked``.
+    """
+    cuda = torch.device("cuda")
+    # a CPU device keeps the host output (the F1 behavior, unpatched)
+    assert gpu_paste.device_output_mode(torch.device("cpu"), 4, 256, 384) == "host"
+
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 8 << 30)
+    assert gpu_paste.device_output_mode(cuda, 4, 256, 384) == "full"
+    assert gpu_paste.device_output_mode(cuda, 100, 2880, 5120) == "chunked"
+
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 64 << 20)
+    assert gpu_paste.device_output_mode(cuda, 100, 2880, 5120) == "host"
+
+    # the exact budget boundary: four frames of a 256x384 canvas are
+    # exactly a quarter of 4,718,592 bytes of "free" memory
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 4_718_592)
+    assert gpu_paste.device_output_mode(cuda, 4, 256, 384) == "full"
+    assert gpu_paste.device_output_mode(cuda, 5, 256, 384) == "chunked"
+
+
+@pytest.mark.unit
+def test_the_convert_out_sub_chunks_without_changing_a_pixel(gpu_paste, image_utils):
+    """The budget-sized sub-chunks of the convert-out are bit-exact.
+
+    The full mode's convert-out peaks at about 9x the canvas bytes of
+    device transient (the out-of-place RGB gather, the float32 cast and
+    the ``/255`` - the design's D4 finding), so both device tails convert
+    in sub-chunks of ``budget // (9 * frame_bytes)`` frames.  The chain is
+    elementwise - batch-invariant on the CPU device like every op of the
+    paste - so the sub-chunked result is the single
+    :func:`~.keep_image_utils.bgr_u8_batch_to_comfy` call, byte for byte.
+    The budget is forced to one frame and to two (a non-tail-aligned 2/2/1
+    split over the five frames), and the preallocated ``out`` receives the
+    result in place.
+    """
+    rng = np.random.default_rng(191)
+    canvas = torch.from_numpy(
+        rng.integers(0, 256, size=(5, 48, 72, 3), dtype=np.uint8))
+    single = image_utils.bgr_u8_batch_to_comfy(canvas)
+    transient = 9 * 48 * 72 * 3  # the per-frame peak the budget bounds
+
+    assert torch.equal(gpu_paste.comfy_convert_out(canvas), single)
+    assert torch.equal(gpu_paste.comfy_convert_out(canvas, budget=transient), single)
+    assert torch.equal(
+        gpu_paste.comfy_convert_out(canvas, budget=2 * transient), single)
+
+    out = torch.empty((5, 48, 72, 3), dtype=torch.float32)
+    assert gpu_paste.comfy_convert_out(canvas, out=out, budget=transient) is out
+    assert torch.equal(out, single)
+
+
+@pytest.mark.unit
+def test_the_device_output_stack_is_bit_identical_to_the_host_stack_at_upscale_four(
+    gpu_paste, gpu_ops
+):
+    """AC 4: the device-output canvas at the upscale factor of four.
+
+    The factor-4 canvas is where the host assembly revives today (16x the
+    pixels), so the pin runs the cheap stand-in: 64x96 frames paste onto a
+    256x384 canvas.  The 4x background is produced **once** and feeds both
+    modes, so the pin isolates the assembly of the output stack - exactly
+    the F1 pin above, at the factor the budget bites.  (The processor's
+    factor-4 host background is the cv2 Lanczos while the device modes use
+    the owner-accepted device Lanczos - a tolerance route the end-to-end
+    pin stays clear of by comparing at one factor.)
+    """
+    frames = smooth_frames_u8(2, (64, 96), seed=193)
+    landmarks = synthetic_landmarks(2, (64, 96), seed=197)
+    rng = np.random.default_rng(199)
+    faces = rng.integers(0, 256, size=(2, 512, 512, 3), dtype=np.uint8)
+    affines = gpu_ops.estimate_affines(landmarks, FACE_TEMPLATE)
+    background = gpu_paste.batched_bg_frames(frames, 4.0, None, torch.device("cpu"))
+    inverses = gpu_ops.inverse_affines(affines, upscale_factor=4.0)
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=inverses,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=211),
+        frame_chunk=2,
+    )
+
+    host_frames = gpu_paste.paste_faces_batch(**kwargs)
+    device_canvas = gpu_paste.paste_faces_batch(device_output=True, **kwargs)
+
+    assert background.shape == (2, 256, 384, 3), background.shape
+    assert tuple(device_canvas.shape) == (2, 256, 384, 3), device_canvas.shape
+    for index, host_frame in enumerate(host_frames):
+        assert np.array_equal(device_canvas[index].numpy(), host_frame), (
+            f"frame {index}: the factor-4 device canvas drifted from the host stack"
+        )
+
+
+@pytest.mark.unit
+def test_the_chunked_assembly_matches_the_host_stack_and_the_full_canvas(
+    gpu_paste, image_utils
+):
+    """AC 3a: the chunked helper's IMAGE rows == the host stack == the canvas.
+
+    The helper pastes in ``frame_chunk=1`` groups - the smallest possible -
+    while the full mode runs the whole batch and the host stack is the
+    shipped list return.  On the CPU device every op of the paste is
+    batch-invariant (measured, the design's D3), so all three assemblies
+    come out as the same float32 IMAGE batch, byte for byte.
+    """
+    rng = np.random.default_rng(223)
+    faces = np.stack([_face_u8("smooth", seed=227), _face_u8("noise", seed=229)])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "interior", scale=0.3),
+    ]
+    background = rng.integers(0, 256, size=(2, *ROI_CANVAS_HW, 3), dtype=np.uint8)
+    kwargs = dict(
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=233),
+    )
+
+    host_frames = gpu_paste.paste_faces_batch(faces_bgr=faces, frame_chunk=2, **kwargs)
+    full_canvas = gpu_paste.paste_faces_batch(
+        faces_bgr=faces, frame_chunk=2, device_output=True, **kwargs)
+    chunked = gpu_paste.paste_faces_batch_chunked(
+        faces_bgr=faces,
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        canvas_hw=None,
+        frame_chunk=1,
+        **kwargs,
+    )
+
+    assert chunked.dtype == torch.float32 and chunked.device.type == "cpu"
+    assert tuple(chunked.shape) == (2, *ROI_CANVAS_HW, 3), chunked.shape
+    assert torch.equal(
+        chunked, image_utils.bgr_u8_batch_to_comfy(np.stack(host_frames))
+    ), "the chunked helper drifted from the host stack"
+    assert torch.equal(chunked, gpu_paste.comfy_convert_out(full_canvas)), (
+        "the chunked helper drifted from the full device mode"
+    )
+
+
+@pytest.mark.unit
+def test_the_chunked_assembly_is_independent_of_the_group_boundaries(
+    gpu_paste, image_utils
+):
+    """AC 3b: 17 faces in groups of 2 == the full mode's one whole batch.
+
+    The group boundaries (2, with the 8 x 2 + 1 remainder group) do not
+    align with the full mode's internal chunk (the whole batch in one), so
+    every op sees a different batch composition - and the IMAGE rows still
+    come out identical on the CPU device, where the parse forward, the
+    warps, the blend and the convert chain are batch-invariant (measured,
+    the design's D3).  On CUDA the production group size **is** the full
+    mode's own :func:`paste_chunk_size`, so the batch compositions are
+    equal by construction; the Lanczos background resize (whole batch in
+    the full mode, groups in this one) stays the one owner-gated residual.
+    """
+    rng = np.random.default_rng(239)
+    faces = rng.integers(0, 256, size=(17, 512, 512, 3), dtype=np.uint8)
+    matrices = [
+        _face_to_canvas(
+            ROI_CANVAS_HW,
+            "interior" if index % 2 == 0 else "edge",
+            scale=0.25 if index % 3 else 0.3,
+        )
+        for index in range(17)
+    ]
+    background = rng.integers(0, 256, size=(17, *ROI_CANVAS_HW, 3), dtype=np.uint8)
+    kwargs = dict(
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=241),
+    )
+
+    full_canvas = gpu_paste.paste_faces_batch(
+        faces_bgr=faces, frame_chunk=17, device_output=True, **kwargs)
+    chunked = gpu_paste.paste_faces_batch_chunked(
+        faces_bgr=faces,
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        canvas_hw=None,
+        frame_chunk=2,
+        **kwargs,
+    )
+
+    assert torch.equal(chunked, gpu_paste.comfy_convert_out(full_canvas)), (
+        "the group boundaries changed the pasted pixels"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The batched background (design section 7.7, step 1)
 # ---------------------------------------------------------------------------
 
@@ -1202,3 +1463,182 @@ def test_the_vendored_paste_stays_reachable_without_a_parse_net(processor_module
 
     assert "paste_faces_to_input_image" in face_helper.calls, face_helper.calls
     assert tuple(output.shape) == (1, 64, 96, 3), output.shape
+
+
+@pytest.mark.unit
+def test_the_batched_paste_returns_the_device_output_sentinels(
+    processor_module, gpu_paste, gpu_ops, monkeypatch
+):
+    """The wiring: the selector's verdict picks the sentinel of the mapping.
+
+    ``_batched_paste`` runs the real device-mode code on the CPU device
+    (the F1 pins prove it) - only the selector is patched, so the
+    ``"full"`` verdict returns :data:`~.keep_gpu_paste.DEVICE_CANVAS_KEY`
+    with one uint8 canvas, the ``"chunked"`` verdict
+    :data:`~.keep_gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY` with the float32
+    IMAGE rows, and the unpatched CPU run keeps the host mapping
+    (``{index: frame}``, no sentinel).  The mapped indices name the rows
+    of the sentinel tensor, in order.
+    """
+    frames = smooth_frames_u8(2, (64, 96), seed=251)
+    landmarks = synthetic_landmarks(2, (64, 96), seed=257)
+    rng = np.random.default_rng(263)
+    faces = rng.integers(0, 256, size=(2, 512, 512, 3), dtype=np.uint8)
+    affines = gpu_ops.estimate_affines(landmarks, FACE_TEMPLATE)
+    gray_flags = np.zeros(2, dtype=bool)
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _ParseFaceHelper(parse_net=_StubParseNet(seed=269))))
+
+    def call():
+        return processor._batched_paste(
+            frames, faces, affines, landmarks, 1.0, False, gray_flags)
+
+    host = call()
+    assert gpu_paste.DEVICE_CANVAS_KEY not in host
+    assert gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY not in host
+    assert all(isinstance(host[index], np.ndarray) for index in host)
+
+    monkeypatch.setattr(gpu_paste, "device_output_mode", lambda *a, **k: "full")
+    full = call()
+    canvas = full.pop(gpu_paste.DEVICE_CANVAS_KEY)
+    assert isinstance(canvas, torch.Tensor), type(canvas)
+    assert canvas.dtype == torch.uint8 and canvas.device.type == "cpu"
+    assert tuple(canvas.shape) == (2, 64, 96, 3), canvas.shape
+    assert gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY not in full
+    assert list(full) == [0, 1]
+    assert torch.equal(torch.stack([full[0], full[1]]), canvas)
+
+    monkeypatch.setattr(gpu_paste, "device_output_mode", lambda *a, **k: "chunked")
+    chunked = call()
+    chunks = chunked.pop(gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY)
+    assert isinstance(chunks, torch.Tensor), type(chunks)
+    assert chunks.dtype == torch.float32 and chunks.device.type == "cpu"
+    assert tuple(chunks.shape) == (2, 64, 96, 3), chunks.shape
+    assert gpu_paste.DEVICE_CANVAS_KEY not in chunked
+    assert list(chunked) == [0, 1]
+    assert torch.equal(torch.stack([chunked[0], chunked[1]]), chunks)
+
+
+@pytest.mark.unit
+def test_the_device_modes_keep_the_sequence_output_end_to_end(
+    processor_module, gpu_paste, image_utils, monkeypatch
+):
+    """AC 3c: the chunked and the full device modes ship the same IMAGE batch.
+
+    A four-frame sequence (three faces + one **gray** frame) runs through
+    ``process_image_sequence`` four times: the unpatched host run at the
+    factor of one, the full mode forced at one, then both device modes
+    forced at four.  Within one factor the final IMAGE tensors are
+    identical, byte for byte - and the gray frame rides along to pin the
+    vendored-fallback row across the modes (the stub paste returns a
+    canvas-sized pattern, converted by the same elementwise chain
+    everywhere).  The factor-4 host run is **not** compared: its
+    background is the cv2 Lanczos while the device modes use the
+    owner-accepted device Lanczos - a documented tolerance route, not a
+    drift.
+    """
+
+    def run(final_upscale_factor, canvas_hw, mode):
+        rng = np.random.default_rng(271)
+        pattern = rng.integers(0, 256, size=(*canvas_hw, 3), dtype=np.uint8)
+        landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
+        face_helper = _ParseFaceHelper(
+            parse_net=_StubParseNet(seed=277), landmarks=landmarks)
+        # the vendored paste of the fallback frame: a canvas-sized pattern,
+        # so the fallback row carries content (not zeros) and the same
+        # bytes in every run
+        face_helper.paste_faces_to_input_image = lambda *a, **k: pattern.copy()
+        frames = torch.rand(
+            (4, 64, 96, 3), generator=torch.Generator().manual_seed(281))
+        frames[3] = 0.4  # one channel value everywhere -> the gray flag
+        if mode is not None:
+            monkeypatch.setattr(
+                gpu_paste, "device_output_mode", lambda *a, **k: mode)
+        output, _ = _run_sequence(
+            processor_module, face_helper, frames,
+            final_upscale_factor=final_upscale_factor)
+        return output, pattern
+
+    host_f1, _ = run(1.0, (64, 96), None)
+    full_f1, pattern_f1 = run(1.0, (64, 96), "full")
+    full_f4, pattern_f4 = run(4.0, (256, 384), "full")
+    chunked_f4, _ = run(4.0, (256, 384), "chunked")
+
+    assert tuple(host_f1.shape) == (4, 64, 96, 3), host_f1.shape
+    assert torch.equal(full_f1, host_f1), (
+        "the forced-full run drifted from the host run at the factor of one"
+    )
+
+    assert tuple(full_f4.shape) == (4, 256, 384, 3), full_f4.shape
+    assert full_f4.dtype == torch.float32
+    assert torch.equal(chunked_f4, full_f4), (
+        "the chunked mode drifted from the full mode at the factor of four"
+    )
+
+    # the gray fallback row: the stub's canvas-sized pattern, converted by
+    # the same elementwise chain in every mode
+    gray_row = image_utils.bgr_u8_batch_to_comfy(torch.from_numpy(pattern_f4))
+    assert gray_row.abs().sum() > 0
+    assert torch.equal(full_f4[3], gray_row), (
+        "the full mode's fallback row drifted from the stub's pattern"
+    )
+    assert torch.equal(chunked_f4[3], gray_row), (
+        "the chunked mode's fallback row drifted from the stub's pattern"
+    )
+    assert torch.equal(
+        full_f1[3], image_utils.bgr_u8_batch_to_comfy(torch.from_numpy(pattern_f1))
+    )
+
+
+@pytest.mark.unit
+def test_the_nan_landmark_short_circuit_keeps_the_device_tails_aligned(
+    processor_module, gpu_paste, monkeypatch
+):
+    """The NaN-landmark short-circuit records its fallback row (the device tails).
+
+    The short-circuit of the paste loop (a frame whose smoothed landmarks
+    are NaN) appends its output but never recorded the frame in
+    ``fallback_indices`` - in a device-output mode the tail's indexed
+    assignment then length-mismatches and raises.  The production route
+    cannot reach the branch today: ``interpolate_sequence`` fills the NaN
+    landmarks (``np.interp`` flat-fills the edges too), so the branch is
+    defensive.  The pin forces a NaN landmark through - the interpolation
+    patched to the identity, the first detection emitting NaN - so the
+    branch runs and the three output modes stay byte-for-byte equal.
+    """
+    monkeypatch.setattr(processor_module, "interpolate_sequence", lambda seq: seq)
+
+    def run(mode):
+        landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
+        face_helper = _ParseFaceHelper(
+            parse_net=_StubParseNet(seed=311), landmarks=landmarks)
+        detections = {"n": 0}
+        original = face_helper.get_face_landmarks_5
+
+        def landmarks_with_nan(**kwargs):
+            result = original(**kwargs)
+            detections["n"] += 1
+            if detections["n"] == 1:
+                face_helper.all_landmarks_5 = [np.full_like(landmarks, np.nan)]
+            return result
+
+        face_helper.get_face_landmarks_5 = landmarks_with_nan
+        if mode is not None:
+            monkeypatch.setattr(
+                gpu_paste, "device_output_mode", lambda *a, **k: mode)
+        frames = torch.rand(
+            (24, 64, 96, 3), generator=torch.Generator().manual_seed(313))
+        output, _ = _run_sequence(
+            processor_module, face_helper, frames, final_upscale_factor=1.0)
+        return output
+
+    host = run(None)
+    full = run("full")
+    chunked = run("chunked")
+    assert tuple(host.shape) == (24, 64, 96, 3), host.shape
+    assert torch.equal(full, host), (
+        "the forced-full run drifted from the host run with a NaN landmark frame"
+    )
+    assert torch.equal(chunked, full), (
+        "the chunked mode drifted from the full mode with a NaN landmark frame"
+    )
