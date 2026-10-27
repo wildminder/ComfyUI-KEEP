@@ -23,6 +23,7 @@ from .keep_gpu_ops import (
     inverse_affines,
     tensor2img_batch,
 )
+from . import keep_gpu_paste as paste_mod
 from .keep_gpu_paste import (
     PARSE_FACE_SIZE,
     batched_bg_frames,
@@ -196,10 +197,40 @@ class KEEPFaceProcessor:
         # group instead of one per frame.
         inverses = inverse_affines(
             [affine_matrices[i] for i in eligible], upscale_factor=final_upscale_factor)
+        # the device-output mode (F1 of the paste-step round): the background
+        # stays on the device and the pasted stack is returned as one uint8
+        # tensor instead of N host arrays - the assembly of the output stack
+        # (the per-frame download, the canvas copies, the ``np.stack`` and
+        # the convert-out's host math) moves to one indexed copy plus one
+        # convert-out.  The CPU device and an over-budget canvas keep the
+        # host output byte-for-byte.
+        canvas_shape = None
+        on_device = self.device.type == "cuda"
+        background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
+        height, width = background_stacked.shape[1:3]
+        target_h, target_w = int(height * final_upscale_factor), int(width * final_upscale_factor)
+        canvas_h, canvas_w = target_h, target_w
+        if canvas_hw is not None:
+            canvas_h = max(target_h, int(canvas_hw[0] * final_upscale_factor))
+            canvas_w = max(target_w, int(canvas_hw[1] * final_upscale_factor))
+        canvas_bytes = len(eligible) * canvas_h * canvas_w * 3
+        if on_device and canvas_bytes <= paste_mod.PASTE_DEVICE_STACK_MAX_BYTES:
+            canvas_shape = (canvas_h, canvas_w)
+        if canvas_shape is not None:
+            background = batched_bg_frames(
+                background_stacked, final_upscale_factor, self.bg_upscale_model,
+                self.device, canvas_hw=canvas_hw, return_device=True)
+            canvas = paste_faces_batch(
+                faces_bgr=np.stack([restored_faces[i] for i in eligible]),
+                inverse_affines=inverses,
+                background_bgr=background,
+                device=self.device,
+                parse_net=parse_net,
+                device_output=True)
+            return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
         background = batched_bg_frames(
-            np.stack([input_frames_bgr[i] for i in eligible]),
-            final_upscale_factor, self.bg_upscale_model, self.device,
-            canvas_hw=canvas_hw)
+            background_stacked, final_upscale_factor, self.bg_upscale_model,
+            self.device, canvas_hw=canvas_hw)
         pasted = paste_faces_batch(
             faces_bgr=np.stack([restored_faces[i] for i in eligible]),
             inverse_affines=inverses,
@@ -476,7 +507,9 @@ class KEEPFaceProcessor:
         del batched_cropped_faces, all_restored_face_tensors, temp_restored_face_tensors
         _soft_empty_cache()
 
-        output_frames_cv2 = []
+        output_frames_cv2: list[np.ndarray] = []
+        fallback_indices: list[int] = []
+        device_canvas: torch.Tensor | None = None
         logger.info("Pasting faces and finalizing frames")
         # The paste step calls into the vendored facelib: its console writes
         # are routed to the logger of the pack (D4).
@@ -508,15 +541,29 @@ class KEEPFaceProcessor:
                     avg_landmarks_sequence, final_upscale_factor, draw_box, gray_flags,
                     canvas_hw=canvas_hw)
 
+            canvas = batched_outputs.pop(paste_mod.DEVICE_CANVAS_KEY, None)
+            if canvas is not None:
+                # one device canvas of the whole batch: the batched indices
+                # are already in it (it is the group canvas, indexed copy),
+                # the vendored-fallback frames are uploaded as one stack
+                # below, and the single convert-out runs on the device
+                device_canvas = torch.empty(
+                    (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
+                    device=self.device)
+                device_canvas[list(batched_outputs)] = canvas
             for i in range(num_input_frames):
                 original_frame_bgr = input_frames_bgr[i]
                 if i in batched_outputs:
-                    output_frames_cv2.append(batched_outputs[i])
+                    # the device mode already holds the frame in the canvas;
+                    # the host mode keeps the mapping value
+                    if device_canvas is None:
+                        output_frames_cv2.append(batched_outputs[i])
                     progress.update(1)
                     continue
                 if i >= len(all_restored_faces_cv2):
                     final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
                     output_frames_cv2.append(final_pasted_frame)
+                    fallback_indices.append(i)
                     continue
                 restored_face_patch_cv2 = all_restored_faces_cv2[i]
                 self.face_helper.clean_all()
@@ -576,10 +623,18 @@ class KEEPFaceProcessor:
                         final_pasted_frame = _gray_to_bgr(final_pasted_frame)
 
                 output_frames_cv2.append(final_pasted_frame)
+                fallback_indices.append(i)
                 progress.update(1)
             
         # The batched convert-out (design section 7.8): one stack and one
         # transfer, where the per-frame loop made a tensor per frame.
+        if device_canvas is not None:
+            # F1: the fallback frames are still host arrays - one stacked
+            # upload, never one transfer per frame
+            if output_frames_cv2:
+                device_canvas[fallback_indices] = torch.from_numpy(
+                    np.stack(output_frames_cv2)).to(self.device)
+            return bgr_u8_batch_to_comfy(device_canvas)
         if not output_frames_cv2:
              return image_sequence_tensor
         final_batch_tensor = bgr_u8_batch_to_comfy(np.stack(output_frames_cv2))

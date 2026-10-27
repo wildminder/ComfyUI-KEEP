@@ -706,6 +706,50 @@ def test_the_roi_paste_is_bit_identical_to_the_full_canvas_paste(
 
 
 @pytest.mark.unit
+def test_the_device_output_stack_is_bit_identical_to_the_host_stack(gpu_paste):
+    """F1: the device-output canvas is the host stack, byte for byte.
+
+    The device-output mode (``device_output=True``) moves the assembly of
+    the output stack - the per-frame download, the canvas copy, the
+    ``np.stack`` and the convert-out's host math - onto the device, where
+    the whole stack is one uint8 tensor.  It must not change a pixel: on a
+    CPU device the two modes run the same arithmetic on the same data, so
+    the canvas equals the list of the host frames exactly, on every pixel,
+    for every ROI position of the corpus.
+    """
+    height, width = ROI_CANVAS_HW
+    rng = np.random.default_rng(109)
+    faces = np.stack([_face_u8("smooth", seed=113), _face_u8("noise", seed=127)])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "interior", scale=0.3),
+    ]
+    background = rng.integers(0, 256, size=(2, height, width, 3), dtype=np.uint8)
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=131),
+        frame_chunk=2,
+    )
+
+    host_frames = gpu_paste.paste_faces_batch(use_roi=True, **kwargs)
+    device_canvas = gpu_paste.paste_faces_batch(use_roi=True, device_output=True, **kwargs)
+
+    assert isinstance(device_canvas, torch.Tensor), type(device_canvas)
+    assert tuple(device_canvas.shape) == (2, height, width, 3), device_canvas.shape
+    for index, host_frame in enumerate(host_frames):
+        assert np.array_equal(device_canvas[index].numpy(), host_frame), (
+            f"frame {index}: the device-output canvas drifted from the host stack"
+        )
+    stats = gpu_paste.PASTE_TRANSFER_STATS
+    assert stats["h2d_bytes"] == 0 and stats["d2h_bytes"] == 0, stats
+    assert stats["roi_staged_bytes"] > 0, stats
+    assert stats["roi_frames"] == 2 and stats["fallback_frames"] == 0, stats
+
+
+@pytest.mark.unit
 def test_the_roi_transfers_are_roi_sized(gpu_paste):
     """The transfer counters are ROI-sized, not canvas-sized.
 

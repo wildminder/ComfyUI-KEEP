@@ -108,6 +108,21 @@ ROI_MARGIN = 1
 #: ROI background upload and the blended ROI download; the ParseNet inputs
 #: are counted apart (``face_h2d_bytes``) - they are not ROI-sized by
 #: nature.  The counters describe the **last** paste call.
+#: ``roi_staged_bytes`` is the device-output claim: with the output stack on
+#: the device nothing travels, so the ROI-sized staging is recorded as the
+#: bytes that **would** have travelled (the same numbers ``h2d_bytes`` /
+#: ``d2h_bytes`` hold in the host-output mode).
+#: The device canvas budget of the device-output mode: a batch of
+#: ``N * H * W * 3`` bytes above it falls back to the host assembly (a
+#: 200-frame 1080p batch is 622 MB).  The budget, not a rule of thumb,
+#: decides.
+PASTE_DEVICE_STACK_MAX_BYTES = 1 << 30
+
+#: The key of :func:`_batched_paste`'s mapping that carries the device
+#: canvas and its frame indices in the device-output mode.  The host mode
+#: never sets it, so the ``{frame index: frame}`` contract is unchanged.
+DEVICE_CANVAS_KEY = "__device_canvas__"
+
 PASTE_TRANSFER_STATS: dict[str, int] = {
     "frames": 0,
     "h2d_bytes": 0,
@@ -116,6 +131,7 @@ PASTE_TRANSFER_STATS: dict[str, int] = {
     "canvas_bytes": 0,
     "roi_frames": 0,
     "fallback_frames": 0,
+    "roi_staged_bytes": 0,
 }
 
 
@@ -388,7 +404,8 @@ def batched_bg_frames(
     bg_upscale_model,
     device: torch.device,
     canvas_hw: tuple[int, int] | None = None,
-) -> np.ndarray:
+    return_device: bool = False,
+) -> np.ndarray | torch.Tensor:
     """The background of the paste, at the target size of the paste.
 
     Without a background model (the production default) the background is
@@ -410,20 +427,26 @@ def batched_bg_frames(
             sizes are the same).
 
     Returns:
-        ``(N, h_up, w_up, 3)`` uint8 BGR.
+        ``(N, h_up, w_up, 3)`` uint8 BGR - on the host, or on the device
+        when ``return_device`` is set (the numpy frames are uploaded once;
+        with a background model the batched ``tiled_scale`` result is
+        already on the device).
     """
     frames = np.asarray(frames_bgr_u8)
     height, width = frames.shape[1:3]
     target_h, target_w = int(height * upscale_factor), int(width * upscale_factor)
     on_device = device.type == "cuda"
     if bg_upscale_model is None:
-        background: np.ndarray | torch.Tensor = frames
+        background: np.ndarray | torch.Tensor = (
+            torch.from_numpy(np.ascontiguousarray(frames)).to(device)
+            if return_device else frames
+        )
     else:
         background = _tiled_scale_batch(bg_upscale_model, frames, device)
-        if not on_device:
+        if not on_device and not return_device:
             background = background.numpy()
     if background.shape[1] != target_h or background.shape[2] != target_w:
-        if on_device:
+        if on_device or return_device:
             background = resize_lanczos_u8(background, (target_w, target_h), device)
         else:
             background = np.stack(
@@ -439,7 +462,7 @@ def batched_bg_frames(
         canvas_target_h = int(canvas_h * upscale_factor)
         canvas_target_w = int(canvas_w * upscale_factor)
         if background.shape[1] != canvas_target_h or background.shape[2] != canvas_target_w:
-            if on_device:
+            if on_device or return_device:
                 background = resize_lanczos_u8(
                     background, (canvas_target_w, canvas_target_h), device
                 )
@@ -454,7 +477,7 @@ def batched_bg_frames(
                         for index in range(background.shape[0])
                     ]
                 )
-    if isinstance(background, torch.Tensor):
+    if isinstance(background, torch.Tensor) and not return_device:
         background = background.cpu().numpy()
     return background
 
@@ -557,7 +580,8 @@ def paste_faces_batch(
     parse_chunk: int | None = None,
     frame_chunk: int | None = None,
     use_roi: bool = True,
-) -> list[np.ndarray]:
+    device_output: bool = False,
+) -> list[np.ndarray] | torch.Tensor:
     """The batched paste-back of the restored faces (design section 7.7).
 
     The batched form of the vendored paste
@@ -583,12 +607,22 @@ def paste_faces_batch(
             from the free VRAM).
         frame_chunk: the frames per paste chunk (``None`` sizes it from the
             free VRAM).
+        device_output: keep the output stack on the device - return the
+            ``(N, h_up, w_up, 3)`` uint8 **tensor** instead of the ``N``
+            host arrays.  Nothing is downloaded or assembled on the host;
+            the bytes that would have travelled are counted in
+            ``roi_staged_bytes``.  Default ``False`` keeps the host output
+            of the shipped pins byte-for-byte.
 
     Returns:
-        The ``N`` pasted frames as uint8 BGR arrays.
+        The ``N`` pasted frames as uint8 BGR arrays, or one uint8 BGR
+        device tensor when ``device_output`` is set.
     """
     faces = np.asarray(faces_bgr)
-    background = np.asarray(background_bgr)
+    background = (
+        background_bgr if torch.is_tensor(background_bgr)
+        else np.asarray(background_bgr)
+    )
     num_frames = int(faces.shape[0])
     if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
         # the vendored paste resizes the face to the ParseNet size and the
@@ -616,22 +650,51 @@ def paste_faces_batch(
     reset_paste_transfer_stats()
     PASTE_TRANSFER_STATS["frames"] = num_frames
 
+    # the device-output mode: one canvas, seeded from the background in
+    # chunk-sized indexed copies; the ROI chunks scatter into it.  The
+    # non-ROI chunk (``_paste_chunk``) assembles on the host and keeps the
+    # list return, so the mode is the ROI path's.
+    if device_output and use_roi:
+        background_device = (
+            torch.from_numpy(np.ascontiguousarray(background)).to(device)
+            if not torch.is_tensor(background) else background
+        )
+        canvas = torch.empty(
+            (num_frames, height, width, 3), dtype=torch.uint8, device=device
+        )
+    else:
+        device_output = False
+        background_device = background
     pasted: list[np.ndarray] = []
     for start in range(0, num_frames, max(1, int(frame_chunk))):
         stop = min(start + max(1, int(frame_chunk)), num_frames)
         chunk = _paste_chunk_roi if use_roi else _paste_chunk
-        pasted.extend(
+        if device_output:
+            canvas[start:stop] = background_device[start:stop].to(device)
             chunk(
                 faces[start:stop],
                 list(inverse_affines[start:stop]),
-                background[start:stop],
+                background_device[start:stop],
                 device,
                 parse_net,
                 out_size,
                 parse_chunk,
+                canvas=canvas,
+                frame_offset=start,
             )
-        )
-    return pasted
+        else:
+            pasted.extend(
+                chunk(
+                    faces[start:stop],
+                    list(inverse_affines[start:stop]),
+                    background[start:stop],
+                    device,
+                    parse_net,
+                    out_size,
+                    parse_chunk,
+                )
+            )
+    return canvas if device_output else pasted
 
 
 def _paste_chunk(
@@ -858,7 +921,8 @@ def _paste_frame_full_canvas(
     background: np.ndarray,
     device: torch.device,
     out_size: tuple[int, int],
-) -> np.ndarray:
+    return_device: bool = False,
+) -> np.ndarray | torch.Tensor:
     """The full-canvas paste of one frame (the near-black fallback).
 
     The vendored tail multiplies the **whole canvas** by 255 when the
@@ -869,6 +933,8 @@ def _paste_frame_full_canvas(
     Args:
         warped_mask: the **warped** parse mask of the frame - the full
             canvas ``(H, W)``, from the batched warp of the chunk.
+        return_device: keep the ``(H, W, 3)`` uint8 result on the device
+            (the device-output canvas mode) instead of downloading it.
     """
     warped_face = cv2.warpAffine(face, inverse_affine, out_size)
     warped_face_t = (
@@ -885,18 +951,22 @@ def _paste_frame_full_canvas(
     )
     blended = warped_mask * warped_face_t + (1.0 - warped_mask) * background_t
     pasted = _quantize_and_clip(blended).round_().to(torch.uint8)
+    if return_device:
+        return pasted.permute(1, 2, 0).contiguous()
     return pasted.permute(1, 2, 0).contiguous().cpu().numpy()
 
 
 def _paste_chunk_roi(
     faces: np.ndarray,
     inverse_affines: list[np.ndarray],
-    background: np.ndarray,
+    background: np.ndarray | torch.Tensor,
     device: torch.device,
     parse_net,
     out_size: tuple[int, int],
     parse_chunk: int | None,
-) -> list[np.ndarray]:
+    canvas: torch.Tensor | None = None,
+    frame_offset: int = 0,
+) -> list[np.ndarray] | None:
     """One chunk of the ROI paste (the steps of :func:`paste_faces_batch`).
 
     Every frame is pasted in the ROI of its transformed face: the face warp
@@ -905,6 +975,14 @@ def _paste_chunk_roi(
     runs on the device inside the ROI and only the ROI patch travels
     between the host and the device.  The frame is assembled on the host
     from the untouched background and the ROI patch.
+
+    With a ``canvas`` (the device-output mode) the frame is never assembled
+    on the host: the background is a device tensor, the ROI patch is sliced
+    out of it on the device and the blended ROI is scattered back into
+    ``canvas[frame_offset + index]``.  The output stack stays on the device
+    until the one convert-out - the point of the change.  The bytes that
+    would have travelled are recorded in ``roi_staged_bytes`` so the
+    ROI-sized staging claim survives.
     """
     faces_u8 = torch.from_numpy(np.ascontiguousarray(faces)).to(device)
     PASTE_TRANSFER_STATS["face_h2d_bytes"] += faces_u8.numel() * faces_u8.element_size()
@@ -914,6 +992,8 @@ def _paste_chunk_roi(
     masks = parse_soft_masks_batched(parse_net, faces_bchw, device, parse_chunk)
 
     # 2. the ROI of every frame
+    if canvas is not None:
+        background = background.to(device) if not torch.is_tensor(background) else background
     height, width = background.shape[1:3]
     PASTE_TRANSFER_STATS["canvas_bytes"] = int(height * width * 3)
     rois = [
@@ -936,10 +1016,16 @@ def _paste_chunk_roi(
         x0, y0, x1, y1 = roi
         warped_face = warp_face_roi(faces_bchw[index], terms[index], roi).to(torch.float32)
         warped_mask = warped_masks[index][0]
-        patch = np.ascontiguousarray(background[index][y0:y1, x0:x1])
-        patch_t = torch.from_numpy(patch).to(device)
-        PASTE_TRANSFER_STATS["h2d_bytes"] += patch_t.numel() * patch_t.element_size()
-        patch_t = patch_t.permute(2, 0, 1).to(torch.float32)
+        if canvas is None:
+            patch = np.ascontiguousarray(background[index][y0:y1, x0:x1])
+            patch_t = torch.from_numpy(patch).to(device)
+            PASTE_TRANSFER_STATS["h2d_bytes"] += patch_t.numel() * patch_t.element_size()
+            patch_t = patch_t.permute(2, 0, 1).to(torch.float32)
+        else:
+            # the device-output mode: the ROI patch is sliced out of the
+            # device background - nothing travels, the bytes are recorded
+            patch_t = background[index][y0:y1, x0:x1].permute(2, 0, 1).to(torch.float32)
+            PASTE_TRANSFER_STATS["roi_staged_bytes"] += patch_t.numel() * patch_t.element_size()
         blends.append(warped_mask * warped_face + (1.0 - warped_mask) * patch_t)
         maxima.append(blends[-1].amax())
 
@@ -963,6 +1049,23 @@ def _paste_chunk_roi(
                     # fallback has to use the very same sampling as the
                     # full-canvas path
                     full_masks = list(warp_affine_batch(masks, inverse_affines, out_size))
+                if canvas is not None:
+                    # the device-output mode writes the fallback straight
+                    # into the canvas (``_paste_frame_full_canvas`` takes a
+                    # numpy background there - the frame is downloaded only
+                    # for the fallback, which is rare by construction)
+                    canvas[frame_offset + index] = _paste_frame_full_canvas(
+                        faces[index],
+                        inverse_affines[index],
+                        full_masks[index][0],
+                        background[index].cpu().numpy() if torch.is_tensor(background)
+                        else background[index],
+                        device,
+                        out_size,
+                        return_device=True,
+                    )
+                    PASTE_TRANSFER_STATS["roi_frames"] += 1
+                    continue
                 pasted.append(
                     _paste_frame_full_canvas(
                         faces[index],
@@ -978,6 +1081,13 @@ def _paste_chunk_roi(
                 max(float(frame_maxima[index]), outside), device=device
             )
         quantized = _quantize_and_clip(blends[index], maximum=maximum).round_().to(torch.uint8)
+        if canvas is not None:
+            # the device-output mode: the blended ROI is scattered into the
+            # canvas - no download, no host assembly
+            canvas[frame_offset + index, y0:y1, x0:x1] = quantized.permute(1, 2, 0)
+            PASTE_TRANSFER_STATS["roi_staged_bytes"] += quantized.numel()
+            PASTE_TRANSFER_STATS["roi_frames"] += 1
+            continue
         patch = quantized.permute(1, 2, 0).contiguous().cpu().numpy()
         PASTE_TRANSFER_STATS["d2h_bytes"] += patch.nbytes
         frame = background[index].copy()
