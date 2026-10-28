@@ -37,6 +37,8 @@ stubbed model inits (``tests/test_multiface_image.py:make_helper``), the
 from __future__ import annotations
 
 import importlib
+import importlib.util
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -670,15 +672,16 @@ def test_the_multiface_sequence_progress_counts_faces(
     _run_sequence(processor_module, _KeepNet(), face_helper, frames)
 
     assert events == [
-        ("total", 9),  # the frames-only estimate of the reporter
+        ("total", 12),  # the frames-only estimate of the reporter
         ("update", 3),  # the batched convert-in
         ("update", 3),  # the detection
         ("update", 3),  # the restore, one chunk of three faces
+        ("update", 3),  # the paste stage's second convert-in (D-R2.3.1)
         ("update", 1),  # the paste, frame by frame
         ("update", 1),
         ("update", 1),
     ], events
-    assert created and created[0].total == 3 * 3 + 3, (
+    assert created and created[0].total == 4 * 3 + 3, (
         f"the final total counts the restore in faces, got {created[0].total}"
     )
 
@@ -732,13 +735,14 @@ def test_the_kth_cancel_check_aborts_the_multiface_sequence(
 ):
     """The k-th check escapes the multi-face branch with no KEEP work after it.
 
-    Four faces over two frames with ``max_clip_length=1``: the checks fire
-    2x in the detection loop and 4x in the crop loop (calls 1-6), then once
-    per restore chunk (7-10).  Raising on the 9th call lets exactly two
-    1-face chunks restore and kills everything after - the third chunk's
-    KEEP forward never happens.
+    Four faces over two frames with ``max_clip_length=1``: the fused crop +
+    restore loop polls at the chunk top and per face (round 4, D-R2.2) - the
+    checks fire 2x in the detection loop, then per chunk 1x at the top and
+    1x per face (calls 3-4 = chunk 1, 5-6 = chunk 2, 7 = chunk 3's top).
+    Raising on the 7th call lets exactly two 1-face chunks restore and kills
+    everything after - the third chunk's KEEP forward never happens.
     """
-    check, counter = _cancel_on_call(model_management, 9)
+    check, counter = _cancel_on_call(model_management, 7)
     monkeypatch.setattr(keep_interrupt, "check_interrupted", check)
     frames = _sequence_tensor(
         image_utils, _smooth_frames(2))
@@ -752,8 +756,8 @@ def test_the_kth_cancel_check_aborts_the_multiface_sequence(
         _run_sequence(processor_module, keep_net, face_helper, frames,
                       max_clip_length=1)
 
-    assert counter["calls"] == 9, (
-        f"2 detection + 4 crop + 3 restore-chunk polls before the raise, "
+    assert counter["calls"] == 7, (
+        f"2 detection + (chunk top + face) of two chunks before the raise, "
         f"saw {counter['calls']}"
     )
     assert keep_net.calls == [
@@ -799,3 +803,232 @@ def test_the_multiface_sequence_does_not_smooth_the_landmarks(
     assert smoothed["count"] == 0 and interpolated["count"] == 0, (
         "the multi-face branch must not run the temporal landmark smoothing"
     )
+
+
+# ---------------------------------------------------------------------------
+# P-M1 - the golden fixtures (the pre-restructure outputs, D-R2.0)
+# ---------------------------------------------------------------------------
+#: The fixture directory (``tests/fixtures``, the tool's default output).
+GOLDEN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def _load_golden_capture():
+    """The capture tool module - the single source of the golden cases."""
+    source = Path(__file__).resolve().parent.parent / "tools" / "capture_round4_golden.py"
+    spec = importlib.util.spec_from_file_location("_round4_golden_capture", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case_name", ["multiface_seq", "single_seq"])
+def test_the_sequence_golden_fixtures_are_reproduced_bit_for_bit(
+    processor_module, helper_module, image_utils, monkeypatch, case_name
+):
+    """P-M1: the streamed re-run of a captured case is bitwise identical.
+
+    The fixtures were captured once by ``tools/capture_round4_golden.py``
+    from the **pre-restructure** processor (D-R2.0); this pin re-runs the
+    case through the current code and demands the same bytes - the returned
+    IMAGE tensor, the KEEP call shapes (the chunk boundaries are a quality
+    contract) and the parse-call count.  ``single_seq`` is all sub-512
+    (every frame carries the vendored upscale, so the re-derived crop
+    source of the fused loop is exercised), ``multiface_seq`` has the gray
+    face-less frame (the background gather) and the 3/3/1 restore chunks
+    (the 1-face duplicate-to-2).
+    """
+    monkeypatch.setattr(helper_module, "init_detection_model", lambda *a, **k: object())
+    monkeypatch.setattr(helper_module, "init_parsing_model", lambda *a, **k: object())
+    capture = _load_golden_capture()
+    stubs = capture._load_test_stubs()
+    case = capture.SEQUENCE_CASES[case_name]
+    golden = np.load(GOLDEN_FIXTURE_DIR / f"round4_golden_{case_name}.npz")
+
+    faces = {key: capture.golden_face(stubs, key) for key in capture.FACE_OFFSETS}
+    per_frame = [[faces[key] for key in frame] for frame in case["faces"]]
+    tensor = image_utils.bgr_u8_batch_to_comfy(capture.sequence_frames(case))
+    assert np.array_equal(tensor.numpy(), golden["input_frames"]), (
+        "the re-run input drifted from the captured one"
+    )
+
+    face_helper = capture._make_helper(
+        stubs, helper_module, per_frame, capture.PARSE_SEEDS[case_name])
+    keep_net = stubs._KeepNet()
+    output = _run_sequence(
+        processor_module, keep_net, face_helper, tensor,
+        only_center_face=case["only_center_face"],
+        max_clip_length=case["max_clip_length"],
+    )
+
+    assert np.array_equal(output.numpy(), golden["output_frames"]), (
+        "the output IMAGE tensor is not bitwise the captured one"
+    )
+    shapes, flags = capture._keep_records(keep_net)
+    assert np.array_equal(shapes, golden["keep_net_shapes"]), (
+        f"the KEEP call shapes moved: {shapes} vs {golden['keep_net_shapes']}"
+    )
+    assert np.array_equal(flags, golden["keep_net_need_upscale"])
+    assert face_helper.face_parse.calls == int(golden["parse_calls"]), (
+        f"the parse-call count moved: {face_helper.face_parse.calls} "
+        f"vs {int(golden['parse_calls'])}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P-M2 - the crop staging stays bounded by the clip length (D-R2.2)
+# ---------------------------------------------------------------------------
+def _ten_faces(frame_row: int) -> list[np.ndarray]:
+    """Ten template faces on a 5x2 grid, shifted a little per frame."""
+    return [
+        (FACE_TEMPLATE - 256.0) * 0.25
+        + np.array([64.0 + 128.0 * col, 128.0 + 256.0 * grid_row + 2.0 * frame_row])
+        for grid_row in range(2)
+        for col in range(5)
+    ]
+
+
+@pytest.mark.unit
+def test_the_crop_staging_stays_bounded_by_the_clip_length(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """P-M2: the fused loop's staging never scales with the face count.
+
+    4 frames x 10 faces through the real helper and the multi-face branch
+    (``max_clip_length=10``): every ``np.empty`` / ``np.stack`` allocation
+    of the run is recorded.  The uint8 512-crop-shaped ``np.empty`` calls
+    must stay at or below one chunk of rows - the single exception is
+    D-R2.2.3's preallocated restored stack (the result, one allocation) -
+    and no ``np.stack`` of crops exists at all (the old crop list plus its
+    stack, the 2x staging peak, is gone).  Every frame carries faces and
+    none is gray, so both paste pass-through gates hold (D-R2.3.2) and
+    even the paste faces stack disappears from the record.
+    """
+    faces_per_frame = [_ten_faces(row) for row in range(4)]
+    face_helper = make_helper(use_parse=True)
+    face_helper.face_parse = _StubParseNet(seed=202)
+    _attach_detector(face_helper, _SequenceDetector(faces_per_frame))
+    frames = _sequence_tensor(image_utils, _smooth_frames(4))
+    keep_net = _KeepNet()
+
+    allocs: list[tuple[str, tuple, np.dtype]] = []
+    real_empty, real_stack = np.empty, np.stack
+
+    def recording_empty(*args, **kwargs):
+        shape = args[0] if args else kwargs["shape"]
+        dtype = kwargs.get("dtype", args[1] if len(args) > 1 else np.float64)
+        allocs.append(("empty", tuple(np.atleast_1d(shape).tolist()), np.dtype(dtype)))
+        return real_empty(*args, **kwargs)
+
+    def recording_stack(arrays, *args, **kwargs):
+        arrays = list(arrays)
+        allocs.append(("stack", tuple(np.asarray(arrays).shape), np.dtype(np.uint8)))
+        return real_stack(arrays, *args, **kwargs)
+
+    monkeypatch.setattr(np, "empty", recording_empty)
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    _run_sequence(processor_module, keep_net, face_helper, frames, max_clip_length=10)
+
+    total_faces = 40
+    crops = [
+        (kind, shape) for kind, shape, dtype in allocs
+        if len(shape) == 4 and shape[1:] == (512, 512, 3) and dtype == np.uint8
+    ]
+    # the preallocated restored stack (D-R2.2.3) is the only unbounded one
+    restored = [shape for kind, shape in crops if kind == "empty" and shape[0] == total_faces]
+    assert len(restored) == 1, crops
+    staging = [(kind, shape) for kind, shape in crops if shape[0] != total_faces]
+    assert staging, "the fused loop must allocate its chunk staging through np.empty"
+    for kind, shape in staging:
+        assert shape[0] <= 10, (kind, shape)
+    # the old list + np.stack of the crops is gone: no stacked crops at all
+    stacked_crops = [
+        shape for kind, shape, dtype in allocs
+        if kind == "stack" and len(shape) == 4 and shape[1:] == (512, 512, 3)
+    ]
+    assert stacked_crops == [], stacked_crops
+
+
+# ---------------------------------------------------------------------------
+# P-M3 - the detection pass converts at most a group at a time (D-R2.1)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_detection_pass_converts_at_most_a_group_at_a_time(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """P-M3 (multi-face leg): no whole-clip convert before the first KEEP call.
+
+    The streamed detection pass converts a group of at most
+    ``max_clip_length`` rows at a time and the fused loop re-derives
+    single rows; the whole-clip uint8 stack of the old detection pass is
+    gone.  Recording the converter's batch sizes: everything before the
+    first KEEP forward stays at or below the clip length.  The frames sit
+    at the 512 floor, so the pin measures exactly the group conversions
+    (the sub-512 case rides the golden fixtures instead).
+    """
+    conversions: list[int] = []
+    real_convert = processor_module.comfy_batch_to_bgr_u8
+
+    def recording_convert(tensor):
+        conversions.append(int(tensor.shape[0]))
+        return real_convert(tensor)
+
+    monkeypatch.setattr(processor_module, "comfy_batch_to_bgr_u8", recording_convert)
+
+    keep_at: list[int] = []
+
+    class _ProbeKeepNet(_KeepNet):
+        def __call__(self, frames, need_upscale=False):
+            keep_at.append(len(conversions))
+            return super().__call__(frames, need_upscale=need_upscale)
+
+    face_helper = make_helper()
+    _attach_detector(
+        face_helper, _SequenceDetector([[FACE_A], [FACE_C], [FACE_A], [FACE_C]]))
+    frames = _sequence_tensor(image_utils, _smooth_frames(4))
+    _run_sequence(
+        processor_module, _ProbeKeepNet(), face_helper, frames, max_clip_length=2)
+
+    assert keep_at, "the probe net must be called"
+    before_the_first_keep = conversions[: keep_at[0]]
+    assert before_the_first_keep, (
+        "the detection pass must convert through the module function"
+    )
+    assert max(before_the_first_keep) <= 2, before_the_first_keep
+
+
+# ---------------------------------------------------------------------------
+# P-M5 - the sequence paths release the helper after the run (D-R2.4)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_sequence_paths_release_the_helper_after_the_run(
+    processor_module, make_helper, image_utils
+):
+    """P-M5: both sequence branches leave no detection image behind (D-R2.4).
+
+    The vendored ``clean_all`` clears the face lists but not ``input_img``
+    (``face_restoration_helper.py:530-537``) - the leaked whole frame of
+    the OOM report.  The ``finally`` of the redesign releases both on the
+    success path, for the single-face branch and the multi-face branch
+    alike, real helper end to end.
+    """
+    for only_center_face, layout in (
+        (True, [[FACE_A], [FACE_C]]),
+        (False, [[FACE_A, FACE_B], [FACE_C]]),
+    ):
+        face_helper = make_helper(use_parse=True)
+        face_helper.face_parse = _StubParseNet(seed=203)
+        _attach_detector(face_helper, _SequenceDetector(layout))
+        frames = _sequence_tensor(image_utils, _smooth_frames(2))
+        _run_sequence(
+            processor_module, _KeepNet(), face_helper, frames,
+            only_center_face=only_center_face, max_clip_length=20,
+        )
+
+        assert face_helper.input_img is None, only_center_face
+        for name in (
+            "cropped_faces", "restored_faces", "affine_matrices",
+            "inverse_affine_matrices", "all_landmarks_5",
+        ):
+            assert getattr(face_helper, name) == [], (only_center_face, name)

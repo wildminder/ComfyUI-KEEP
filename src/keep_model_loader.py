@@ -357,6 +357,44 @@ class KEEPModelPack:
 
         if self.face_helper is not None:
             self.face_helper.device = self.device
+            self._place_face_nets()
+
+    def _place_face_nets(self) -> int:
+        """Place the detector and the parser nets on the pack device (D-R1.2).
+
+        ``ModelPatcher.load`` silently skips a module that does not fit under
+        VRAM pressure, while the plain facelib modules lack
+        ``comfy_cast_weights`` - the explicit ``.to()`` converts that silent
+        skew into a logged warning at placement time.  A failed move must
+        leave the state of the net reflecting reality, so the ``.device``
+        attribute sync (the YOLO detector stores its own and pushes its
+        inputs there) belongs to the **success** path only.  A helper
+        without one of the nets is placed as far as it goes - it must not
+        break.  Returns the number of nets placed.
+        """
+        placed = 0
+        for role, net in (
+            ("face detector", getattr(self.face_helper, "face_detector", None)),
+            ("face parser", getattr(self.face_helper, "face_parse", None)),
+        ):
+            if net is None:
+                continue
+            try:
+                net.to(self.device)
+            except Exception as exc:  # noqa: BLE001 - any move failure
+                logger.warning(tagged(
+                    f"KEEP {role} could not be placed on {self.device} ({exc}); "
+                    "it stays on its current device. Detection/parsing may "
+                    "fail with a device mismatch - free VRAM and retry."
+                ))
+            else:
+                if hasattr(net, "device"):
+                    net.device = self.device
+                placed += 1
+
+        if placed:
+            logger.info(f"KEEP face nets placed on {self.device}")
+        return placed
 
     def offload(self):
         """Move the models back to the offload device and free the VRAM."""
@@ -372,6 +410,14 @@ class KEEPModelPack:
 
         if self.face_helper is not None:
             self.face_helper.device = self.offload_device
+            # D-R1.3: the mirror of the load_device placement - the YOLO-style
+            # ``.device`` attributes follow the nets back, guarded the same way
+            for net in (
+                getattr(self.face_helper, "face_detector", None),
+                getattr(self.face_helper, "face_parse", None),
+            ):
+                if net is not None and hasattr(net, "device"):
+                    net.device = self.offload_device
 
         model_management.unload_all_models()
         model_management.soft_empty_cache()
@@ -603,7 +649,11 @@ class KEEPModelLoader:
                 face_helper = FaceRestoreHelper(
                     upscale_factor=1, face_size=512, crop_ratio=(1, 1),
                     det_model=detection_model_str, save_ext='png', use_parse=True,
-                    device=self.offload_device, model_rootpath=facelib_root
+                    # D-R1.1: the helper stores this device and builds its
+                    # detector and parser on it - the pack device, not the
+                    # offload device (the CPU-only fallback is inherent:
+                    # ``get_torch_device()`` answers ``cpu`` there)
+                    device=self.device, model_rootpath=facelib_root
                 )
         except Exception as e:
             logger.error(f"Error initializing FaceRestoreHelper: {e}")

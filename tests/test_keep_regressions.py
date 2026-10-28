@@ -976,11 +976,13 @@ def test_the_progress_reaches_the_total_of_the_frame_count(monkeypatch):
         max_clip_length=2,
     )
 
-    # the total is the frame count times the four families
-    assert {max_value for _, max_value in reported} == {20}, reported
-    # 5 (convert) + 5 (detection) + 2 + 2 + 1 (the KEEP chunks) + 5 x 1 (paste)
+    # the total is the frame count times the five families (round 4
+    # D-R2.3.1 added the paste stage's second convert-in: single *5)
+    assert {max_value for _, max_value in reported} == {25}, reported
+    # 5 (convert) + 5 (detection) + 2 + 2 + 1 (the KEEP chunks)
+    # + 5 (the second convert-in) + 5 x 1 (paste)
     assert [value for value, _ in reported] == [
-        5, 10, 12, 14, 15, 16, 17, 18, 19, 20
+        5, 10, 12, 14, 15, 20, 21, 22, 23, 24, 25
     ], reported
 
 

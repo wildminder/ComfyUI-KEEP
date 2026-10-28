@@ -205,7 +205,7 @@ def _run_sequence(processor, frames, **kwargs):
         image_sequence_tensor=frames,
         final_upscale_factor=kwargs.pop("final_upscale_factor", 1.0),
         has_aligned_frames=False,
-        only_center_face=True,
+        only_center_face=kwargs.pop("only_center_face", True),
         draw_box=kwargs.pop("draw_box", False),
         max_clip_length=kwargs.pop("max_clip_length", 20),
     )
@@ -291,6 +291,61 @@ def test_the_seventh_check_aborts_the_sequence_without_more_keep_work(
         f"exactly the first restore chunk may reach the KEEP net, "
         f"got {keep_net.calls}"
     )
+
+
+@pytest.mark.unit
+def test_the_first_check_aborts_before_any_detection_work(
+    processor_module, model_management, keep_interrupt, monkeypatch
+):
+    """The detection group loop polls before any other long loop (P-M6).
+
+    The streamed detection pass is the pipeline's first loop; its first
+    per-frame check is the run's first check.  Raising on call 1 kills the
+    run before a single frame is detected - no KEEP work, nothing else.
+    """
+    check, counter = _cancel_on_call(model_management, 1)
+    monkeypatch.setattr(keep_interrupt, "check_interrupted", check)
+    keep_net = _StubKeepNet()
+    face_helper = _ParseFaceHelper(parse_net=_StubParseNet(), landmarks=_face_landmarks())
+    processor = _make_processor(processor_module, keep_net, face_helper)
+    frames = torch.rand((3, 64, 96, 3), dtype=torch.float32)
+
+    with pytest.raises(model_management.InterruptProcessingException):
+        _run_sequence(processor, frames, max_clip_length=2)
+
+    assert counter["calls"] == 1, (
+        f"the first check must be the detection loop's, saw {counter['calls']}"
+    )
+    assert keep_net.calls == [], f"no KEEP work after the raise, got {keep_net.calls}"
+
+
+@pytest.mark.unit
+def test_the_fused_chunk_top_aborts_the_multiface_sequence(
+    processor_module, model_management, keep_interrupt, monkeypatch
+):
+    """The multi-face fused loop's chunk-top poll is wired (P-M6).
+
+    2 frames with one face each and ``max_clip_length=1`` through the
+    multi-face branch: the checks fire once per detection frame (calls
+    1-2) and at the first chunk's top (call 3) - the per-face polls of the
+    chunk never run and neither does the KEEP net.
+    """
+    check, counter = _cancel_on_call(model_management, 3)
+    monkeypatch.setattr(keep_interrupt, "check_interrupted", check)
+    keep_net = _StubKeepNet()
+    face_helper = _ParseFaceHelper(parse_net=_StubParseNet(), landmarks=_face_landmarks())
+    processor = _make_processor(processor_module, keep_net, face_helper)
+    frames = torch.rand((2, 64, 96, 3), dtype=torch.float32)
+
+    with pytest.raises(model_management.InterruptProcessingException):
+        _run_sequence(
+            processor, frames, only_center_face=False, max_clip_length=1)
+
+    assert counter["calls"] == 3, (
+        f"the checks must fire 2x in the detection loop and once at the "
+        f"first chunk top, saw {counter['calls']}"
+    )
+    assert keep_net.calls == [], f"no KEEP work after the raise, got {keep_net.calls}"
 
 
 # ---------------------------------------------------------------------------

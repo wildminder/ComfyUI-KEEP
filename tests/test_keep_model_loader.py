@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import logging
 import os
 
 import pytest
@@ -200,6 +201,226 @@ def test_the_cpu_mode_makes_the_same_calls(
     assert cpu_calls.count("load_models_gpu") == 1, cpu_calls
     assert cpu_calls.count("unload_all_models") == 1, cpu_calls
     assert cpu_calls.count("soft_empty_cache") == 1, cpu_calls
+
+
+# ---------------------------------------------------------------------------
+# the device placement of the face nets (round 4, D-R1)
+# ---------------------------------------------------------------------------
+def _pack_on_distinct_devices(loader_module, model_management, monkeypatch):
+    """A pack whose pack device is distinct from its offload device.
+
+    The conftest mock answers ``cpu`` for both device functions, so a
+    placement on the wrong device would be indistinguishable from a correct
+    one.  The patch gives the pack a distinct device object - recording
+    only, no CUDA op ever runs (the CPU/GPU-leg pattern above).
+    """
+    monkeypatch.setattr(
+        model_management, "get_torch_device", lambda: torch.device("cuda")
+    )
+    monkeypatch.setattr(
+        model_management, "unet_offload_device", lambda: torch.device("cpu")
+    )
+    pack = loader_module.KEEPModelPack(
+        _StubKeepNet(), _StubFaceHelper(), None, None, "KEEP"
+    )
+    assert pack.device != pack.offload_device  # the leg is not a no-op
+    return pack
+
+
+class _YoloDetector(_StubModule):
+    """The YOLO detector shape - it stores its own ``device`` attribute.
+
+    The vendored YOLO detector reads ``self.device`` when it pushes its
+    inputs (the device diagnosis D8b), so a moved net with a stale attribute
+    would run on the wrong device.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("detector")
+        # a sentinel distinct from every leg device - a sync shows up
+        self.device = torch.device("meta")
+
+
+class _FailingParser(_StubModule):
+    """A parser whose move raises - the placement must degrade cleanly."""
+
+    def __init__(self) -> None:
+        super().__init__("parser")
+        self.device = torch.device("meta")
+
+    def to(self, device):
+        raise RuntimeError("the VRAM is full")
+
+
+@pytest.fixture
+def keep_records(loader_module, caplog):
+    """The records of the pack logger (the pattern of ``test_keep_download``).
+
+    Without a ComfyUI the pack logger owns a private handler and does not
+    propagate, so the records never reach the root logger of pytest: the
+    capture handler is attached to the pack logger itself.
+    """
+    loader_module.logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        loader_module.logger.removeHandler(caplog.handler)
+
+
+@pytest.mark.unit
+def test_the_face_helper_is_constructed_on_the_pack_device(
+    loader_module, model_management, monkeypatch, loader
+):
+    """P-D1: the helper is constructed with the pack device.
+
+    The vendored helper stores the construction device and builds its
+    detector and parser nets on it (``face_restoration_helper.py:66-93``) -
+    constructed on the offload device, the nets were born on the wrong side
+    of the patcher flow.  The ``_StubHelper`` of the ``loader`` fixture
+    records the constructor kwargs.
+    """
+    monkeypatch.setattr(
+        model_management, "get_torch_device", lambda: torch.device("cuda")
+    )
+    monkeypatch.setattr(
+        model_management, "unet_offload_device", lambda: torch.device("cpu")
+    )
+    # the device functions are read at construction - a loader built after
+    # the patch sees the distinct pack device (the fixture's loader saw cpu)
+    fresh = loader_module.KEEPModelLoader()
+    pack = fresh.load_keep_model_pack("KEEP", "retinaface_resnet50")
+
+    assert pack.face_helper.kwargs["device"] == pack.device
+    assert pack.face_helper.kwargs["device"] != pack.offload_device
+
+
+@pytest.mark.unit
+def test_load_device_places_the_face_nets_on_the_pack_device(
+    loader_module, model_management, monkeypatch
+):
+    """P-D2: ``load_device`` places the detector and the parser explicitly.
+
+    The patcher flow may silently skip a module under VRAM pressure - the
+    explicit placement makes the residency of the two nets a fact, not a
+    hope, and the helper's own ``device`` stays synced.
+    """
+    pack = _pack_on_distinct_devices(loader_module, model_management, monkeypatch)
+
+    pack.load_device()
+
+    assert pack.face_helper.face_detector.moved_to[-1] == pack.device
+    assert pack.face_helper.face_parse.moved_to[-1] == pack.device
+    assert pack.face_helper.device == pack.device
+
+
+@pytest.mark.unit
+def test_load_device_falls_back_cleanly_when_a_net_cannot_move(
+    loader_module, model_management, keep_records
+):
+    """P-D3: a net that cannot move degrades cleanly.
+
+    A failed move must not raise out of ``load_device``, must be logged as a
+    warning, and must leave the net's own ``.device`` attribute untouched -
+    the sync belongs to the success path only (a failed move that still
+    re-synced the attribute would point the net at a device its weights
+    never reached).  The other net is still placed.
+    """
+    helper = _StubFaceHelper()
+    failing = _FailingParser()
+    helper.face_parse = failing
+    pack = loader_module.KEEPModelPack(
+        _StubKeepNet(), helper, None, None, "KEEP"
+    )
+
+    pack.load_device()  # must not raise
+
+    # the detector is still placed, the helper device still synced
+    assert pack.face_helper.face_detector.moved_to[-1] == pack.device
+    assert pack.face_helper.device == pack.device
+    # the failed parser: no move recorded, no attribute re-sync
+    assert failing.moved_to == []
+    assert failing.device == torch.device("meta")
+    # the failure is a logged warning, not a silent skip
+    warnings = [
+        record for record in keep_records.records
+        if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1, [r.getMessage() for r in keep_records.records]
+    assert "face parser" in warnings[0].getMessage()
+    assert "could not be placed" in warnings[0].getMessage()
+
+
+@pytest.mark.unit
+def test_load_device_syncs_a_detector_own_device_attribute(
+    loader_module, model_management, monkeypatch
+):
+    """P-D4: the YOLO-style ``.device`` attribute follows the net - both ways.
+
+    Synced on ``load_device`` (after a successful move, D-R1.2) and restored
+    on ``offload`` (D-R1.3) - the attribute must never lag the weights.
+    """
+    monkeypatch.setattr(
+        model_management, "get_torch_device", lambda: torch.device("cuda")
+    )
+    monkeypatch.setattr(
+        model_management, "unet_offload_device", lambda: torch.device("cpu")
+    )
+    helper = _StubFaceHelper()
+    helper.face_detector = _YoloDetector()
+    pack = loader_module.KEEPModelPack(
+        _StubKeepNet(), helper, None, None, "KEEP"
+    )
+    detector = pack.face_helper.face_detector
+    assert detector.device == torch.device("meta")  # the sentinel so far
+
+    pack.load_device()
+    assert detector.moved_to[-1] == pack.device
+    assert detector.device == pack.device
+
+    pack.offload()
+    assert detector.moved_to[-1] == pack.offload_device
+    assert detector.device == pack.offload_device
+
+
+@pytest.mark.unit
+def test_the_cpu_mode_places_the_nets_on_cpu(
+    loader_module, model_management, monkeypatch
+):
+    """P-D5: the CPU leg places the nets on ``cpu`` with the same calls.
+
+    The CPU/GPU-leg comparison of the residency (the B7 guard): the
+    placement is one more residency step that must not branch on the device,
+    and on the CPU leg it must land on ``cpu`` - the inherent fallback of a
+    CPU-only install, where ``get_torch_device()`` answers ``cpu``.
+    """
+
+    def leg(device):
+        monkeypatch.setattr(model_management, "get_torch_device", lambda: device)
+        monkeypatch.setattr(model_management, "unet_offload_device", lambda: device)
+        model_management.calls.clear()
+        pack = loader_module.KEEPModelPack(
+            _StubKeepNet(), _StubFaceHelper(), None, None, "KEEP"
+        )
+        assert pack.device == device  # the patched device reaches the pack
+        pack.load_device()
+        pack.offload()
+        placements = (
+            pack.face_helper.face_detector.moved_to,
+            pack.face_helper.face_parse.moved_to,
+        )
+        return [call[0] for call in model_management.calls], placements
+
+    gpu_calls, _ = leg(torch.device("cuda"))
+    cpu_calls, cpu_placements = leg(torch.device("cpu"))
+
+    assert cpu_calls == gpu_calls, (cpu_calls, gpu_calls)
+    assert cpu_calls.count("load_models_gpu") == 1, cpu_calls
+    assert cpu_calls.count("unload_all_models") == 1, cpu_calls
+    assert cpu_calls.count("soft_empty_cache") == 1, cpu_calls
+    # both nets were placed on cpu (the placement) and moved back (the
+    # offload) - exactly the two moves, no device branch
+    for moved_to in cpu_placements:
+        assert moved_to == [torch.device("cpu"), torch.device("cpu")], moved_to
 
 
 # ---------------------------------------------------------------------------

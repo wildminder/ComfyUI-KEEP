@@ -16,11 +16,14 @@ import contextlib
 import importlib
 import logging
 import types
+import weakref
+from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 
 @pytest.fixture(scope="module")
@@ -462,7 +465,11 @@ def test_the_sequence_reads_and_measures_every_frame_once(processor_module):
     face_helper = _DetectingFaceHelper()
     processor = processor_module.KEEPFaceProcessor(_make_pack(keep_net, face_helper))
 
-    frames = torch.rand((3, 16, 16, 3), dtype=torch.float32)
+    # The frames are at the 512 floor: the paste fallback's deterministic
+    # re-derivation of the vendored upscale (D-R2.3.3) fires only below 512
+    # and would add one read per fallback frame - the read-once contract of
+    # the detection is pinned at the size where it holds for the whole run.
+    frames = torch.rand((3, 512, 640, 3), dtype=torch.float32)
     processor.process_image_sequence(
         image_sequence_tensor=frames,
         final_upscale_factor=1.0,
@@ -510,10 +517,11 @@ def test_the_progress_reports_four_steps_per_frame(processor_module, monkeypatch
     )
 
     assert events == [
-        ("total", 12),
+        ("total", 15),
         ("update", 3),  # the batched convert-in
         ("update", 3),  # the detection
         ("update", 3),  # the single KEEP chunk
+        ("update", 3),  # the paste stage's second convert-in (D-R2.3.1)
         ("update", 1),  # the paste, frame by frame
         ("update", 1),
         ("update", 1),
@@ -621,3 +629,245 @@ def test_the_batched_crop_matches_the_vendored_warp(processor_module):
     assert np.allclose(face_helper.affine_matrices[0], affine), (
         "the paste loop did not reuse the affine matrix of the crop"
     )
+
+
+# ---------------------------------------------------------------------------
+# P-M1 - the golden fixtures of the image paths (the pre-restructure outputs)
+# ---------------------------------------------------------------------------
+def _load_golden_capture():
+    """The capture tool module - the single source of the golden cases."""
+    import importlib.util
+
+    source = (
+        Path(__file__).resolve().parent.parent / "tools" / "capture_round4_golden.py"
+    )
+    spec = importlib.util.spec_from_file_location("_round4_golden_capture", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case_name", ["image_multiface", "image_single"])
+def test_the_image_golden_fixtures_are_reproduced_bit_for_bit(
+    processor_module, monkeypatch, case_name
+):
+    """P-M1: the image paths re-run their captured cases bitwise.
+
+    The fixtures come from ``tools/capture_round4_golden.py`` (captured
+    once from the pre-restructure code, D-R2.0): the input image, the
+    returned BGR image, the KEEP call shapes and the parse-call count (the
+    vendored paste parses every pasted face itself,
+    ``face_restoration_helper.py:462``).  The sub-512 input exercises the
+    vendored upscale in all three ``read_image`` stages of the image paths.
+    """
+    helper_module = importlib.import_module(
+        "ComfyUI_KEEP.modules.deps.facelib.utils.face_restoration_helper")
+    monkeypatch.setattr(helper_module, "init_detection_model", lambda *a, **k: object())
+    monkeypatch.setattr(helper_module, "init_parsing_model", lambda *a, **k: object())
+    capture = _load_golden_capture()
+    stubs = capture._load_test_stubs()
+    case = capture.IMAGE_CASES[case_name]
+    fixture_dir = Path(__file__).resolve().parent / "fixtures"
+    golden = np.load(fixture_dir / f"round4_golden_{case_name}.npz")
+
+    image_bgr = capture.golden_frames(1, case["frame_seed"])[0]
+    assert np.array_equal(image_bgr, golden["input_image"]), (
+        "the re-run input drifted from the captured one"
+    )
+    faces = {key: capture.golden_face(stubs, key) for key in capture.FACE_OFFSETS}
+    face_helper = capture._make_helper(
+        stubs, helper_module,
+        [[faces[key] for key in case["faces"]]], capture.PARSE_SEEDS[case_name])
+    keep_net = stubs._KeepNet()
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(keep_net, face_helper))
+    output = processor.process_image(
+        cv2_image_orig=image_bgr,
+        final_upscale_factor=1.0,
+        has_aligned=False,
+        only_center_face=case["only_center_face"],
+        draw_box=False,
+    )
+
+    assert np.array_equal(np.asarray(output), golden["output_image"]), (
+        "the returned image is not bitwise the captured one"
+    )
+    shapes, flags = capture._keep_records(keep_net)
+    assert np.array_equal(shapes, golden["keep_net_shapes"]), (
+        f"the KEEP call shapes moved: {shapes} vs {golden['keep_net_shapes']}"
+    )
+    assert np.array_equal(flags, golden["keep_net_need_upscale"])
+    assert face_helper.face_parse.calls == int(golden["parse_calls"]), (
+        f"the parse-call count moved: {face_helper.face_parse.calls} "
+        f"vs {int(golden['parse_calls'])}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P-M3 / P-M4 / P-M5 - the memory bounds of the redesign (design section 3)
+# ---------------------------------------------------------------------------
+class _TinyParseNet:
+    """A parse net with the vendored contract (``[0]`` are the logits)."""
+
+    def __init__(self, seed: int = 7) -> None:
+        generator = torch.Generator().manual_seed(seed)
+        self.weight = torch.randn(19, 3, 1, 1, generator=generator) * 0.35
+
+    def __call__(self, samples):
+        return (F.conv2d(samples, self.weight), None)
+
+
+@pytest.mark.unit
+def test_the_detection_pass_converts_at_most_a_group_at_a_time(
+    processor_module, monkeypatch
+):
+    """P-M3 (single-face leg): no whole-clip convert before the first KEEP call.
+
+    The streamed detection pass converts a group of at most
+    ``max_clip_length`` rows at a time; the whole-clip uint8 stack of the
+    old detection pass is gone.  Recording the converter's batch sizes:
+    everything before the first KEEP forward stays at or below the clip
+    length (3 frames, clips of 2 - a whole-clip convert would be a 3).
+    """
+    conversions: list[int] = []
+    real_convert = processor_module.comfy_batch_to_bgr_u8
+
+    def recording_convert(tensor):
+        conversions.append(int(tensor.shape[0]))
+        return real_convert(tensor)
+
+    monkeypatch.setattr(processor_module, "comfy_batch_to_bgr_u8", recording_convert)
+
+    keep_at: list[int] = []
+
+    class _ProbeKeepNet(_StubKeepNet):
+        def __call__(self, frames, need_upscale=False):
+            keep_at.append(len(conversions))
+            return super().__call__(frames, need_upscale=need_upscale)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_ProbeKeepNet(), _DetectingFaceHelper())
+    )
+    frames = torch.rand((3, 512, 640, 3), dtype=torch.float32)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=2,
+    )
+
+    assert keep_at, "the probe net must be called"
+    before_the_first_keep = conversions[: keep_at[0]]
+    assert before_the_first_keep, (
+        "the detection pass must convert through the module function"
+    )
+    assert max(before_the_first_keep) <= 2, before_the_first_keep
+
+
+@pytest.mark.unit
+def test_the_chunked_mode_keeps_one_tail_buffer(processor_module, monkeypatch):
+    """P-M4: the forced chunked mode releases its staging tail (D-R2.3.5).
+
+    ``device_output_mode`` is patched to "chunked" (on CPU the modes are
+    value-identical, the verdict just never selects a device mode by
+    itself): 3 frames at 64x64 with one black - gray - frame, so 2
+    eligible rows.  Recording every ``torch.empty``: exactly one float32
+    allocation carries the whole-clip row count (the contractual
+    ``final_batch``) and exactly one carries the eligible rows (the
+    chunked core's ``out``).  After the return the eligible buffer is
+    gone - the processor drops the name AND the row views
+    (``batched_outputs`` becomes an index set) - while the returned IMAGE
+    is ``final_batch`` itself and keeps it alive.
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    empties: list[tuple[tuple, torch.dtype, weakref.ref]] = []
+    real_empty = torch.empty
+
+    def recording_empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        empties.append((tuple(tensor.shape), tensor.dtype, weakref.ref(tensor)))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((3, 64, 64, 3), dtype=torch.float32)
+    frames[1] = 0.0  # the black frame is a gray frame - it leaves the batch
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    float_rows = [
+        (shape, ref) for shape, dtype, ref in empties
+        if dtype == torch.float32 and len(shape) == 4
+    ]
+    final = [ref for shape, ref in float_rows if shape[0] == 3]
+    eligible = [ref for shape, ref in float_rows if shape[0] == 2]
+    assert len(final) == 1, float_rows
+    assert len(eligible) == 1, float_rows
+    # the returned IMAGE is the contractual whole-clip buffer
+    assert final[0]() is not None, "final_batch must stay alive after the return"
+    # the chunked core's eligible-rows buffer is released with its row views
+    assert eligible[0]() is None, (
+        "the chunked staging tail must be released after the indexed scatter"
+    )
+    assert tuple(output.shape) == (3, 512, 512, 3), output.shape
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case_name", ["image_single", "image_multiface"])
+def test_the_image_paths_release_the_helper_after_the_run(
+    processor_module, monkeypatch, case_name
+):
+    """P-M5 (image legs): no detection image survives the run (D-R2.4).
+
+    The image paths run the real vendored helper (the capture rig): the
+    ``finally`` must clear the face lists and the ``input_img`` the same
+    way the sequence paths do - the sub-512 golden input leaves a full
+    upscaled frame in ``input_img`` unless it is released.
+    """
+    helper_module = importlib.import_module(
+        "ComfyUI_KEEP.modules.deps.facelib.utils.face_restoration_helper")
+    monkeypatch.setattr(helper_module, "init_detection_model", lambda *a, **k: object())
+    monkeypatch.setattr(helper_module, "init_parsing_model", lambda *a, **k: object())
+    capture = _load_golden_capture()
+    stubs = capture._load_test_stubs()
+    case = capture.IMAGE_CASES[case_name]
+    image_bgr = capture.golden_frames(1, case["frame_seed"])[0]
+    faces = {key: capture.golden_face(stubs, key) for key in capture.FACE_OFFSETS}
+    face_helper = capture._make_helper(
+        stubs, helper_module,
+        [[faces[key] for key in case["faces"]]], capture.PARSE_SEEDS[case_name])
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(stubs._KeepNet(), face_helper))
+    processor.process_image(
+        cv2_image_orig=image_bgr,
+        final_upscale_factor=1.0,
+        has_aligned=False,
+        only_center_face=case["only_center_face"],
+        draw_box=False,
+    )
+
+    assert face_helper.input_img is None, case_name
+    for name in (
+        "cropped_faces", "restored_faces", "affine_matrices",
+        "inverse_affine_matrices", "all_landmarks_5",
+    ):
+        assert getattr(face_helper, name) == [], (case_name, name)
