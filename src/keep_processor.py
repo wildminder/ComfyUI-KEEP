@@ -24,6 +24,7 @@ from .keep_gpu_ops import (
     tensor2img_batch,
 )
 from . import keep_gpu_paste as paste_mod
+from . import keep_interrupt
 from .keep_gpu_paste import (
     PARSE_FACE_SIZE,
     batched_bg_frames,
@@ -259,10 +260,149 @@ class KEEPFaceProcessor:
             parse_net=parse_net)
         return dict(zip(eligible, pasted))
 
+    def _batched_paste_multiface(self,
+                                 input_frames_bgr: np.ndarray,
+                                 restored_faces: np.ndarray,
+                                 face_affines: list,
+                                 face_frames: list[int],
+                                 face_landmarks: list,
+                                 final_upscale_factor: float,
+                                 draw_box: bool,
+                                 gray_flags: np.ndarray,
+                                 canvas_hw: tuple[int, int] | None = None) -> dict:
+        """The batched paste of the multi-face branch (design section 3.4).
+
+        The sibling of :meth:`_batched_paste` - which stays byte-untouched for
+        the shipped one-face-per-frame path - for the frames with **several**
+        faces: the canvas rows, the background and the output stay
+        **frame-indexed** while the faces, the inverses, the masks and the
+        ROIs are **face-indexed**, joined by the ``face_frame`` map of
+        ``src/keep_gpu_paste.py`` (the t3 paste core).
+
+        The eligibility is **per frame, all-or-nothing**: a frame is
+        device-batched iff it has at least one face, is not gray, and
+        **every** face is eligible (an affine, no NaN landmarks, a restored
+        face of the ParseNet size) - a frame with any ineligible face goes
+        entirely to the vendored fallback with all its faces (mixing device
+        ROIs and a vendored composite in one frame would need a float
+        accurate hand-off).  A ``None`` affine or NaN landmarks never reach
+        here in practice - the crop stage of the multi-face branch drops
+        those faces (``_process_sequence_multiface``) - the checks are the
+        contract of the design, kept like the sibling's.
+
+        Returns:
+            The ``{frame index: ...}`` mapping of the **eligible** frames -
+            the frames that are not in it take the vendored fallback.  A
+            device-output mode replaces the mapped frames with the sentinel
+            keys, exactly like :meth:`_batched_paste`: the canvas and the
+            chunk buffer are allocated over the eligible **frame** count
+            (``device_output_mode`` counts canvas rows), the faces ride the
+            map.
+        """
+        parse_net = getattr(self.face_helper, "face_parse", None)
+        if parse_net is None or not getattr(self.face_helper, "use_parse", False):
+            return {}
+        if draw_box or self.face_upscale_model is not None:
+            return {}
+
+        # The faces of every frame, in detection order (design section 3.2:
+        # the entries are ordered by (frame index, detection index), so a
+        # frame's faces are contiguous and every row owns whole faces).
+        faces_by_frame: dict[int, list[int]] = {}
+        for face_index, frame in enumerate(face_frames):
+            faces_by_frame.setdefault(int(frame), []).append(face_index)
+
+        eligible = []
+        for frame, face_indices in faces_by_frame.items():
+            if gray_flags[frame]:
+                continue
+            if any(
+                face_affines[k] is None
+                or np.isnan(face_landmarks[k]).any()
+                or restored_faces[k].shape[:2] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE)
+                for k in face_indices
+            ):
+                continue
+            eligible.append(frame)
+        if not eligible:
+            return {}
+
+        # The canvas rows are the eligible frames; the faces and the inverses
+        # ride the map, a row after a row.
+        batch_faces = [k for frame in eligible for k in faces_by_frame[frame]]
+        face_frame = [
+            row for row, frame in enumerate(eligible)
+            for _ in faces_by_frame[frame]
+        ]
+        inverses = inverse_affines(
+            [face_affines[k] for k in batch_faces],
+            upscale_factor=final_upscale_factor)
+        background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
+        canvas_h, canvas_w = paste_mod.paste_canvas_hw(
+            background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
+        # the canvas budget counts canvas rows - the eligible **frame**
+        # count, not the face count (design section 3.4)
+        mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
+        if mode == "host" and self.device.type == "cuda":
+            logger.info(
+                f"Device output assembly disengaged: {len(eligible)} frames on a "
+                f"{canvas_h}x{canvas_w} canvas exceed the "
+                f"{paste_mod.device_canvas_budget(self.device)}-byte device budget "
+                "- the host assembly runs"
+            )
+        faces_stacked = np.stack([restored_faces[k] for k in batch_faces])
+        if mode == "full":
+            background = batched_bg_frames(
+                background_stacked, final_upscale_factor, self.bg_upscale_model,
+                self.device, canvas_hw=canvas_hw, return_device=True)
+            canvas = paste_faces_batch(
+                faces_bgr=faces_stacked,
+                inverse_affines=inverses,
+                background_bgr=background,
+                device=self.device,
+                parse_net=parse_net,
+                device_output=True,
+                face_frame=face_frame,
+                num_frames=len(eligible))
+            return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
+        if mode == "chunked":
+            chunks = paste_mod.paste_faces_batch_chunked(
+                faces_bgr=faces_stacked,
+                inverse_affines=inverses,
+                background_bgr=background_stacked,
+                upscale_factor=final_upscale_factor,
+                bg_upscale_model=self.bg_upscale_model,
+                device=self.device,
+                canvas_hw=canvas_hw,
+                parse_net=parse_net,
+                face_frame=face_frame,
+                num_frames=len(eligible))
+            return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
+        background = batched_bg_frames(
+            background_stacked, final_upscale_factor, self.bg_upscale_model,
+            self.device, canvas_hw=canvas_hw)
+        pasted = paste_faces_batch(
+            faces_bgr=faces_stacked,
+            inverse_affines=inverses,
+            background_bgr=background,
+            device=self.device,
+            parse_net=parse_net,
+            face_frame=face_frame,
+            num_frames=len(eligible))
+        return dict(zip(eligible, pasted))
+
     @torch.no_grad()
     def process_image(self, cv2_image_orig: np.ndarray, final_upscale_factor: float, has_aligned: bool,
                       only_center_face: bool, draw_box: bool):
-        
+        # The multi-face branch (C2, design section 3.5): ``only_center_face``
+        # off on a non-aligned image restores **every** detected face.  The
+        # single-face toggle and the aligned path keep the body below
+        # byte-for-byte (the multi-face machinery lives entirely in
+        # ``_process_image_multiface``).
+        if not has_aligned and not only_center_face:
+            return self._process_image_multiface(
+                cv2_image_orig, final_upscale_factor, draw_box)
+
         self.face_helper.upscale_factor = final_upscale_factor
         
         input_img_list = [cv2_image_orig.copy()]
@@ -280,6 +420,7 @@ class KEEPFaceProcessor:
                     only_center_face=only_center_face, resize=640, eye_dist_threshold=5,
                     only_keep_largest=True)
 
+            keep_interrupt.check_interrupted()
             if num_det_faces >= 1:
                 raw_landmarks_list_np.append(self.face_helper.all_landmarks_5[0].reshape((10,)))
             else: return cv2_image_orig
@@ -319,6 +460,7 @@ class KEEPFaceProcessor:
         final_output_tensor = net_output[:, 0:1, ...].squeeze(0)
         restored_faces_cv2 = [tensor2img(x, rgb2bgr=True, min_max=(-1, 1)) for x in final_output_tensor]
         _soft_empty_cache()
+        keep_interrupt.check_interrupted()
 
         img_for_pasting = input_img_list[0]
         self.face_helper.clean_all()
@@ -346,6 +488,7 @@ class KEEPFaceProcessor:
             else:
                 bg_img_final = bg_img_upscaled_by_model
 
+            keep_interrupt.check_interrupted()
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
             with capture_console_to_logger():
@@ -370,6 +513,150 @@ class KEEPFaceProcessor:
 
         return final_restored_image
 
+    def _process_image_multiface(self, cv2_image_orig: np.ndarray,
+                                 final_upscale_factor: float, draw_box: bool) -> np.ndarray:
+        """The multi-face single-image path (C2, design section 3.5).
+
+        ``only_center_face=False`` restores **every** detected face of the
+        image.  The single-face collapse was two sites deep: the detector
+        call kept ``only_keep_largest=True`` (the vendored selector reduces
+        to the largest face **first**, ``face_restoration_helper.py:247-255``
+        - ``only_center_face=False`` never fired behind it), and the
+        pipeline indexed ``all_landmarks_5[0]``.  Both are lifted here: the
+        detector keeps all faces, the vendored ``align_warp_face`` crops
+        each of them (it already loops), one KEEP batch holds every crop
+        and **one** vendored ``paste_faces_to_input_image`` composites them
+        all - the reference composite by construction (the vendored forward
+        loop blends face k into the result of face k-1, ``:495``, and tails
+        once per image, ``:497-507``).
+
+        There is no landmark smoothing: the (F, 10) array of the single-face
+        path fed a *temporal* interpolator along the face axis, which would
+        blend coordinates **between** different faces - the landmarks are
+        used as detected.
+
+        The interrupt checks sit at the same stage boundaries as the
+        single-face path (after detection, after the KEEP restore, before
+        the paste - ``process_image`` / design section 2.2).
+        """
+        self.face_helper.upscale_factor = final_upscale_factor
+        # One working copy: the three stages read the same image the
+        # single-face path reads (detection, crop, paste), and the early
+        # exits return the caller's original untouched.
+        img = cv2_image_orig.copy()
+
+        # Detection: all faces - the argument change **is** the fix (PM
+        # risk #1 of the plan): keeping ``only_keep_largest=True`` would
+        # collapse the detection before any downstream indexing could help.
+        self.face_helper.clean_all()
+        # The detection step calls into the vendored facelib: its console
+        # writes are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            self.face_helper.read_image(img)
+            num_det_faces = self.face_helper.get_face_landmarks_5(
+                only_center_face=False, resize=640, eye_dist_threshold=5,
+                only_keep_largest=False)
+        keep_interrupt.check_interrupted()
+        if num_det_faces < 1:
+            return cv2_image_orig
+        # The (10,) round trip of the single-face path, without its
+        # cross-axis interpolation (see the docstring): ``np.array``
+        # materializes copies that survive the ``clean_all`` of the crop.
+        raw_landmarks_list_np = [lm.reshape((10,)) for lm in self.face_helper.all_landmarks_5]
+        raw_landmarks_np_array = np.array(raw_landmarks_list_np)
+        avg_landmarks_np_array = raw_landmarks_np_array.reshape(raw_landmarks_np_array.shape[0], 5, 2)
+        avg_landmarks_list = [lm for lm in avg_landmarks_np_array]
+
+        # Crop: the vendored loop over every face (the single-face path
+        # passed a one-element list until this round).  A ``None`` affine -
+        # the LMEDS failure - leaves a ``None`` in **both** ``cropped_faces``
+        # and ``affine_matrices`` (``face_restoration_helper.py:317-318``):
+        # that face drops out of the batch, and the vendored paste skips a
+        # ``None`` inverse gracefully (``:377-378``).
+        self.face_helper.clean_all()
+        # The crop step calls into the vendored facelib: its console
+        # writes are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            self.face_helper.read_image(img)
+            self.face_helper.all_landmarks_5 = list(avg_landmarks_list)
+            self.face_helper.align_warp_face()
+        crop_indices = [
+            i for i, affine in enumerate(self.face_helper.affine_matrices)
+            if affine is not None]
+        if not crop_indices:
+            return cv2_image_orig
+
+        # Restore: one KEEP batch over all the crops.  The image path's
+        # duplicate-axis trick (the temporal KEEP wants a clip of >= 2)
+        # doubles the face axis to ``2F`` and the first ``F`` outputs are
+        # taken - the contracted faithful flatten (design section 3.5).
+        cropped_face_t_list = []
+        for i in crop_indices:
+            cropped_face_cv2 = self.face_helper.cropped_faces[i]
+            cropped_face_t = img2tensor(cropped_face_cv2 / 255., bgr2rgb=True, float32=True)
+            # torchvision ``normalize`` became the equivalent in-place torch
+            # arithmetic: (t - mean) / std with mean = std = 0.5, bit-exact.
+            cropped_face_t.sub_(0.5).div_(0.5)
+            cropped_face_t_list.append(cropped_face_t)
+        num_faces = len(crop_indices)
+        cropped_faces_tensor = torch.stack(cropped_face_t_list, dim=0).unsqueeze(0).to(self.device)
+        duplicated_input_frames = torch.cat([cropped_faces_tensor, cropped_faces_tensor], dim=1)
+        net_output = self.keep_net(duplicated_input_frames, need_upscale=False)
+        final_output_tensor = net_output[:, 0:num_faces, ...].squeeze(0)
+        restored_faces_cv2 = [tensor2img(x, rgb2bgr=True, min_max=(-1, 1)) for x in final_output_tensor]
+        _soft_empty_cache()
+        keep_interrupt.check_interrupted()
+
+        # The per-face all-black guard (the analogue of the single-face
+        # ``restored_faces_cv2[0].any()``): a fully black restore drops out
+        # of the paste - together with its landmarks, so the vendored
+        # face-to-inverse pairing stays positional - and if every face
+        # drops, the original image comes back.
+        survivors = [
+            (avg_landmarks_list[i], face)
+            for i, face in zip(crop_indices, restored_faces_cv2)
+            if face.any()]
+        if not survivors:
+            return cv2_image_orig
+
+        # Paste: one vendored composite of all the faces - the helper's own
+        # multi-face flow (``add_restored_face`` per face, one
+        # ``get_inverse_affine``, one ``paste_faces_to_input_image``).  The
+        # paste-stage ``align_warp_face`` recomputes the affines of the
+        # surviving faces (the same recompute the single-face path runs).
+        self.face_helper.clean_all()
+        # The paste step calls into the vendored facelib: its console
+        # writes are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            self.face_helper.read_image(img)
+            self.face_helper.all_landmarks_5 = [lm for lm, _ in survivors]
+            self.face_helper.align_warp_face()
+        for _, face in survivors:
+            self.face_helper.add_restored_face(face.astype('uint8'))
+
+        bg_img_upscaled_by_model = self._run_upscaler(self.bg_upscale_model, img)
+
+        h, w, _ = img.shape
+        target_h, target_w = int(h * final_upscale_factor), int(w * final_upscale_factor)
+        if bg_img_upscaled_by_model.shape[0] != target_h or bg_img_upscaled_by_model.shape[1] != target_w:
+            bg_img_final = cv2.resize(bg_img_upscaled_by_model, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        else:
+            bg_img_final = bg_img_upscaled_by_model
+
+        keep_interrupt.check_interrupted()
+        with capture_console_to_logger():
+            self.face_helper.get_inverse_affine(None)
+            final_restored_image = self.face_helper.paste_faces_to_input_image(
+                upsample_img=bg_img_final,
+                draw_box=draw_box,
+                face_upsampler=self.face_upscale_model
+            )
+
+        if final_restored_image is None:
+            return cv2_image_orig
+
+        return final_restored_image
+
     @torch.no_grad()
     def process_image_sequence(self,
                                image_sequence_tensor: torch.Tensor,
@@ -381,6 +668,16 @@ class KEEPFaceProcessor:
         num_input_frames = image_sequence_tensor.shape[0]
         if num_input_frames == 0:
             return image_sequence_tensor
+
+        # The multi-face branch (C2, design section 3.1): ``only_center_face``
+        # off on a non-aligned sequence restores **every** detected face of
+        # every frame.  The single-face toggle and the aligned path keep the
+        # body below byte-for-byte (the multi-face machinery lives entirely
+        # in ``_process_sequence_multiface``).
+        if not has_aligned_frames and not only_center_face:
+            return self._process_sequence_multiface(
+                image_sequence_tensor, final_upscale_factor, draw_box,
+                max_clip_length)
 
         # P4.7: the V3 progress API replaces the V1 ``comfy.utils.ProgressBar``
         # (``src/keep_progress.py`` reports through the execution API).
@@ -406,6 +703,9 @@ class KEEPFaceProcessor:
             # writes are routed to the logger of the pack (D4).
             with capture_console_to_logger():
                 for i in range(num_input_frames):
+                    # The cancel poll (C1): ComfyUI's Cancel button raises
+                    # here - a no-op outside ComfyUI (``src/keep_interrupt.py``).
+                    keep_interrupt.check_interrupted()
                     img = input_frames_bgr[i]
                     self.face_helper.clean_all()
                     self.face_helper.read_image(img)
@@ -502,6 +802,7 @@ class KEEPFaceProcessor:
         temp_restored_face_tensors = []
         logger.info("Restoring faces with KEEP")
         for start_idx in range(0, num_input_frames, max_clip_length):
+            keep_interrupt.check_interrupted()
             end_idx = min(start_idx + max_clip_length, num_input_frames)
             current_clip_faces = batched_cropped_faces[:, start_idx:end_idx, ...]
             if current_clip_faces.shape[1] == 0: continue
@@ -582,6 +883,7 @@ class KEEPFaceProcessor:
                     (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
                 final_batch[list(batched_outputs)] = chunks_out
             for i in range(num_input_frames):
+                keep_interrupt.check_interrupted()
                 original_frame_bgr = input_frames_bgr[i]
                 if i in batched_outputs:
                     # both device modes already hold the frame (the canvas
@@ -678,6 +980,317 @@ class KEEPFaceProcessor:
             # upload, never one transfer per frame; the convert-out runs on
             # the device in budget-sized sub-chunks (the out-of-place chain
             # peaks at about 9x the canvas bytes of device transient)
+            if output_frames_cv2:
+                device_canvas[fallback_indices] = torch.from_numpy(
+                    np.stack(output_frames_cv2)).to(self.device)
+            return paste_mod.comfy_convert_out(
+                device_canvas, budget=paste_mod.device_canvas_budget(self.device))
+        if not output_frames_cv2:
+             return image_sequence_tensor
+        final_batch_tensor = bgr_u8_batch_to_comfy(np.stack(output_frames_cv2))
+        return final_batch_tensor
+
+    def _process_sequence_multiface(self,
+                                    image_sequence_tensor: torch.Tensor,
+                                    final_upscale_factor: float,
+                                    draw_box: bool,
+                                    max_clip_length: int) -> torch.Tensor:
+        """The multi-face sequence path (C2, design sections 3.2 and 3.3).
+
+        ``only_center_face=False`` restores **every** detected face of every
+        frame.  The single-face collapse was two sites deep: the detector
+        call kept ``only_keep_largest=True`` (the vendored selector reduces
+        to the largest face **first**,
+        ``face_restoration_helper.py:247-255`` - ``only_center_face=False``
+        never fired behind it), and the pipeline indexed
+        ``all_landmarks_5[0]``.  Both are lifted here: the detector keeps all
+        faces, every face of every frame becomes an entry of a **flattened**
+        face batch, and the pastes are wired through the face-to-frame map of
+        ``src/keep_gpu_paste.py`` (the t3 paste core).
+
+        The face entries are ordered by ``(frame index, detection index)``:
+        a frame's faces are contiguous, so the restore chunks, the paste map
+        and the fallback all address "a frame's faces" as a contiguous slice.
+
+        There is **no temporal landmark smoothing**: the single-track
+        ``(frames, 10)`` model interpolates between *frames* - with a ragged
+        face set that would blend the coordinates of different faces into
+        each other.  Per-frame independent detection is the contracted
+        behavior (per-face tracking is a future round).
+
+        A ``None`` affine (the LMEDS failure of the vendored crop) drops its
+        face from the batch before the crop - the vendored fallback would
+        skip a ``None`` inverse gracefully (``:377-378``), and here there is
+        no crop and no restored face for it to paste.
+
+        Honest caveat (design section 3.2): the KEEP batch is flattened to
+        ``(1, total_faces, 3, 512, 512)`` - the video path's optical-flow
+        module sees the faces as frames, so a multi-face clip is outside the
+        temporal prior's training condition (one face per frame); the
+        quality on the owner's clips is their manual accept, per-frame
+        sub-batching is the recorded fallback.
+
+        The interrupt checks sit in every long loop: the detection per
+        frame, the crop per face, the restore per chunk and the paste per
+        frame (design section 2.2).
+        """
+        num_input_frames = image_sequence_tensor.shape[0]
+        progress = ProgressReporter(num_input_frames * 3)
+
+        # The batched convert-in (design section 7.1): the elementwise math
+        # of the per-frame conversion on the whole stack - one host transfer
+        # instead of one per frame.
+        input_frames_bgr = comfy_batch_to_bgr_u8(image_sequence_tensor)
+        progress.update(num_input_frames)
+
+        # Detection (design section 3.3): every face of every frame becomes
+        # an entry.  ``read_image`` is called once per frame and the image
+        # the detector saw is kept for the crop (the same read-once pattern
+        # the single-face path runs, design section 7.2).
+        face_frames: list[int] = []
+        face_landmarks: list[np.ndarray] = []
+        # The images the detector saw (design section 7.2): the crop warps
+        # them - no frame is read twice.
+        detection_frames: list = []
+        logger.info("Detecting face landmarks")
+        # The detection step calls into the vendored facelib: its console
+        # writes are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            for i in range(num_input_frames):
+                # The cancel poll (C1): ComfyUI's Cancel button raises
+                # here - a no-op outside ComfyUI (``src/keep_interrupt.py``).
+                keep_interrupt.check_interrupted()
+                img = input_frames_bgr[i]
+                self.face_helper.clean_all()
+                self.face_helper.read_image(img)
+                detection_frames.append(self.face_helper.input_img)
+                # All faces: the argument change **is** the fix (PM risk #1
+                # of the plan) - ``only_keep_largest=True`` would collapse
+                # the detection to the largest face before any downstream
+                # indexing could help.
+                self.face_helper.get_face_landmarks_5(
+                    only_center_face=False, resize=640, eye_dist_threshold=5,
+                    only_keep_largest=False)
+                for landmark in self.face_helper.all_landmarks_5:
+                    face_frames.append(i)
+                    # ``np.array`` materializes copies that survive the
+                    # ``clean_all`` calls of the stages below.
+                    face_landmarks.append(np.array(landmark, dtype=np.float64))
+
+        total_faces = len(face_landmarks)
+        # Zero faces in the whole clip - the mirror of the all-NaN guard of
+        # the single-face path (design section 3.2): the input comes back.
+        if total_faces == 0:
+            return image_sequence_tensor
+        progress.update(num_input_frames)
+        # The restore spend is counted in **faces** and the paste in frames
+        # (design section 3.6): convert-in + detection spend
+        # ``2 * num_input_frames``, the restore ``total_faces`` and the paste
+        # ``num_input_frames``.
+        progress.total = num_input_frames * 3 + total_faces
+
+        logger.info("Cropping and aligning faces")
+        # Crop (design section 3.3): the same vendored LMEDS call over all
+        # the face landmarks (``keep_gpu_ops.estimate_affines``) and the
+        # same cv2 warp per face - the affine once, reused by every paste.
+        # The crop step calls into the vendored facelib: its console writes
+        # are routed to the logger of the pack (D4).
+        face_affines = list(estimate_affines(
+            face_landmarks, self.face_helper.face_template))
+        # A ``None`` affine drops its face from the batch; with every affine
+        # failed there is nothing to restore or paste.
+        croppable = [k for k in range(total_faces) if face_affines[k] is not None]
+        if not croppable:
+            return image_sequence_tensor
+        face_frames = [face_frames[k] for k in croppable]
+        face_landmarks = [face_landmarks[k] for k in croppable]
+        face_affines = [face_affines[k] for k in croppable]
+        total_faces = len(croppable)
+
+        # The crop (tolerance decision D2, design section 7.4): the warp
+        # stays on cv2 - the batched ``grid_sample`` of the device drifts
+        # against cv2's fixed-point sampling and the crop is a uint8-bound
+        # op.  The warp source is the image the detector saw - the raw
+        # frame, or the frame ``read_image`` upscaled for min(h, w) < 512.
+        # The img2tensor + normalize tail stays batched on the device.
+        cropped_u8 = []
+        with capture_console_to_logger():
+            for k in range(total_faces):
+                keep_interrupt.check_interrupted()
+                crop = cv2.warpAffine(
+                    detection_frames[face_frames[k]], face_affines[k], (512, 512),
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(135, 133, 132),
+                )
+                cropped_u8.append(crop)
+        cropped_batch = bgr_u8_batch_to_normalized(
+            torch.from_numpy(np.stack(cropped_u8)).permute(0, 3, 1, 2).to(self.device))
+        del cropped_u8
+        # The flattened faces-only batch: the time axis is the faces, not
+        # the frames (design section 3.2) - the frames without a face
+        # contribute no entry, and the neutral 0.5 crops of the single-face
+        # layout are gone with them.
+        batched_cropped_faces = cropped_batch.unsqueeze(0)
+        del cropped_batch
+
+        # Restore: the chunk loop of the single-face path over **faces**
+        # (design section 3.2) - the 1-entry chunk keeps the duplicate-to-2
+        # trick, the progress counts faces.
+        temp_restored_face_tensors = []
+        logger.info("Restoring faces with KEEP")
+        for start_idx in range(0, total_faces, max_clip_length):
+            keep_interrupt.check_interrupted()
+            end_idx = min(start_idx + max_clip_length, total_faces)
+            current_clip_faces = batched_cropped_faces[:, start_idx:end_idx, ...]
+            if current_clip_faces.shape[1] == 1:
+                 current_clip_faces_for_net = torch.cat([current_clip_faces, current_clip_faces], dim=1)
+                 clip_output_tensor = self.keep_net(current_clip_faces_for_net, need_upscale=False)
+                 temp_restored_face_tensors.append(clip_output_tensor[:, 0:1, ...])
+            else:
+                 clip_output_tensor = self.keep_net(current_clip_faces, need_upscale=False)
+                 temp_restored_face_tensors.append(clip_output_tensor)
+            progress.update(end_idx - start_idx)
+            # P4.6: the chunk boundary - the cached blocks of the finished
+            # chunk are released before the next chunk is allocated.
+            _soft_empty_cache()
+
+        if not temp_restored_face_tensors:
+            return image_sequence_tensor
+        all_restored_face_tensors = torch.cat(temp_restored_face_tensors, dim=1).squeeze(0)
+        # The batched tensor2img (design section 7.6): the vendored
+        # elementwise chain on the whole stack - the same pixels.
+        all_restored_faces_cv2 = tensor2img_batch(all_restored_face_tensors, min_max=(-1, 1))
+        del batched_cropped_faces, all_restored_face_tensors, temp_restored_face_tensors
+        _soft_empty_cache()
+
+        # The faces of every frame, in detection order - the crop stage keeps
+        # the entries ordered by (frame index, detection index).
+        faces_by_frame: dict[int, list[int]] = {}
+        for face_index, frame in enumerate(face_frames):
+            faces_by_frame.setdefault(frame, []).append(face_index)
+
+        output_frames_cv2: list[np.ndarray] = []
+        fallback_indices: list[int] = []
+        device_canvas: torch.Tensor | None = None
+        logger.info("Pasting faces and finalizing frames")
+        # The paste step calls into the vendored facelib: its console writes
+        # are routed to the logger of the pack (D4).
+        with capture_console_to_logger():
+            # The gray flags of the frames (the vendored ``is_gray`` of
+            # ``facelib/utils/misc.py:146``) - the same variances, without
+            # the PIL round trip the per-frame paste made.
+            gray_device = self.device if torch.device(self.device).type == "cuda" else None
+            gray_flags = is_gray_batch(input_frames_bgr, device=gray_device)
+            # The batched paste (design section 3.4): the eligible frames
+            # paste on the device through the face-to-frame map - the faces,
+            # the affines and the ROIs are face-indexed, the canvas, the
+            # chunk buffer and the mapping stay frame-indexed.  The vendored
+            # paste stays reachable for the non-default branches (the box,
+            # the face upsampler, the grayscale frames, the frames without a
+            # parse net and the frames with an ineligible face).
+            # The canvas of the paste (F1): the image the vendored
+            # ``read_image`` produced - the raw frame, or the frame
+            # upscaled for min(h, w) < 512.  The vendored paste sizes its
+            # canvas from ``self.input_img``
+            # (``face_restoration_helper.py:362-370``).
+            canvas_hw = tuple(detection_frames[0].shape[:2])
+            batched_outputs = self._batched_paste_multiface(
+                input_frames_bgr, all_restored_faces_cv2, face_affines,
+                face_frames, face_landmarks, final_upscale_factor, draw_box,
+                gray_flags, canvas_hw=canvas_hw)
+
+            canvas = batched_outputs.pop(paste_mod.DEVICE_CANVAS_KEY, None)
+            if canvas is not None:
+                # one device canvas of the whole batch: the batched indices
+                # are already in it (it is the group canvas, indexed copy),
+                # the vendored-fallback frames are uploaded as one stack
+                # below, and the single convert-out runs on the device
+                device_canvas = torch.empty(
+                    (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
+                    device=self.device)
+                device_canvas[list(batched_outputs)] = canvas
+            chunks_out = batched_outputs.pop(paste_mod.DEVICE_OUTPUT_CHUNKS_KEY, None)
+            if chunks_out is not None:
+                # one float32 host buffer of the whole batch: the chunked
+                # mode's per-group convert-outs already landed in it (the
+                # eligible rows are IMAGE rows) - one indexed copy places
+                # them; the vendored-fallback frames are converted host-side
+                # below (one stack, never per-frame transfers)
+                final_batch = torch.empty(
+                    (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
+                final_batch[list(batched_outputs)] = chunks_out
+            for i in range(num_input_frames):
+                keep_interrupt.check_interrupted()
+                original_frame_bgr = input_frames_bgr[i]
+                if i in batched_outputs:
+                    # both device modes already hold the frame (the canvas
+                    # or the chunk buffer); the host mode keeps the mapping
+                    # value
+                    if device_canvas is None and chunks_out is None:
+                        output_frames_cv2.append(batched_outputs[i])
+                    progress.update(1)
+                    continue
+                # The vendored fallback (design section 3.5): the helper gets
+                # **all** of the frame's faces at once - the restored faces
+                # and the crop matrices of the frame, one
+                # ``get_inverse_affine``, one ``paste_faces_to_input_image``
+                # - the reference composite by construction.  A frame without
+                # a face pastes nothing: the vendored call then returns the
+                # background at the target size.  ``draw_box=True`` draws one
+                # box per pasted face for free (the vendored per-face border
+                # masks, ``face_restoration_helper.py:428-438``).
+                self.face_helper.clean_all()
+                # Read once (design section 7.2): the paste loop of today ran
+                # a third ``read_image`` per frame.  ``input_img`` is the
+                # image the vendored ``read_image`` produced - the vendored
+                # paste sizes its canvas from it
+                # (``face_restoration_helper.py:362-370``).
+                self.face_helper.input_img = (
+                    detection_frames[i] if detection_frames else original_frame_bgr)
+                self.face_helper.is_gray = bool(gray_flags[i])
+                frame_face_indices = faces_by_frame.get(i, [])
+                for k in frame_face_indices:
+                    self.face_helper.add_restored_face(all_restored_faces_cv2[k].astype('uint8'))
+                # Affine once (design section 7.3): the crop stage computed
+                # the matrices - the paste reuses them, in the face order
+                # the restored faces were appended (the vendored paste
+                # pairs the two lists positionally).
+                self.face_helper.affine_matrices = [face_affines[k] for k in frame_face_indices]
+
+                bg_img_upscaled_by_model = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
+                h, w, _ = original_frame_bgr.shape
+                target_h, target_w = int(h * final_upscale_factor), int(w * final_upscale_factor)
+                if bg_img_upscaled_by_model.shape[0] != target_h or bg_img_upscaled_by_model.shape[1] != target_w:
+                    bg_img_final = cv2.resize(bg_img_upscaled_by_model, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                else:
+                    bg_img_final = bg_img_upscaled_by_model
+
+                self.face_helper.upscale_factor = final_upscale_factor
+                self.face_helper.get_inverse_affine(None)
+                final_pasted_frame = self.face_helper.paste_faces_to_input_image(
+                    upsample_img=bg_img_final,
+                    draw_box=draw_box,
+                    face_upsampler=self.face_upscale_model
+                )
+                output_frames_cv2.append(final_pasted_frame)
+                fallback_indices.append(i)
+                progress.update(1)
+
+        # The batched convert-out (design section 7.8): one stack and one
+        # transfer, where the per-frame loop made a tensor per frame.
+        if chunks_out is not None:
+            # the chunked device mode: the eligible rows are already IMAGE
+            # rows of final_batch; the vendored-fallback frames are still
+            # host arrays - one stack and one conversion written into the
+            # fallback rows (never per-frame transfers)
+            if output_frames_cv2:
+                final_batch[fallback_indices] = bgr_u8_batch_to_comfy(
+                    np.stack(output_frames_cv2))
+            return final_batch
+        if device_canvas is not None:
+            # F1: the fallback frames are still host arrays - one stacked
+            # upload, never one transfer per frame; the convert-out runs on
+            # the device in budget-sized sub-chunks
             if output_frames_cv2:
                 device_canvas[fallback_indices] = torch.from_numpy(
                     np.stack(output_frames_cv2)).to(self.device)

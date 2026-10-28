@@ -28,6 +28,19 @@ The **non-default branches stay with the vendored paste** (design section
 face helper without a parse net.  The vendored call path is not deleted -
 it is the fallback of the processor.
 
+The **multi-face paste core** (the cancel + multi-face round, t3)
+generalizes the ROI paste to several faces per canvas row: the faces, the
+affines and the ROIs are **face-indexed**, the background, the canvas and
+the output stay **frame-indexed**, joined by the ``face_frame`` map of
+:func:`paste_faces_batch` (face ``i`` composites into canvas row
+``face_frame[i]``; ``None`` keeps the one-face-per-row identity).  A row's
+faces composite **sequentially in detection order** into a per-row float32
+accumulator - the vendored op order
+(``face_restoration_helper.py:495``) - and the quantizing tail runs **once
+per row**, after the row's last face (``:497-507``), so the result is the
+vendored multi-face composite by construction and degenerates to the
+single-face math for 1-face rows.
+
 The equivalence of every op against the vendored reference is **measured**
 in ``tests/test_gpu_paste_equivalence.py`` (the per-op bounds are the ones
 t1 measured, the end-to-end bound of the paste is measured here).
@@ -45,6 +58,7 @@ import cv2
 import numpy as np
 import torch
 
+from . import keep_interrupt
 from .keep_gpu_ops import parse_soft_masks, resize_lanczos_u8, warp_affine_batch
 from .keep_image_utils import bgr_u8_batch_to_comfy
 
@@ -364,6 +378,8 @@ def paste_faces_batch_chunked(
     parse_net,
     frame_chunk: int | None = None,
     parse_chunk: int | None = None,
+    face_frame: Sequence[int] | None = None,
+    num_frames: int | None = None,
 ) -> torch.Tensor:
     """The device-output paste of the whole eligible batch, in frame groups.
 
@@ -415,28 +431,68 @@ def paste_faces_batch_chunked(
             free VRAM - :func:`paste_chunk_size` of the canvas).
         parse_chunk: the frames per ParseNet forward (``None`` sizes it
             from the free VRAM).
+        face_frame: the canvas row each face composites into - ``None``
+            (the default) keeps the identity contract of the shipped path,
+            face ``i`` -> row ``i``.  With the map the faces and the
+            affines are **face-indexed** while the background and the
+            returned IMAGE rows stay **frame-indexed** (``num_frames``
+            rows), and the groups are built **frame-wise** - a group never
+            splits a frame's faces, so the sequential per-row compositing
+            of :func:`paste_faces_batch` always sees all of a frame's
+            faces together.
+        num_frames: the number of canvas rows - ``None`` derives it (the
+            background rows with the map, the face count without).  When
+            given it has to match the background stack.
 
     Returns:
         The ``(N, canvas_h, canvas_w, 3)`` float32 **CPU** tensor - the
-        ComfyUI IMAGE rows of the eligible frames.
+        ComfyUI IMAGE rows of the eligible canvas rows.
     """
     faces = np.asarray(faces_bgr)
     background = np.asarray(background_bgr)
-    num_frames = int(faces.shape[0])
+    num_faces = int(faces.shape[0])
     if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
         raise ValueError(
             f"paste_faces_batch_chunked expects (N, {PARSE_FACE_SIZE}, "
             f"{PARSE_FACE_SIZE}, 3) faces, got {tuple(faces.shape)}"
         )
-    if len(inverse_affines) != num_frames:
+    if len(inverse_affines) != num_faces:
         raise ValueError(
             f"paste_faces_batch_chunked: {len(inverse_affines)} inverse "
-            f"affines for {num_frames} faces"
+            f"affines for {num_faces} faces"
         )
-    if background.ndim != 4 or background.shape[0] != num_frames:
+    rows: list[int] | None = None
+    if face_frame is None:
+        if num_frames is not None and int(num_frames) != num_faces:
+            raise ValueError(
+                f"paste_faces_batch_chunked: num_frames={int(num_frames)} "
+                f"without a face_frame map pins one row per face ({num_faces})"
+            )
+        num_rows = num_faces
+    else:
+        rows = [int(value) for value in face_frame]
+        if len(rows) != num_faces:
+            raise ValueError(
+                f"paste_faces_batch_chunked: {len(rows)} face_frame entries "
+                f"for {num_faces} faces"
+            )
+        num_rows = (
+            int(num_frames) if num_frames is not None else int(background.shape[0])
+        )
+    if background.ndim != 4 or background.shape[0] != num_rows:
+        if rows is None:
+            raise ValueError(
+                f"paste_faces_batch_chunked: {tuple(background.shape)} background "
+                f"frames for {num_rows} faces"
+            )
         raise ValueError(
             f"paste_faces_batch_chunked: {tuple(background.shape)} background "
-            f"frames for {num_frames} faces"
+            f"frames for {num_rows} canvas rows ({num_faces} faces)"
+        )
+    if rows is not None and any(not 0 <= row < num_rows for row in rows):
+        raise ValueError(
+            "paste_faces_batch_chunked: face_frame names a canvas row outside "
+            f"the background stack of {num_rows} rows"
         )
     canvas_h, canvas_w = paste_canvas_hw(
         background.shape[1:3], upscale_factor, canvas_hw
@@ -445,33 +501,71 @@ def paste_faces_batch_chunked(
         frame_chunk = paste_chunk_size(canvas_h, canvas_w, device)
     frame_chunk = max(1, int(frame_chunk))
     budget = device_canvas_budget(device)
-    out = torch.empty((num_frames, canvas_h, canvas_w, 3), dtype=torch.float32)
+    out = torch.empty((num_rows, canvas_h, canvas_w, 3), dtype=torch.float32)
     reset_paste_transfer_stats()
     totals: dict[str, int] = {key: 0 for key in PASTE_TRANSFER_STATS}
-    for start in range(0, num_frames, frame_chunk):
-        stop = min(start + frame_chunk, num_frames)
-        group_background = batched_bg_frames(
-            background[start:stop], upscale_factor, bg_upscale_model,
-            device, canvas_hw=canvas_hw, return_device=True,
-        )
-        canvas = paste_faces_batch(
-            faces[start:stop],
-            list(inverse_affines[start:stop]),
-            group_background,
-            device,
-            parse_net,
-            parse_chunk=parse_chunk,
-            frame_chunk=frame_chunk,
-            device_output=True,
-        )
-        # the group's paste call resets the counters - the chunked run
-        # sums the additive ones; ``frames`` and ``canvas_bytes`` are
-        # per-call values the tail sets for the whole helper call.
-        for key, value in PASTE_TRANSFER_STATS.items():
-            if key not in ("frames", "canvas_bytes"):
-                totals[key] += value
-        comfy_convert_out(canvas, out=out[start:stop], budget=budget)
-    totals["frames"] = num_frames
+    if rows is None:
+        for start in range(0, num_rows, frame_chunk):
+            # The cancel poll (C1): ComfyUI's Cancel button raises here - a
+            # no-op outside ComfyUI (``src/keep_interrupt.py``).
+            keep_interrupt.check_interrupted()
+            stop = min(start + frame_chunk, num_rows)
+            group_background = batched_bg_frames(
+                background[start:stop], upscale_factor, bg_upscale_model,
+                device, canvas_hw=canvas_hw, return_device=True,
+            )
+            canvas = paste_faces_batch(
+                faces[start:stop],
+                list(inverse_affines[start:stop]),
+                group_background,
+                device,
+                parse_net,
+                parse_chunk=parse_chunk,
+                frame_chunk=frame_chunk,
+                device_output=True,
+            )
+            # the group's paste call resets the counters - the chunked run
+            # sums the additive ones; ``frames`` and ``canvas_bytes`` are
+            # per-call values the tail sets for the whole helper call.
+            for key, value in PASTE_TRANSFER_STATS.items():
+                if key not in ("frames", "canvas_bytes"):
+                    totals[key] += value
+            comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+    else:
+        # The multi-face groups (the cancel + multi-face round, t3):
+        # frame-wise - a group never splits a frame's faces, so the inner
+        # sequential per-row compositing always sees all of a frame's faces
+        # together.  The rows of the group carry the canvas; the faces ride
+        # the map, re-based to the group's first row.
+        row_faces: list[list[int]] = [[] for _ in range(num_rows)]
+        for face_index, row in enumerate(rows):
+            row_faces[row].append(face_index)
+        for start in range(0, num_rows, frame_chunk):
+            keep_interrupt.check_interrupted()
+            stop = min(start + frame_chunk, num_rows)
+            face_indices = [
+                index for row in range(start, stop) for index in row_faces[row]
+            ]
+            group_background = batched_bg_frames(
+                background[start:stop], upscale_factor, bg_upscale_model,
+                device, canvas_hw=canvas_hw, return_device=True,
+            )
+            canvas = paste_faces_batch(
+                faces[face_indices],
+                [inverse_affines[index] for index in face_indices],
+                group_background,
+                device,
+                parse_net,
+                parse_chunk=parse_chunk,
+                frame_chunk=frame_chunk,
+                device_output=True,
+                face_frame=[rows[index] - start for index in face_indices],
+            )
+            for key, value in PASTE_TRANSFER_STATS.items():
+                if key not in ("frames", "canvas_bytes"):
+                    totals[key] += value
+            comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+    totals["frames"] = num_rows
     totals["canvas_bytes"] = canvas_h * canvas_w * 3
     PASTE_TRANSFER_STATS.clear()
     PASTE_TRANSFER_STATS.update(totals)
@@ -863,6 +957,8 @@ def paste_faces_batch(
     frame_chunk: int | None = None,
     use_roi: bool = True,
     device_output: bool = False,
+    face_frame: Sequence[int] | None = None,
+    num_frames: int | None = None,
 ) -> list[np.ndarray] | torch.Tensor:
     """The batched paste-back of the restored faces (design section 7.7).
 
@@ -895,17 +991,33 @@ def paste_faces_batch(
             the bytes that would have travelled are counted in
             ``roi_staged_bytes``.  Default ``False`` keeps the host output
             of the shipped pins byte-for-byte.
+        face_frame: the canvas row each face composites into - ``None``
+            (the default) keeps the identity contract of the shipped path,
+            face ``i`` -> row ``i``, and the body below runs unchanged.
+            With the map the faces, the affines and the ROIs are
+            **face-indexed** while the background, the canvas and the
+            output stay **frame-indexed** (``num_frames`` rows): a row's
+            faces composite **sequentially in detection order** into the
+            accumulated float composite of the row - the vendored op order
+            (``face_restoration_helper.py:495``) - and the quantizing tail
+            runs **once per row**, after the row's last face (``:497-507``).
+            The multi-face chunk is the ROI one (``use_roi`` has to stay
+            set); the chunk boundaries stay frame-wise, so a group never
+            splits a frame's faces.
+        num_frames: the number of canvas rows - ``None`` derives it (the
+            background rows with the map, the face count without).  When
+            given it has to match the background stack.
 
     Returns:
-        The ``N`` pasted frames as uint8 BGR arrays, or one uint8 BGR
-        device tensor when ``device_output`` is set.
+        The pasted frames as uint8 BGR arrays - one per canvas row - or
+        one uint8 BGR device tensor when ``device_output`` is set.
     """
     faces = np.asarray(faces_bgr)
     background = (
         background_bgr if torch.is_tensor(background_bgr)
         else np.asarray(background_bgr)
     )
-    num_frames = int(faces.shape[0])
+    num_faces = int(faces.shape[0])
     if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
         # the vendored paste resizes the face to the ParseNet size and the
         # parse mask back to the face size - the batched path keeps the
@@ -915,22 +1027,55 @@ def paste_faces_batch(
             f"paste_faces_batch expects (N, {PARSE_FACE_SIZE}, {PARSE_FACE_SIZE}, 3) "
             f"faces, got {tuple(faces.shape)}"
         )
-    if len(inverse_affines) != num_frames:
+    if len(inverse_affines) != num_faces:
         raise ValueError(
             f"paste_faces_batch: {len(inverse_affines)} inverse affines for "
-            f"{num_frames} faces"
+            f"{num_faces} faces"
         )
-    if background.shape[0] != num_frames:
+    rows: list[int] | None = None
+    if face_frame is None:
+        if num_frames is not None and int(num_frames) != num_faces:
+            raise ValueError(
+                f"paste_faces_batch: num_frames={int(num_frames)} without a "
+                f"face_frame map pins one row per face ({num_faces})"
+            )
+        num_rows = num_faces
+    else:
+        rows = [int(value) for value in face_frame]
+        if len(rows) != num_faces:
+            raise ValueError(
+                f"paste_faces_batch: {len(rows)} face_frame entries for "
+                f"{num_faces} faces"
+            )
+        if not use_roi:
+            raise ValueError(
+                "paste_faces_batch: the multi-face paste runs on the ROI "
+                "chunk - the full-canvas chunk has no multi-face form"
+            )
+        num_rows = (
+            int(num_frames) if num_frames is not None else int(background.shape[0])
+        )
+    if background.shape[0] != num_rows:
+        if rows is None:
+            raise ValueError(
+                f"paste_faces_batch: {background.shape[0]} background frames for "
+                f"{num_rows} faces"
+            )
         raise ValueError(
             f"paste_faces_batch: {background.shape[0]} background frames for "
-            f"{num_frames} faces"
+            f"{num_rows} canvas rows ({num_faces} faces)"
+        )
+    if rows is not None and any(not 0 <= row < num_rows for row in rows):
+        raise ValueError(
+            "paste_faces_batch: face_frame names a canvas row outside the "
+            f"background stack of {num_rows} rows"
         )
     height, width = background.shape[1:3]
     out_size = (width, height)  # the cv2 dsize order
     if frame_chunk is None:
         frame_chunk = paste_chunk_size(height, width, device)
     reset_paste_transfer_stats()
-    PASTE_TRANSFER_STATS["frames"] = num_frames
+    PASTE_TRANSFER_STATS["frames"] = num_rows
 
     # the device-output mode: one canvas, seeded from the background in
     # chunk-sized indexed copies; the ROI chunks scatter into it.  The
@@ -942,20 +1087,65 @@ def paste_faces_batch(
             if not torch.is_tensor(background) else background
         )
         canvas = torch.empty(
-            (num_frames, height, width, 3), dtype=torch.uint8, device=device
+            (num_rows, height, width, 3), dtype=torch.uint8, device=device
         )
     else:
         device_output = False
         background_device = background
     pasted: list[np.ndarray] = []
-    for start in range(0, num_frames, max(1, int(frame_chunk))):
-        stop = min(start + max(1, int(frame_chunk)), num_frames)
-        chunk = _paste_chunk_roi if use_roi else _paste_chunk
+    if rows is None:
+        for start in range(0, num_rows, max(1, int(frame_chunk))):
+            keep_interrupt.check_interrupted()
+            stop = min(start + max(1, int(frame_chunk)), num_rows)
+            chunk = _paste_chunk_roi if use_roi else _paste_chunk
+            if device_output:
+                canvas[start:stop] = background_device[start:stop].to(device)
+                chunk(
+                    faces[start:stop],
+                    list(inverse_affines[start:stop]),
+                    background_device[start:stop],
+                    device,
+                    parse_net,
+                    out_size,
+                    parse_chunk,
+                    canvas=canvas,
+                    frame_offset=start,
+                )
+            else:
+                pasted.extend(
+                    chunk(
+                        faces[start:stop],
+                        list(inverse_affines[start:stop]),
+                        background[start:stop],
+                        device,
+                        parse_net,
+                        out_size,
+                        parse_chunk,
+                    )
+                )
+        return canvas if device_output else pasted
+
+    # The multi-face mode (the cancel + multi-face round, t3): frame-wise
+    # groups under the same canvas-byte budget - a group never splits a
+    # frame's faces, so the sequential per-row compositing of
+    # ``_paste_chunk_faces`` always sees all of a frame's faces together.
+    # The rows of the group carry the canvas; the faces ride the map,
+    # re-based to the group's first row.
+    row_faces: list[list[int]] = [[] for _ in range(num_rows)]
+    for face_index, row in enumerate(rows):
+        row_faces[row].append(face_index)
+    for start in range(0, num_rows, max(1, int(frame_chunk))):
+        keep_interrupt.check_interrupted()
+        stop = min(start + max(1, int(frame_chunk)), num_rows)
+        face_indices = [
+            index for row in range(start, stop) for index in row_faces[row]
+        ]
         if device_output:
             canvas[start:stop] = background_device[start:stop].to(device)
-            chunk(
-                faces[start:stop],
-                list(inverse_affines[start:stop]),
+            _paste_chunk_faces(
+                faces[face_indices],
+                [inverse_affines[index] for index in face_indices],
+                [rows[index] - start for index in face_indices],
                 background_device[start:stop],
                 device,
                 parse_net,
@@ -966,9 +1156,10 @@ def paste_faces_batch(
             )
         else:
             pasted.extend(
-                chunk(
-                    faces[start:stop],
-                    list(inverse_affines[start:stop]),
+                _paste_chunk_faces(
+                    faces[face_indices],
+                    [inverse_affines[index] for index in face_indices],
+                    [rows[index] - start for index in face_indices],
                     background[start:stop],
                     device,
                     parse_net,
@@ -1238,6 +1429,57 @@ def _paste_frame_full_canvas(
     return pasted.permute(1, 2, 0).contiguous().cpu().numpy()
 
 
+def _paste_frame_full_canvas_multi(
+    faces: Sequence[np.ndarray],
+    inverse_affines: Sequence[np.ndarray],
+    warped_masks: Sequence[torch.Tensor],
+    background: np.ndarray,
+    device: torch.device,
+    out_size: tuple[int, int],
+    return_device: bool = False,
+) -> np.ndarray | torch.Tensor:
+    """The full-canvas paste of one row's faces (the near-black fallback).
+
+    The multi-face form of :func:`_paste_frame_full_canvas`: a row whose
+    **whole** frame is near black takes the vendored tail's full-canvas
+    fallback, which re-blends **all** of the row's faces sequentially at
+    the full canvas - the same accumulation the vendored paste runs
+    (``face_restoration_helper.py:495``) - and applies the vendored x255
+    tail (``:497-507``) once, over the final composite.  With one face the
+    loop degenerates to the exact expression of
+    :func:`_paste_frame_full_canvas`.
+
+    Args:
+        faces: the row's uint8 BGR restored faces, in detection order.
+        inverse_affines: the row's paste warps (face -> canvas).
+        warped_masks: the row's **full-canvas** warped parse masks - the
+            ``(H, W)`` floats of the batched warp of the chunk.
+        background: the row's ``(H, W, 3)`` uint8 BGR background.
+        return_device: keep the ``(H, W, 3)`` uint8 result on the device
+            (the device-output canvas mode) instead of downloading it.
+    """
+    background_t = (
+        torch.from_numpy(np.ascontiguousarray(background))
+        .to(device)
+        .permute(2, 0, 1)
+        .to(torch.float32)
+    )
+    composite = background_t
+    for face, inverse_affine, warped_mask in zip(faces, inverse_affines, warped_masks):
+        warped_face = cv2.warpAffine(face, inverse_affine, out_size)
+        warped_face_t = (
+            torch.from_numpy(np.ascontiguousarray(warped_face))
+            .to(device)
+            .permute(2, 0, 1)
+            .to(torch.float32)
+        )
+        composite = warped_mask * warped_face_t + (1.0 - warped_mask) * composite
+    pasted = _quantize_and_clip(composite).round_().to(torch.uint8)
+    if return_device:
+        return pasted.permute(1, 2, 0).contiguous()
+    return pasted.permute(1, 2, 0).contiguous().cpu().numpy()
+
+
 def _paste_chunk_roi(
     faces: np.ndarray,
     inverse_affines: list[np.ndarray],
@@ -1383,6 +1625,218 @@ def _paste_chunk_roi(
         PASTE_TRANSFER_STATS["d2h_bytes"] += patch.nbytes
         frame = background[index].copy()
         frame[y0:y1, x0:x1] = patch
+        pasted.append(frame)
+        PASTE_TRANSFER_STATS["roi_frames"] += 1
+    return pasted
+
+
+def _paste_chunk_faces(
+    faces: np.ndarray,
+    inverse_affines: list[np.ndarray],
+    face_rows: Sequence[int],
+    background: np.ndarray | torch.Tensor,
+    device: torch.device,
+    parse_net,
+    out_size: tuple[int, int],
+    parse_chunk: int | None,
+    canvas: torch.Tensor | None = None,
+    frame_offset: int = 0,
+) -> list[np.ndarray]:
+    """One frame-wise chunk of the multi-face ROI paste (the t3 sibling).
+
+    The multi-face form of :func:`_paste_chunk_roi` - which stays byte-
+    untouched for the shipped one-face-per-row path: several faces
+    composite into **one** canvas row.  Every op stays the vendored one,
+    only the bookkeeping changes:
+
+    - the faces, the affines, the parse masks and the ROIs are
+      **face-indexed** (the ParseNet forward is one batched call over the
+      chunk's faces, like the single-face chunk's over its frames);
+    - the background, the canvas and the output stay **frame-indexed** -
+      ``face_rows[i]`` is the chunk-local row face ``i`` composites into;
+    - a row's faces composite **sequentially in detection order** into a
+      per-row float32 accumulator seeded with the row's background over
+      the bounding box of the faces' ROIs - face ``k`` blends
+      ``mask_k * face_k + (1 - mask_k) * composite`` (the vendored op
+      order, ``face_restoration_helper.py:495``), reading its ROI patch
+      from the accumulator, so overlapping ROIs see the earlier faces'
+      blend - bit-exact against the vendored sequential blend, and the
+      1-face row degenerates to :func:`_paste_chunk_roi`'s exact math;
+    - the quantizing tail runs **once per row**, after the row's last
+      face (the vendored granularity, ``:497-507``): the row-global
+      maximum is the maximum of the accumulated composite over the union
+      bounding box and of the background outside it.  A whole near-black
+      row falls back to :func:`_paste_frame_full_canvas_multi` (all the
+      row's faces re-blended at the full canvas); otherwise the union
+      patch is quantized with the row-global maximum and scattered once -
+      the background pixels inside the box quantize to themselves.
+
+    Args:
+        faces: the ``(F, 512, 512, 3)`` uint8 BGR restored faces of the
+            chunk (face-indexed).
+        face_rows: the ``F`` chunk-local canvas rows the faces composite
+            into, in face order.
+        background: the ``(num_rows, H, W, 3)`` uint8 BGR background rows
+            of the chunk (frame-indexed; a device tensor in the
+            device-output mode).
+        canvas: the device-output canvas - the blended rows scatter into
+            ``canvas[frame_offset + row]`` and the return stays empty.
+
+    Returns:
+        The pasted rows as uint8 BGR arrays, in row order (the host mode;
+        an empty list in the device-output mode).
+    """
+    num_rows = int(background.shape[0])
+    if int(faces.shape[0]) == 0:
+        # the defensive empty chunk (the eligibility of the processor gives
+        # every row at least one face): the rows pass through as their
+        # background - the canvas rows are already seeded with it.
+        if canvas is None:
+            return [background[row].copy() for row in range(num_rows)]
+        return []
+    faces_u8 = torch.from_numpy(np.ascontiguousarray(faces)).to(device)
+    PASTE_TRANSFER_STATS["face_h2d_bytes"] += faces_u8.numel() * faces_u8.element_size()
+    faces_bchw = faces_u8.permute(0, 3, 1, 2)  # (F, 3, 512, 512) BGR
+
+    # 1. the parse mask of the faces
+    masks = parse_soft_masks_batched(parse_net, faces_bchw, device, parse_chunk)
+
+    # 2. the ROI of every face
+    if canvas is not None:
+        background = background.to(device) if not torch.is_tensor(background) else background
+    height, width = background.shape[1:3]
+    PASTE_TRANSFER_STATS["canvas_bytes"] = int(height * width * 3)
+    rois = [
+        face_roi_box(inverse_affines[index], (height, width))
+        for index in range(len(inverse_affines))
+    ]
+    terms = [
+        warp_fixed_point_terms(inverse_affines[index], width, height)
+        for index in range(len(inverse_affines))
+    ]
+
+    # the warped parse masks of the ROIs - one batched call for the whole
+    # chunk (the sampling arithmetic of the kernel depends on the batch, so
+    # a per-face call would drift by a last bit)
+    warped_masks = warp_affine_batch(masks, inverse_affines, out_size, rois=rois)
+
+    # 3. the sequential per-row compositing: the accumulator of a row is
+    # seeded with its background over the union bounding box and grows
+    # face by face, in detection order.
+    faces_by_row: dict[int, list[int]] = {}
+    for face_index, row in enumerate(face_rows):
+        faces_by_row.setdefault(int(row), []).append(face_index)
+
+    composited: dict[int, tuple[tuple[int, int, int, int], torch.Tensor, torch.Tensor]] = {}
+    for row, local_faces in faces_by_row.items():
+        ux0 = min(rois[index][0] for index in local_faces)
+        uy0 = min(rois[index][1] for index in local_faces)
+        ux1 = max(rois[index][2] for index in local_faces)
+        uy1 = max(rois[index][3] for index in local_faces)
+        if canvas is None:
+            patch = np.ascontiguousarray(background[row][uy0:uy1, ux0:ux1])
+            acc = torch.from_numpy(patch).to(device)
+            PASTE_TRANSFER_STATS["h2d_bytes"] += acc.numel() * acc.element_size()
+            acc = acc.permute(2, 0, 1).to(torch.float32)
+        else:
+            # the device-output mode: the union patch is sliced out of the
+            # device background - nothing travels, the bytes are recorded
+            acc = background[row][uy0:uy1, ux0:ux1].permute(2, 0, 1).to(torch.float32)
+            PASTE_TRANSFER_STATS["roi_staged_bytes"] += acc.numel() * acc.element_size()
+        for index in local_faces:
+            x0, y0, x1, y1 = rois[index]
+            warped_face = warp_face_roi(
+                faces_bchw[index], terms[index], (x0, y0, x1, y1)
+            ).to(torch.float32)
+            warped_mask = warped_masks[index][0]
+            window = (slice(None), slice(y0 - uy0, y1 - uy0), slice(x0 - ux0, x1 - ux0))
+            blended = warped_mask * warped_face + (1.0 - warped_mask) * acc[window]
+            acc[window] = blended
+        composited[row] = ((ux0, uy0, ux1, uy1), acc, acc.amax())
+
+    # one synchronisation for the whole chunk: the row-global maximum of
+    # the vendored tail is the only place where the whole row matters
+    row_maxima = (
+        torch.stack([entry[2] for entry in composited.values()]).cpu().numpy()
+        if composited else np.zeros(0, dtype=np.float64)
+    )
+    maxima_by_row = {
+        row: float(value) for row, value in zip(composited, row_maxima)
+    }
+
+    pasted: list[np.ndarray] = []
+    full_masks: list[torch.Tensor] | None = None
+    for row in range(num_rows):
+        if row not in composited:
+            # the defensive passthrough - the eligibility gives every row
+            # at least one face, so this is only reachable for a caller
+            # that maps no face to the row: the row keeps its background.
+            if canvas is None:
+                pasted.append(background[row].copy())
+            PASTE_TRANSFER_STATS["roi_frames"] += 1
+            continue
+        (ux0, uy0, ux1, uy1), acc, maximum = composited[row]
+        if maxima_by_row[row] <= 1.001:
+            # the rare branch: the background outside the union box.  In
+            # the canvas mode the background is a device tensor - the
+            # helper is a numpy one, and the branch is rare by
+            # construction, so this one row is downloaded rather than the
+            # helper being duplicated for the device.
+            outside = _background_max_outside(
+                background[row].cpu().numpy() if canvas is not None
+                and torch.is_tensor(background) else background[row],
+                (ux0, uy0, ux1, uy1))
+
+            if outside <= 1.001:
+                # the whole row is near black: the vendored tail scales
+                # the **whole canvas** by 255 - the full-canvas fallback
+                # re-blends all of the row's faces
+                PASTE_TRANSFER_STATS["fallback_frames"] += 1
+                if full_masks is None:
+                    # the batched full-canvas warp of the masks - the
+                    # fallback has to use the very same sampling as the
+                    # full-canvas path
+                    full_masks = list(warp_affine_batch(masks, inverse_affines, out_size))
+                local_faces = faces_by_row[row]
+                row_faces_arrays = [faces[index] for index in local_faces]
+                row_affines = [inverse_affines[index] for index in local_faces]
+                row_full_masks = [full_masks[index][0] for index in local_faces]
+                row_background = (
+                    background[row].cpu().numpy() if torch.is_tensor(background)
+                    else background[row]
+                )
+                if canvas is not None:
+                    canvas[frame_offset + row] = _paste_frame_full_canvas_multi(
+                        row_faces_arrays,
+                        row_affines,
+                        row_full_masks,
+                        row_background,
+                        device,
+                        out_size,
+                        return_device=True,
+                    )
+                    PASTE_TRANSFER_STATS["roi_frames"] += 1
+                    continue
+                pasted.append(_paste_frame_full_canvas_multi(
+                    row_faces_arrays, row_affines, row_full_masks,
+                    row_background, device, out_size,
+                ))
+                continue
+            maximum = torch.tensor(
+                max(maxima_by_row[row], outside), device=device
+            )
+        quantized = _quantize_and_clip(acc, maximum=maximum).round_().to(torch.uint8)
+        if canvas is not None:
+            # the device-output mode: the quantized union patch is
+            # scattered into the canvas - no download, no host assembly
+            canvas[frame_offset + row, uy0:uy1, ux0:ux1] = quantized.permute(1, 2, 0)
+            PASTE_TRANSFER_STATS["roi_staged_bytes"] += quantized.numel()
+            PASTE_TRANSFER_STATS["roi_frames"] += 1
+            continue
+        patch = quantized.permute(1, 2, 0).contiguous().cpu().numpy()
+        PASTE_TRANSFER_STATS["d2h_bytes"] += patch.nbytes
+        frame = background[row].copy()
+        frame[uy0:uy1, ux0:ux1] = patch
         pasted.append(frame)
         PASTE_TRANSFER_STATS["roi_frames"] += 1
     return pasted

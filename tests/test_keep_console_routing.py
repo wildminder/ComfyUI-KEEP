@@ -328,27 +328,39 @@ def test_the_processor_does_not_import_tqdm():
 
 @pytest.mark.unit
 def test_the_processor_logs_the_four_steps():
-    """The four steps of the sequence path are logged - one message each."""
+    """Each sequence path logs its four steps - one message each, in order."""
     source = (SRC_DIR / "keep_processor.py").read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(SRC_DIR / "keep_processor.py"))
-
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "info"
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "logger"
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    ]
-    # the calls in the order of the source
-    messages = [node.args[0].value for node in sorted(calls, key=lambda call: call.lineno)]
-    assert messages == [
+    four_steps = [
         "Detecting face landmarks",
         "Cropping and aligning faces",
         "Restoring faces with KEEP",
         "Pasting faces and finalizing frames",
     ]
+
+    def _stage_messages(fn):
+        calls = [
+            node
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "info"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ]
+        messages = [node.args[0].value for node in sorted(calls, key=lambda call: call.lineno)]
+        return [m for m in messages if m in four_steps]
+
+    paths = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _stage_messages(node)
+    ]
+    assert paths, "no sequence path logs its four steps"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in paths:
+            assert _stage_messages(node) == four_steps, node.name

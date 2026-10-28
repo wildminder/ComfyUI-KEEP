@@ -539,11 +539,27 @@ class _MockModelPatcher:
 
 
 class _MockModelManagement(types.ModuleType):
-    """Mock of ``comfy.model_management`` - records the residency calls."""
+    """Mock of ``comfy.model_management`` - records the residency calls.
+
+    The interrupt surface mirrors the real module's semantics (the real
+    source, ``comfy/model_management.py:2196-2221``): the flag of the Cancel
+    button, the thrower that raises **and resets** it, and the
+    ``InterruptProcessingException`` which derives from **BaseException** -
+    the broad ``except Exception`` handlers of the pipeline must not be able
+    to swallow it.  The interrupt calls are not recorded in ``calls`` (the
+    cancel checks poll once per loop iteration - the residency recording
+    would flood).
+    """
+
+    class InterruptProcessingException(BaseException):
+        """Mock of ``comfy.model_management.InterruptProcessingException``."""
 
     def __init__(self) -> None:
         super().__init__("comfy.model_management")
         self.calls: list[tuple] = []
+        # The cancel flag (the real module's ``interrupt_processing``
+        # global): the single mock instance is shared by the whole session.
+        self.interrupted = False
 
     def load_models_gpu(self, models, memory_required=None, **kwargs) -> None:
         self.calls.append(("load_models_gpu", models, memory_required))
@@ -577,6 +593,18 @@ class _MockModelManagement(types.ModuleType):
 
     def get_free_memory(self, *args, **kwargs):
         return 0, 0
+
+    def interrupt_current_processing(self, value=True) -> None:
+        self.interrupted = bool(value)
+
+    def processing_interrupted(self) -> bool:
+        return self.interrupted
+
+    def throw_exception_if_processing_interrupted(self) -> None:
+        # the real semantics: the thrower raises **and resets** the flag
+        if self.interrupted:
+            self.interrupted = False
+            raise self.InterruptProcessingException()
 
 
 class _MockProgressBar:
