@@ -765,6 +765,12 @@ def test_the_detection_pass_converts_at_most_a_group_at_a_time(
         "the detection pass must convert through the module function"
     )
     assert max(before_the_first_keep) <= 2, before_the_first_keep
+    # The fused crop loop re-derives the chunk's detection images in ONE
+    # group conversion per chunk (the grouped D-R2.2.1) - the per-row
+    # re-derivations of the first round-4 cut are gone: across the whole
+    # run only the detection groups, the crop groups and the paste stage's
+    # second convert-in may call the converter (2 * ceil(3 / 2) + 1 = 5).
+    assert len(conversions) <= 5, conversions
 
 
 @pytest.mark.unit

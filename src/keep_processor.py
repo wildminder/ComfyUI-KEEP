@@ -695,27 +695,54 @@ class KEEPFaceProcessor:
             self.face_helper.clean_all()
             self.face_helper.input_img = None
 
+    def _detection_frames(self,
+                          image_sequence_tensor: torch.Tensor,
+                          indices,
+                          needs_upscale: list[bool]) -> dict[int, np.ndarray]:
+        """The images the detector saw for ``indices``, in one group pass.
+
+        The round-4 re-derivation (D-R2.2.1) of the released
+        ``detection_frames`` list, in the **grouped** form: one batched
+        conversion of the gathered rows instead of one single-row
+        conversion per frame - the converter is elementwise, so every row
+        is bitwise the row the per-row form produced (and the round-3 crop
+        consumed), while the chunk pays one host transfer instead of
+        ``len(indices)``.  For the sub-512 frames the vendored
+        ``read_image`` re-runs to reproduce its INTER_LINEAR upscale - the
+        deterministic image the crop warps consume and the paste sizes its
+        canvas from (``face_restoration_helper.py:182-184``).  The caller
+        keeps the helper's console writes captured; the rows are bounded by
+        the caller's chunk (at most ``max_clip_length`` of them).
+
+        Returns:
+            ``{index: the detection image}`` - the raw converted row, or
+            the vendored upscale of it.
+        """
+        unique = sorted({int(index) for index in indices})
+        rows = comfy_batch_to_bgr_u8(image_sequence_tensor[unique])
+        frames: dict[int, np.ndarray] = {}
+        for position, index in enumerate(unique):
+            row = rows[position]
+            if needs_upscale[index]:
+                # the same vendored re-derivation the per-row form runs -
+                # the one ``read_image`` call site of the sequence path.
+                self.face_helper.read_image(row)
+                frames[index] = self.face_helper.input_img
+            else:
+                frames[index] = row
+        return frames
+
     def _detection_frame(self,
                          image_sequence_tensor: torch.Tensor,
                          index: int,
                          needs_upscale: list[bool]) -> np.ndarray:
-        """The image the detector saw for ``index`` (round 4, D-R2.2.1).
+        """The image the detector saw for ``index`` - the group form, one row.
 
-        The row of the batched conversion, re-derived from the input tensor
-        - the converter is elementwise, so the row is bitwise the row the
-        detection pass converted.  For the sub-512 frames the vendored
-        ``read_image`` re-runs to reproduce its INTER_LINEAR upscale - the
-        deterministic image today's crop warps consume and the paste sizes
-        its canvas from (``face_restoration_helper.py:182-184``).  The same
-        derivation serves the crop source and the paste fallback's
-        ``input_img`` (D-R2.3.3); the call sites keep the helper's console
-        writes captured.
+        The paste fallback's per-frame derivation (D-R2.3.3): the same
+        values :meth:`_detection_frames` returns, for a single index.
         """
-        row = comfy_batch_to_bgr_u8(image_sequence_tensor[index:index + 1])[0]
-        if not needs_upscale[index]:
-            return row
-        self.face_helper.read_image(row)
-        return self.face_helper.input_img
+        return self._detection_frames(
+            image_sequence_tensor, [index], needs_upscale)[index]
 
     @torch.no_grad()
     def process_image_sequence(self,
@@ -886,14 +913,24 @@ class KEEPFaceProcessor:
                     # console writes are routed to the logger of the pack
                     # (D4) - the derivation's ``read_image`` included.
                     with capture_console_to_logger():
+                        # The chunk's detection images in ONE group pass
+                        # (D-R2.2.1, grouped): the conversion is elementwise,
+                        # so the rows are bitwise the rows the per-row form
+                        # produced - one host transfer per chunk instead of
+                        # one per row.
+                        chunk_detection_frames = (
+                            self._detection_frames(
+                                image_sequence_tensor, croppable_rows,
+                                needs_upscale)
+                            if croppable_rows else {})
                         for row, i in enumerate(croppable_rows):
                             staged_u8[row] = cv2.warpAffine(
-                                self._detection_frame(
-                                    image_sequence_tensor, i, needs_upscale),
+                                chunk_detection_frames[i],
                                 affine_matrices[i], (512, 512),
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=(135, 133, 132),
                             )
+                    del chunk_detection_frames
                     # The frames without a (croppable) face carry the base's
                     # neutral crop (``torch.zeros(3, 512, 512) * 0.5`` of the
                     # base - 0.5 in the normalized scale, not 0): the
@@ -1266,23 +1303,25 @@ class KEEPFaceProcessor:
                 keep_interrupt.check_interrupted()
                 end_idx = min(start_idx + max_clip_length, total_faces)
                 staged_u8 = np.empty((end_idx - start_idx, 512, 512, 3), np.uint8)
-                chunk_frames: dict[int, np.ndarray] = {}
                 # The crop step calls into the vendored facelib: its console
                 # writes are routed to the logger of the pack (D4) - the
                 # derivation's ``read_image`` included.
                 with capture_console_to_logger():
+                    # The chunk's involved frames in ONE group pass
+                    # (D-R2.2.1, grouped): the conversion is elementwise, so
+                    # the rows are bitwise the rows the per-row form produced
+                    # - one host transfer per chunk instead of one per
+                    # involved frame (a frame's faces are contiguous, so the
+                    # involved frames stay ``max_clip_length``-bounded).
+                    chunk_frames = self._detection_frames(
+                        image_sequence_tensor,
+                        face_frames[start_idx:end_idx], needs_upscale)
                     for row, k in enumerate(range(start_idx, end_idx)):
                         # The per-face poll of today's crop loop (the cadence
                         # pin counts it; the chunk top polled above).
                         keep_interrupt.check_interrupted()
-                        frame = face_frames[k]
-                        detection_frame = chunk_frames.get(frame)
-                        if detection_frame is None:
-                            detection_frame = self._detection_frame(
-                                image_sequence_tensor, frame, needs_upscale)
-                            chunk_frames[frame] = detection_frame
                         staged_u8[row] = cv2.warpAffine(
-                            detection_frame, face_affines[k], (512, 512),
+                            chunk_frames[face_frames[k]], face_affines[k], (512, 512),
                             borderMode=cv2.BORDER_CONSTANT,
                             borderValue=(135, 133, 132),
                         )

@@ -960,8 +960,9 @@ def test_the_detection_pass_converts_at_most_a_group_at_a_time(
     """P-M3 (multi-face leg): no whole-clip convert before the first KEEP call.
 
     The streamed detection pass converts a group of at most
-    ``max_clip_length`` rows at a time and the fused loop re-derives
-    single rows; the whole-clip uint8 stack of the old detection pass is
+    ``max_clip_length`` rows at a time and the fused loop re-derives the
+    chunk's involved frames in one group conversion per chunk (the grouped
+    D-R2.2.1); the whole-clip uint8 stack of the old detection pass is
     gone.  Recording the converter's batch sizes: everything before the
     first KEEP forward stays at or below the clip length.  The frames sit
     at the 512 floor, so the pin measures exactly the group conversions
@@ -996,6 +997,12 @@ def test_the_detection_pass_converts_at_most_a_group_at_a_time(
         "the detection pass must convert through the module function"
     )
     assert max(before_the_first_keep) <= 2, before_the_first_keep
+    # The fused crop loop re-derives the chunk's involved frames in ONE
+    # group conversion per chunk (the grouped D-R2.2.1) - the per-frame
+    # re-derivations of the first round-4 cut are gone: across the whole
+    # run only the detection groups, the crop groups and the paste stage's
+    # second convert-in may call the converter (2 * ceil(4 / 2) + 1 = 5).
+    assert len(conversions) <= 5, conversions
 
 
 # ---------------------------------------------------------------------------
