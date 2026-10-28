@@ -52,7 +52,7 @@ VENDORED_PREFIX = "modules/deps/"
 
 #: Suffixes that hold binary content and are skipped.
 BINARY_SUFFIXES = frozenset(
-    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pth", ".pt", ".ckpt", ".bin", ".safetensors"}
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pth", ".pt", ".ckpt", ".bin", ".safetensors", ".npz"}
 )
 
 
