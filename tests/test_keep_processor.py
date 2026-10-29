@@ -229,13 +229,15 @@ def test_the_vram_is_released_through_comfyui(processor_module):
 
 
 @pytest.mark.mock_integration
-def test_the_sequence_releases_the_vram_at_every_chunk_boundary(
+def test_the_sequence_releases_the_vram_once_per_run(
     processor_module, monkeypatch
 ):
-    """P4.6: every chunk boundary releases the cached VRAM.
+    """P4.6 (Opt 6): the sequence releases the cached VRAM once per run.
 
-    30 frames with ``max_clip_length=20`` are two chunks - the release must
-    happen after each of them (the next chunk is allocated right after).
+    30 frames with ``max_clip_length=20`` are two chunks - the chunk
+    boundaries do **not** release any more (the chunk shapes repeat, so the
+    caching allocator reuses its blocks instead of accumulating); the one
+    release comes from the ``finally`` when the run is done.
     """
     events: list[str] = []
 
@@ -261,12 +263,49 @@ def test_the_sequence_releases_the_vram_at_every_chunk_boundary(
         max_clip_length=20,
     )
 
-    net_positions = [index for index, event in enumerate(events) if event == "net"]
-    assert len(net_positions) == 2, events
-    for position in net_positions:
-        assert events[position + 1] == "empty_cache", (
-            f"the chunk boundary did not release the VRAM: {events}"
+    assert events == ["net", "net", "empty_cache"], events
+
+
+@pytest.mark.mock_integration
+def test_an_oom_in_the_restore_loop_releases_the_vram_and_propagates(
+    processor_module, monkeypatch
+):
+    """Opt 6: the OOM handler releases the cached VRAM, then fails loudly.
+
+    The stub net raises ``torch.cuda.OutOfMemoryError`` (constructible
+    without CUDA) inside the fused crop + restore loop; the release fires
+    and the exception leaves ``process_image_sequence`` unchanged.  The
+    recorder fires **twice** (the round-6 owner answer keeps §6.2
+    verbatim): once in the ``except`` handler before the ``raise``, once
+    in the ``finally`` - both idempotent, and the happy path still fires
+    exactly once (the pin above).
+    """
+    events: list[str] = []
+
+    class _OomKeepNet(_StubKeepNet):
+        def __call__(self, frames, need_upscale=False):
+            raise torch.cuda.OutOfMemoryError()
+
+    monkeypatch.setattr(
+        processor_module, "_soft_empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_OomKeepNet(), _StubFaceHelper())
+    )
+    frames = torch.rand((4, 16, 16, 3), dtype=torch.float32)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        processor.process_image_sequence(
+            image_sequence_tensor=frames,
+            final_upscale_factor=1.0,
+            has_aligned_frames=True,
+            only_center_face=True,
+            draw_box=False,
+            max_clip_length=20,
         )
+
+    assert events == ["empty_cache", "empty_cache"], events
 
 
 # ---------------------------------------------------------------------------
@@ -560,9 +599,21 @@ def test_the_batched_crop_matches_the_vendored_warp(processor_module):
     The reference is the warp of ``face_restoration_helper.py:326-328`` (the
     512 template, the gray border) on the very frame the detector saw,
     followed by the ``img2tensor`` + normalize tail of the processor.  The
-    measured residual of the batched warp against cv2 is at most **1/255**
-    on this content (``tests/test_gpu_batch_equivalence.py``); the bound
-    below leaves the headroom of the float round trip.
+    crop itself warps on the device (Opt 1): one batched
+    ``crop_faces_batch`` per source-shape group replaced the per-row
+    ``cv2.warpAffine``, and the measured residual of that warp against cv2
+    is at most **1/255** on this content
+    (``tests/test_gpu_batch_equivalence.py``); the bound below is that
+    residual in the normalized scale, doubled for headroom.
+
+    The normalize tail is **float32** (Opt 3): its deviation from the
+    float64 ``img2tensor`` chain of the reference is one float32 rounding of
+    the ``u8 / 255`` quotient (<= 2**-22 in this scale, pinned in
+    ``tests/test_gpu_batch_equivalence.py``) - two orders of magnitude below
+    the warp bound, so the two changes compose without re-tuning.
+    The **smoothed** landmarks Opt 3 feeds the affine estimate add their own
+    sub-pixel share (measured ~2e-4 on the matrix, a 1-frame clip's 1-ulp
+    mean); the reuse assertion below carries that bound explicitly.
 
     The test also pins the **affine reuse**: the paste loop receives the
     matrix the crop computed - the second ``align_warp_face`` of the old
@@ -626,9 +677,109 @@ def test_the_batched_crop_matches_the_vendored_warp(processor_module):
 
     # the paste loop reused the matrix of the crop
     assert len(face_helper.affine_matrices) == 1, face_helper.affine_matrices
-    assert np.allclose(face_helper.affine_matrices[0], affine), (
-        "the paste loop did not reuse the affine matrix of the crop"
+    # The reference ``affine`` is fitted on the **raw** landmarks; the
+    # processor fits it on the **smoothed** ones (the single temporal filter
+    # of the sequence path).  On a 1-frame clip the symmetric pad makes the
+    # smoothing a weighted mean of the same five points, so the result is
+    # the input to within one float32 rounding - ~1e-4 px at the landmark
+    # magnitude (Opt 3).  The LMEDS fit then translates into a ~2e-4-matrix
+    # shift: the comparison is therefore absolute-tolerant in the sub-pixel
+    # band rather than the default ``allclose`` relative tolerance, which a
+    # near-zero matrix entry would otherwise bound below.
+    affine_delta = np.abs(face_helper.affine_matrices[0] - affine).max()
+    assert affine_delta <= 1e-3, (
+        f"the paste loop did not reuse the affine matrix of the crop "
+        f"(delta {affine_delta:.3e})"
     )
+
+
+class _StubParseNet:
+    """A parse net with the vendored contract (``[0]`` are the logits).
+
+    A 1x1 convolution over the color channels - deterministic, and spatial
+    enough for the batched paste to produce a non-trivial soft mask.
+    """
+
+    def __init__(self) -> None:
+        generator = torch.Generator().manual_seed(5)
+        self.weight = torch.randn(19, 3, 1, 1, generator=generator) * 0.35
+
+    def __call__(self, samples):
+        return (F.conv2d(samples, self.weight), None)
+
+
+@pytest.mark.unit
+def test_the_sequence_crop_warps_on_the_device_without_cv2(
+    processor_module, monkeypatch
+):
+    """Opt 1: the fused crop warps on the device - ``cv2.warpAffine`` never runs.
+
+    ``cv2.warpAffine`` is a shared module attribute, so the raising patch
+    hits the vendored paste too - the corpus must route **every** frame
+    through the batched paste (whose face warp is the torch
+    ``warp_face_roi``): every frame carries exactly one detected face with
+    a valid affine, all frames color, a parse net present (``use_parse``
+    stub), ``draw_box=False`` and no background / face upsampler.  Outside
+    this corpus the raising patch fails the run loudly by design - an
+    unplanned failure there means the corpus leaked a vendored-fallback
+    frame, not that Opt 1 regressed.
+
+    The recorded crop must be the batched device op's output: it is
+    recomputed here through ``crop_faces_batch`` +
+    ``bgr_u8_batch_to_normalized`` on the same detection frames and
+    compared bit for bit (the same op on the same input - tighter than the
+    2/255/127.5 warp bound of the pin above).
+    """
+    height, width = 512, 640
+    rng = np.random.default_rng(11)
+    small = rng.uniform(0.0, 255.0, size=(16, 20, 3)).astype(np.float32)
+    frame = np.clip(
+        cv2.resize(small, (width, height), interpolation=cv2.INTER_CUBIC), 0, 255
+    ).astype(np.uint8)
+    landmarks = FACE_TEMPLATE_512 + np.array([100.0, 50.0])
+
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.use_parse = True
+    face_helper.face_parse = _StubParseNet()
+    keep_net = _RecordingKeepNet()
+    processor = processor_module.KEEPFaceProcessor(_make_pack(keep_net, face_helper))
+
+    frames = torch.from_numpy(
+        np.stack([frame, frame]).astype(np.float32) / 255.0)
+
+    def _no_cv2_warp(*args, **kwargs):
+        raise AssertionError("the crop must not warp through cv2.warpAffine")
+
+    monkeypatch.setattr(cv2, "warpAffine", _no_cv2_warp)
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    # every frame went through the batched paste: no vendored fallback (its
+    # paste warps with cv2.warpAffine and would have raised above), and the
+    # canvas is the raw frame size (the 512 floor - no read_image upscale)
+    assert "paste_faces_to_input_image" not in face_helper.calls, face_helper.calls
+    assert tuple(output.shape) == (2, height, width, 3), output.shape
+
+    # the recorded crop is the device op's output, bit for bit
+    image_utils = importlib.import_module("ComfyUI_KEEP.src.keep_image_utils")
+    gpu_ops = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_ops")
+    frame_bgr = image_utils.comfy_batch_to_bgr_u8(frames)
+    affine = cv2.estimateAffinePartial2D(
+        landmarks, FACE_TEMPLATE_512, method=cv2.LMEDS
+    )[0]
+    expected_u8 = gpu_ops.crop_faces_batch(
+        torch.from_numpy(frame_bgr).permute(0, 3, 1, 2),
+        [affine, affine], (512, 512))
+    expected = image_utils.bgr_u8_batch_to_normalized(expected_u8)
+    assert len(keep_net.frames) == 1, keep_net.frames
+    assert tuple(keep_net.frames[0].shape) == (1, 2, 3, 512, 512)
+    assert torch.equal(keep_net.frames[0][0], expected)
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +853,241 @@ def test_the_image_golden_fixtures_are_reproduced_bit_for_bit(
         f"the parse-call count moved: {face_helper.face_parse.calls} "
         f"vs {int(golden['parse_calls'])}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round 6, Opt 5 - the aligned single-image fast path (design section 5)
+# ---------------------------------------------------------------------------
+class _IdentityKeepNet(_StubKeepNet):
+    """A KEEP net that returns its input and keeps a copy of the call.
+
+    The identity keeps the input contract checkable: the net input stays in
+    ``[-1, 1]`` only if the ``/255`` ran *before* the normalize, and the
+    output is the denormalized input - so the recorded frames pin both the
+    chain and the return contract without a second stub.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frames: list[torch.Tensor] = []
+
+    def __call__(self, frames, need_upscale=False):
+        self.calls.append((tuple(frames.shape), need_upscale))
+        self.frames.append(frames.detach().clone())
+        return frames
+
+
+class _BlackKeepNet(_StubKeepNet):
+    """Every output comes back at the bottom of the range (all black)."""
+
+    def __call__(self, frames, need_upscale=False):
+        self.calls.append((tuple(frames.shape), need_upscale))
+        return torch.full_like(frames, -1.0)
+
+
+def _aligned_face_image(seed: int = 3) -> np.ndarray:
+    """A "already aligned 512" face" as the node hands it over: uint8 BGR.
+
+    The node's ``comfy_image_to_cv2`` (``keep_image_utils.py:34``) has
+    already truncated the IMAGE tensor to uint8, so the fast path takes an
+    arbitrary-size uint8 BGR image - the resize is the first thing it does.
+    """
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, size=(640, 768, 3), dtype=np.uint8)
+
+
+def _expected_aligned_net_input(image: np.ndarray) -> torch.Tensor:
+    """The test's own computation of the corrected chain (design 5.4a).
+
+    bilinear-512 on the float tensor, **``/255`` first**, then the BGR ->
+    RGB flip and the ``(t - 0.5) / 0.5`` normalize - the same order the
+    standard aligned leg applies (``img2tensor(cropped / 255., bgr2rgb)``
+    then the normalize).  A re-computation alone would also pass a wrong
+    chain, so the companion range guard (min >= -1, max <= 1) is the
+    independent check: a missing ``/255`` lands in ``~(-1, 509)``.
+    """
+    img = torch.from_numpy(np.ascontiguousarray(image)).to(torch.device("cpu"))
+    img512 = F.interpolate(
+        img.permute(2, 0, 1).unsqueeze(0).float(),
+        size=(512, 512), mode="bilinear", align_corners=False)
+    return img512[:, [2, 1, 0]].div(255.0).sub(0.5).div(0.5)
+
+
+@pytest.mark.unit
+def test_the_aligned_fast_path_feeds_the_net_the_corrected_chain(processor_module):
+    """Opt 5a: one KEEP call, ``(1, 2, 3, 512, 512)``, the pinned input.
+
+    The recorded net input equals the test's own recomputation of the
+    corrected chain **bit for bit**, and it stays inside ``[-1, 1]`` - the
+    range guard is what makes the pin independent of the implementation.
+    """
+    keep_net = _IdentityKeepNet()
+    face_helper = _StubFaceHelper()
+    processor = processor_module.KEEPFaceProcessor(_make_pack(keep_net, face_helper))
+    image = _aligned_face_image()
+
+    output = processor.process_image(
+        cv2_image_orig=image,
+        final_upscale_factor=1.0,
+        has_aligned=True,
+        only_center_face=True,
+        draw_box=False,
+    )
+
+    assert keep_net.calls == [((1, 2, 3, 512, 512), False)], keep_net.calls
+    assert tuple(keep_net.frames[0].shape) == (1, 2, 3, 512, 512)
+    recorded = keep_net.frames[0]
+    # (batch 0, frame 0) of the ``(1, 2, 3, 512, 512)`` KEEP batch - the
+    # batch dim is 1 here, so the frame lives on the **time** axis (unlike
+    # the sequence stack, where ``[0]`` selects the first face).
+    assert torch.equal(recorded[0, 0], _expected_aligned_net_input(image)[0]), (
+        "the net input is not the corrected chain (bilinear-512, /255 first)"
+    )
+    assert recorded.min() >= -1.0, recorded.min()
+    assert recorded.max() <= 1.0, recorded.max()
+    # the two halves are the same frame (the duplicate-to-2 contract)
+    assert torch.equal(recorded[0, 0], recorded[0, 1])
+    assert tuple(output.shape) == (512, 512, 3), output.shape
+
+
+@pytest.mark.unit
+def test_the_aligned_fast_path_returns_the_quantized_bgr_image(processor_module):
+    """Opt 5b: the return is the 3-D BGR uint8 image, denormalized/quantized.
+
+    With the identity net the output is the recorded net input moved through
+    ``clamp(-1, 1) -> +1 -> /2 -> *255 -> round`` and flipped back to BGR -
+    the quantization the vendored ``tensor2img`` applied stays.
+    """
+    keep_net = _IdentityKeepNet()
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(keep_net, _StubFaceHelper()))
+    image = _aligned_face_image()
+
+    output = processor.process_image(
+        cv2_image_orig=image,
+        final_upscale_factor=1.0,
+        has_aligned=True,
+        only_center_face=True,
+        draw_box=False,
+    )
+
+    expected_face = _expected_aligned_net_input(image).clamp(-1, 1).add(1).div_(2)
+    expected = (expected_face[0].mul(255.0).round().clamp(0, 255).to(torch.uint8)
+                .permute(1, 2, 0)[..., [2, 1, 0]].cpu().numpy())
+    assert isinstance(output, np.ndarray), type(output)
+    assert output.dtype == np.uint8, output.dtype
+    assert np.array_equal(output, expected), (
+        f"max delta {(output.astype(int) - expected.astype(int)).__abs__().max()}"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("factor, expected_hw", [(2.0, (1024, 1024)), (0.5, (256, 256))])
+def test_the_aligned_fast_path_upscales_on_the_device(processor_module, factor, expected_hw):
+    """Opt 5c: the final upscale is a device resize of the float face.
+
+    Factor 2 goes **up** and factor 0.5 still resizes (the size check mirrors
+    ``keep_processor.py:566``), so a factor of 1.0 is the only identity case.
+    """
+    keep_net = _IdentityKeepNet()
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(keep_net, _StubFaceHelper()))
+    image = _aligned_face_image()
+
+    output = processor.process_image(
+        cv2_image_orig=image,
+        final_upscale_factor=factor,
+        has_aligned=True,
+        only_center_face=True,
+        draw_box=False,
+    )
+
+    assert output.shape == (*expected_hw, 3), output.shape
+    if factor != 1.0:
+        face = _expected_aligned_net_input(image).clamp(-1, 1).add(1).div(2)
+        resized = F.interpolate(
+            face, size=expected_hw, mode="bicubic", align_corners=False)
+        expected = (resized[0].mul(255.0).round().clamp(0, 255).to(torch.uint8)
+                    .permute(1, 2, 0)[..., [2, 1, 0]].cpu().numpy())
+        assert np.array_equal(output, expected), "the upscale is not the device bicubic"
+
+
+@pytest.mark.unit
+def test_an_all_black_restore_returns_the_original_image(processor_module):
+    """Opt 5d: the black-face guard survives the fast path.
+
+    The standard leg checks the restored face after ``tensor2img``
+    (``keep_processor.py:540``); the fast path checks the tensor before the
+    quantization - the observable contract is the same: the original image.
+    """
+    keep_net = _BlackKeepNet()
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(keep_net, _StubFaceHelper()))
+    image = _aligned_face_image()
+
+    output = processor.process_image(
+        cv2_image_orig=image,
+        final_upscale_factor=1.0,
+        has_aligned=True,
+        only_center_face=True,
+        draw_box=False,
+    )
+
+    assert output is image, "an all-black restore must return the caller's image"
+    assert keep_net.calls == [((1, 2, 3, 512, 512), False)], keep_net.calls
+
+
+@pytest.mark.unit
+def test_the_aligned_fast_path_hands_over_to_the_upscaler_configured_pipeline(processor_module):
+    """Opt 5e: a configured face upsampler keeps the standard pipeline.
+
+    The precondition (``face_upscale_model is None``) is the pin: with a
+    non-``None`` stub the standard aligned leg runs instead.  Its side effect
+    proves it - the helper is driven (the ``512`` resize, the crop list, the
+    restored face), which the fast path never does, and the output is the
+    standard leg's result rather than the fast-path return.  The fast path
+    also never reaches the net on this corpus, so the KEEP-call count is the
+    second half of the proof.
+    """
+    keep_net = _IdentityKeepNet()
+    face_helper = _StubFaceHelper()
+
+    class _StubUpscaleModel:
+        scale = 2.0
+
+        def __init__(self):
+            self.model = self._model
+
+        def _model(self, samples):
+            return samples
+
+    pack = types.SimpleNamespace(
+        keep_net=keep_net,
+        face_helper=face_helper,
+        bg_upscale_model=None,
+        face_upscale_model=_StubUpscaleModel(),
+        device=torch.device("cpu"),
+        model_type_str="KEEP",
+    )
+    processor = processor_module.KEEPFaceProcessor(pack)
+    image = _aligned_face_image()
+
+    output = processor.process_image(
+        cv2_image_orig=image,
+        final_upscale_factor=1.0,
+        has_aligned=True,
+        only_center_face=True,
+        draw_box=False,
+    )
+
+    # the standard pipeline drove the helper - the fast path leaves it alone
+    assert face_helper.calls, face_helper.calls
+    # it reached the net with the vendored crop chain, not the fast-path one
+    assert keep_net.calls == [((1, 2, 3, 512, 512), False)], keep_net.calls
+    # the standard leg's output is the upscaled 512 face, not the fast path's
+    # raw resize of the original - the crop of the aligned leg is
+    # ``resize_bgr_u8(image, (512, 512))``, so a fast-path run would differ
+    assert tuple(output.shape) == (512, 512, 3), output.shape
 
 
 # ---------------------------------------------------------------------------

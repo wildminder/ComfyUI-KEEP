@@ -15,10 +15,11 @@ What it pins:
 - the **shape** of the output - the base and the shipped pipeline must agree
   (the round-1 defect: a frame with ``min(h, w) < 512`` left the shipped
   pipeline at the raw resolution and clipped the pasted face);
-- the **pixels** - the vendored-fallback branch (no parse net) is bit-exact
-  against the base; the batched paste branch stays inside the documented
-  tolerance of the parse mask blur (the only replaced op with a non-zero
-  deviation);
+- the **pixels** - every branch stays inside the documented tolerances: the
+  batched device crop contributes its measured envelope
+  (:data:`CROP_TOLERANCE`, Opt 1) to both paste branches, and the parse
+  mask blur of the device adds :data:`PASTE_TOLERANCE` on the batched-paste
+  branch;
 - the **ROI path** - the shipped paste runs in the ROI of the transformed
   face, and the suite asserts the ROI marker (the product's own transfer
   accounting) over both paste branches (with and without a parse net) and
@@ -56,8 +57,16 @@ FACE_TEMPLATE = np.array(
 )
 
 #: The tolerance of the batched paste against the vendored paste - the
-#: parse mask blur of the device (the only replaced op with a deviation).
+#: parse mask blur of the device (the only replaced paste op with a
+#: deviation).
 PASTE_TOLERANCE = 1
+
+#: The measured envelope of the batched device crop against the vendored
+#: ``cv2.warpAffine`` (Opt 1): the float32 ``grid_sample`` vs cv2's 1/32 px
+#: fixed-point grid - measured 6/255, pinned bound 8/255 on the per-pixel
+#: noise content of this file (``tests/test_gpu_batch_equivalence.py``;
+#: 1/255 on smooth content).
+CROP_TOLERANCE = 8
 
 
 @pytest.fixture(scope="module")
@@ -208,11 +217,11 @@ def test_the_sequence_matches_the_base_implementation(
     The frames of 720x1280 (the normal case) and of 300x400 (the
     ``min(h, w) < 512`` case of the round-1 defect) are both covered.
 
-    Without a parse net the shipped pipeline falls back to the vendored
-    paste and has to be **bit-exact** against the base.  With the parse net
-    the batched paste replaces the vendored one; the only replaced op with a
-    deviation is the parse mask blur of the device, bounded by
-    :data:`PASTE_TOLERANCE` (1/255).
+    The crop warps on the device (Opt 1): both paste branches carry its
+    measured envelope against cv2's fixed-point sampling
+    (:data:`CROP_TOLERANCE` - this corpus is per-pixel noise, the warp's
+    adversarial case).  With the parse net the batched paste adds the
+    parse mask blur of the device (:data:`PASTE_TOLERANCE`).
     """
     height, width = frame_hw
     frames = _synthetic_frames(2, height, width)
@@ -227,7 +236,9 @@ def test_the_sequence_matches_the_base_implementation(
         f"{shipped.shape} != {base.shape}"
     )
     diff = np.abs(base.astype(np.float32) - shipped.astype(np.float32))
-    tolerance = 0.0 if not use_parse else PASTE_TOLERANCE / 255.0
+    tolerance = CROP_TOLERANCE / 255.0 + (
+        PASTE_TOLERANCE / 255.0 if use_parse else 0.0
+    )
     assert diff.max() <= tolerance + 1e-6, (
         f"the shipped pipeline drifted {diff.max() * 255:.2f}/255 from the base "
         f"for {height}x{width} (use_parse={use_parse})"
@@ -371,8 +382,9 @@ def test_the_batched_paste_takes_the_roi_path(
     Both frame sizes are covered: the normal 720x1280 and the
     ``min(h, w) < 512`` frame, whose canvas is the 512 px upscaled frame
     of the vendored ``read_image``.  The tolerance against the base
-    implementation stays the documented :data:`PASTE_TOLERANCE` (1/255) -
-    the ROI path must not widen it.
+    implementation is the device crop's envelope (:data:`CROP_TOLERANCE`,
+    Opt 1) plus the documented :data:`PASTE_TOLERANCE` (1/255) of the
+    parse blur - the ROI path must not widen it further.
     """
     height, width = frame_hw
     frames = _synthetic_frames(2, height, width)
@@ -389,7 +401,7 @@ def test_the_batched_paste_takes_the_roi_path(
         f"{shipped.shape} != {base.shape}"
     )
     diff = np.abs(base.astype(np.float32) - shipped.astype(np.float32))
-    assert diff.max() <= PASTE_TOLERANCE / 255.0 + 1e-6, (
+    assert diff.max() <= (CROP_TOLERANCE + PASTE_TOLERANCE) / 255.0 + 1e-6, (
         f"the ROI paste drifted {diff.max() * 255:.2f}/255 from the base "
         f"for {height}x{width}"
     )
@@ -419,9 +431,10 @@ def test_the_vendored_paste_branch_does_not_take_the_roi_path(
     vendored ``paste_faces_to_input_image`` stays the fallback of the
     processor (a face helper without a parse net).  The ROI marker has
     to stay empty there - a filled marker would mean that the ROI path
-    ran on a branch that has no parse mask to warp - and the pixels have
-    to stay **bit-exact** against the base (the vendored fallback is the
-    reference of the suite).
+    ran on a branch that has no parse mask to warp - and the pixels stay
+    inside the device crop's documented envelope (:data:`CROP_TOLERANCE`,
+    Opt 1) against the base: the vendored fallback is the reference of
+    the suite and the crop is the one replaced op that reaches it.
     """
     frames = _synthetic_frames(2, 720, 1280)
 
@@ -440,7 +453,7 @@ def test_the_vendored_paste_branch_does_not_take_the_roi_path(
     diff = np.abs(
         base_out.numpy().astype(np.float32) - shipped_out.numpy().astype(np.float32)
     )
-    assert diff.max() == 0.0, (
+    assert diff.max() <= CROP_TOLERANCE / 255.0 + 1e-6, (
         f"the vendored paste branch drifted {diff.max() * 255:.2f}/255 "
         f"from the base"
     )

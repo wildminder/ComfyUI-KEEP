@@ -114,13 +114,24 @@ def bgr_u8_batch_to_normalized(u8_bchw: torch.Tensor) -> torch.Tensor:
     """A uint8 BGR face stack ``(N, 3, H, W)`` -> the KEEP input ``(N, 3, H, W)`` in [-1, 1].
 
     The batch form of the crop tail ``img2tensor(cropped / 255., bgr2rgb=True,
-    float32=True)`` + ``(t - 0.5) / 0.5`` (``keep_processor.py:311-313``):
-    the BGR -> RGB flip, the /255 scale and the normalize, batched on the
-    input's device.  The /255 runs in **float64** before the float32 cast -
-    ``img2tensor`` divides the uint8 image in numpy float64 and casts once,
-    and the float64 division reproduces that double rounding bit for bit (a
-    float32 division could differ by one ulp); the output is bit-exact
-    against the per-frame chain (pinned in ``tests/test_gpu_batch_equivalence.py``).
+    float32=True)`` + ``(t - 0.5) / 0.5``: the BGR -> RGB flip, the /255
+    scale and the normalize, batched on the input's device.
+
+    The whole chain runs in **float32** (round 6, Opt 3).  The earlier form
+    divided in float64 and cast once to reproduce ``img2tensor``'s numpy
+    float64 division bit for bit; the owner's recorded decision (the plan of
+    ``.dev/docs/2026-10-29-keep-owner-fix1-plan.md``) is that a **one-ulp
+    float32** difference - a single rounding of the ``u8 / 255`` quotient,
+    magnified at most by a factor of two by the final ``div_(0.5)`` - does
+    not justify the 1:64 memory ratio of the transient float64 stack
+    (12 bytes instead of 4 per element of the chunk's crop).  The /255 of a
+    uint8 value is either exactly representable or needs one rounding; the
+    float64 pipeline is only ever *different*, never more correct.
+
+    The fp32 value is pinned twice in ``tests/test_gpu_batch_equivalence.py``:
+    against the vendored ``img2tensor`` chain within the documented
+    ``2**-22`` tolerance, and against the explicit float32 chain bit for
+    bit (the exact operator order and the output dtype).
     """
     rgb = u8_bchw[:, [2, 1, 0]]
-    return (rgb.to(torch.float64) / 255.0).to(torch.float32).sub_(0.5).div_(0.5)
+    return rgb.to(torch.float32).div_(255.0).sub_(0.5).div_(0.5)

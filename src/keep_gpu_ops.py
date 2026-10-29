@@ -35,6 +35,7 @@ The equivalence strategy per op:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -455,6 +456,18 @@ def _lanczos_axis_matrix(in_size: int, out_size: int) -> np.ndarray:
     return matrix[:, :in_size]
 
 
+@lru_cache(maxsize=32)
+def _lanczos_axis_matrix_cached(in_size: int, out_size: int) -> np.ndarray:
+    """The (out, in) Lanczos matrix - a pure function of the sizes.
+
+    The cache holds the **numpy** array (no device state): the
+    ``.to(device)`` stays per call in :func:`resize_lanczos_u8`, so one
+    cached matrix serves both devices.  The cached array must stay
+    read-only in the callers - ``torch.from_numpy`` is a zero-copy view.
+    """
+    return _lanczos_axis_matrix(in_size, out_size)
+
+
 def resize_lanczos_u8(
     frames: np.ndarray | torch.Tensor,
     size: tuple[int, int],
@@ -491,8 +504,8 @@ def resize_lanczos_u8(
     else:
         source = frames.to(device)
     num, height, width, channels = (int(value) for value in source.shape)
-    wy = torch.from_numpy(_lanczos_axis_matrix(height, out_h)).to(device)
-    wx = torch.from_numpy(_lanczos_axis_matrix(width, out_w)).to(device)
+    wy = torch.from_numpy(_lanczos_axis_matrix_cached(height, out_h)).to(device)
+    wx = torch.from_numpy(_lanczos_axis_matrix_cached(width, out_w)).to(device)
     pixels = max(1, height * width)
     chunk = max(1, LANCZOS_CHUNK_PIXELS // pixels)
     out = torch.empty((num, out_h, out_w, channels), dtype=torch.uint8, device=device)

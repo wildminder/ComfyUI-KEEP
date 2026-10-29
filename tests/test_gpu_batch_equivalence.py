@@ -161,13 +161,21 @@ def test_bgr_u8_batch_to_comfy_is_bit_exact_against_the_per_frame_loop(image_uti
 
 @pytest.mark.unit
 def test_bgr_u8_batch_to_normalized_is_bit_exact_against_img2tensor(image_utils, img_util):
-    """The batched crop tail equals ``img2tensor`` + the normalize replacement.
+    """The batched crop tail matches ``img2tensor`` within one float32 rounding.
 
-    The reference is the per-frame chain of ``keep_processor.py:311-313``:
-    ``img2tensor(face / 255., bgr2rgb=True, float32=True)`` (the numpy
-    float64 division, then the float32 cast) and the in-place
-    ``(t - 0.5) / 0.5``.  The float64 division of the batch form reproduces
-    the double rounding bit for bit.
+    The reference is the per-frame chain: ``img2tensor(face / 255.,
+    bgr2rgb=True, float32=True)`` - the numpy **float64** division, then the
+    float32 cast - and the in-place ``(t - 0.5) / 0.5``.
+
+    The batch form computes the /255 **in float32** (round 6, Opt 3): the
+    float64 transient of the early rewrite bought a one-ulp agreement for
+    four times the bytes, and the owner's recorded decision dropped it.  A
+    ``u8 / 255`` quotient is either exact in float32 or needs exactly one
+    rounding, so the two chains differ by at most one float32 ulp of the
+    [0, 1] quotient, doubled by the final ``div_(0.5)`` - the bound below is
+    ``2**-22`` (~2.4e-7), i.e. two ulp of the normalized scale.  The exact
+    operator order is pinned bit for bit by the companion
+    ``test_bgr_u8_batch_to_normalized_matches_the_float32_chain_exactly``.
     """
     rng = np.random.default_rng(23)
     faces = rng.integers(0, 256, size=(3, 3, 48, 64), dtype=np.uint8)
@@ -183,7 +191,34 @@ def test_bgr_u8_batch_to_normalized_is_bit_exact_against_img2tensor(image_utils,
     )
 
     assert batched.dtype == torch.float32
-    assert torch.equal(batched, reference)
+    difference = (batched - reference).abs().max().item()
+    assert difference <= 2**-22, (
+        f"the fp32 crop tail drifted {difference:.3e} from the img2tensor "
+        "chain (bound 2**-22)"
+    )
+
+
+@pytest.mark.unit
+def test_bgr_u8_batch_to_normalized_matches_the_float32_chain_exactly(image_utils):
+    """The float32 tail is pinned bit for bit in its exact operator order.
+
+    The value is compared against the explicit float32 chain - the flip, the
+    float32 cast, then ``/ 255`` and the two in-place normalizes - so the
+    operator order of the fp32 rewrite (round 6, Opt 3) cannot drift into a
+    reshape, a split-kernel form or a float64 revive without a name.
+    """
+    rng = np.random.default_rng(29)
+    faces = rng.integers(0, 256, size=(4, 3, 17, 23), dtype=np.uint8)
+    faces[0, :, 0, 0] = (0, 255, 127)  # the quotient's boundary values
+
+    batched = image_utils.bgr_u8_batch_to_normalized(torch.from_numpy(faces))
+    expected = (
+        torch.from_numpy(faces)[:, [2, 1, 0]].float() / 255.0
+    ).sub_(0.5).div_(0.5)
+
+    assert batched.dtype == torch.float32
+    assert tuple(batched.shape) == faces.shape
+    assert torch.equal(batched, expected)
 
 
 # ---------------------------------------------------------------------------

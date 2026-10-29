@@ -1325,14 +1325,15 @@ def warp_face_roi(
     channels, src_h, src_w = (int(value) for value in face_u8.shape)
     roi_h, roi_w = y1 - y0, x1 - x0
 
-    def column(values: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(values[x0:x1].astype(np.int32)).to(device)
+    # the four term uploads happen once, at the top - everything below is
+    # pure device arithmetic (the upload-count pin freezes this shape)
+    col_x_t = torch.from_numpy(col_x[x0:x1].astype(np.int32)).to(device)
+    col_y_t = torch.from_numpy(col_y[x0:x1].astype(np.int32)).to(device)
+    row_x_t = torch.from_numpy(row_x[y0:y1].astype(np.int32)).to(device)
+    row_y_t = torch.from_numpy(row_y[y0:y1].astype(np.int32)).to(device)
 
-    def row(values: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(values[y0:y1].astype(np.int32)).to(device)
-
-    x_full = row(row_x)[:, None] + column(col_x)[None, :]
-    y_full = row(row_y)[:, None] + column(col_y)[None, :]
+    x_full = row_x_t[:, None] + col_x_t[None, :]
+    y_full = row_y_t[:, None] + col_y_t[None, :]
     x32 = torch.div(x_full, CV_WARP_TAB_SIZE, rounding_mode="floor")
     y32 = torch.div(y_full, CV_WARP_TAB_SIZE, rounding_mode="floor")
     sx0 = torch.div(x32, CV_WARP_TAB_SIZE, rounding_mode="floor")
@@ -1340,6 +1341,9 @@ def warp_face_roi(
     fx = x32 - CV_WARP_TAB_SIZE * sx0
     fy = y32 - CV_WARP_TAB_SIZE * sy0
 
+    # `.reshape`, not `.view`: on the production input's strides both are a
+    # zero-copy view, and `.reshape` also adapts to a differently-strided
+    # view where the H/W merge is not stride-legal
     source = face_u8.reshape(channels, src_h * src_w)
 
     def tap(offset_x: int, offset_y: int) -> torch.Tensor:
@@ -1348,13 +1352,15 @@ def warp_face_roi(
         sy = sy0 + offset_y
         inside = (sx >= 0) & (sx < src_w) & (sy >= 0) & (sy < src_h)
         flat = (sy.clamp(0, src_h - 1) * src_w + sx.clamp(0, src_w - 1)).reshape(-1)
+        # the int32 cast stays on the ROI-sized gather - an up-front
+        # ``source.int()`` would materialize a whole-face int32 copy
         values = source[:, flat].to(torch.int32).reshape(channels, roi_h, roi_w)
-        return values * inside.to(torch.int32)
+        return values * inside.unsqueeze(0).to(torch.int32)
 
-    w00 = (CV_WARP_TAB_SIZE - fx) * (CV_WARP_TAB_SIZE - fy)
-    w01 = fx * (CV_WARP_TAB_SIZE - fy)
-    w10 = (CV_WARP_TAB_SIZE - fx) * fy
-    w11 = fx * fy
+    w00 = ((CV_WARP_TAB_SIZE - fx) * (CV_WARP_TAB_SIZE - fy)).unsqueeze(0)
+    w01 = (fx * (CV_WARP_TAB_SIZE - fy)).unsqueeze(0)
+    w10 = ((CV_WARP_TAB_SIZE - fx) * fy).unsqueeze(0)
+    w11 = (fx * fy).unsqueeze(0)
     total = (
         w00 * tap(0, 0)
         + w01 * tap(1, 0)

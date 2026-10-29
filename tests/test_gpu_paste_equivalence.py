@@ -520,6 +520,57 @@ def test_the_roi_face_warp_is_bit_exact_against_cv2(
 
 
 @pytest.mark.unit
+def test_the_roi_face_warp_uploads_the_terms_once(gpu_paste, monkeypatch):
+    """The four term uploads happen once, at the top of the body.
+
+    ``warp_face_roi`` needs exactly four host arrays per call - the ROI
+    slices of the two column and two row terms - uploaded before the
+    sampling arithmetic starts.  The pin freezes that hoisted shape
+    against a regression to per-tap transfers: a counting
+    ``torch.from_numpy`` wrapper must see exactly four calls per
+    invocation, and each of them one of the four term slices.
+    """
+    height, width = ROI_CANVAS_HW
+    face = _face_u8("noise", seed=103)
+    matrix = _face_to_canvas(ROI_CANVAS_HW, "edge")
+    roi = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
+    terms = gpu_paste.warp_fixed_point_terms(matrix, width, height)
+    source = torch.from_numpy(face).permute(2, 0, 1).contiguous()
+
+    uploaded: list[np.ndarray] = []
+    real_from_numpy = torch.from_numpy
+
+    def counting_from_numpy(array):
+        uploaded.append(np.asarray(array))
+        return real_from_numpy(array)
+
+    monkeypatch.setattr(torch, "from_numpy", counting_from_numpy)
+    gpu_paste.warp_face_roi(source, terms, roi)
+
+    x0, y0, x1, y1 = roi
+    expected = [
+        terms[0][x0:x1].astype(np.int32),
+        terms[1][x0:x1].astype(np.int32),
+        terms[2][y0:y1].astype(np.int32),
+        terms[3][y0:y1].astype(np.int32),
+    ]
+    assert len(uploaded) == 4, f"{len(uploaded)} term uploads for one ROI warp"
+    remaining = list(expected)
+    for piece in uploaded:
+        match = next(
+            (
+                index
+                for index, want in enumerate(remaining)
+                if np.array_equal(piece, want)
+            ),
+            None,
+        )
+        assert match is not None, "an upload that is not one of the term slices"
+        remaining.pop(match)
+    assert not remaining, "a term slice was never uploaded"
+
+
+@pytest.mark.unit
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="no CUDA device for the GPU pin"
 )

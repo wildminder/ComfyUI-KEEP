@@ -559,8 +559,18 @@ def test_no_detected_faces_return_the_original_image(processor_module, make_help
 def test_the_aligned_path_stays_out_of_the_multiface_branch(processor_module, make_helper):
     """``has_aligned=True`` keeps the single-face semantics (out of scope).
 
-    The aligned path never detects - the recording wrapper stays empty -
-    and the net contract stays the aligned one (``2F=2`` for the one face).
+    Reclassified in round 6, Opt 5: with no face upsampler configured this
+    pin now runs the **fast path** (``_restore_aligned_torch``), not the
+    standard aligned leg.  Its three assertions still hold, and they pin the
+    fast path's contract rather than the standard one:
+
+    * the aligned path never detects - the recording wrapper stays empty
+      (the fast path skips the face helper entirely);
+    * the net contract is the aligned one - one call of ``(1, 2, 3, 512,
+      512)`` with ``need_upscale=False``, the duplicate-to-2 of the design;
+    * the output is the 3-D ``(512, 512, 3)`` the ``process_image`` contract
+      returns - a 4-D return would reach ``cv2_to_comfy_image``
+      (``keep_image_utils.py:38-42``) and unsqueeze into a 5-D IMAGE tensor.
     """
     image = _noise_image()
     face_helper = make_helper()

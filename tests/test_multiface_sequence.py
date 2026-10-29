@@ -615,6 +615,13 @@ def test_draw_box_pastes_every_frame_through_the_vendored_fallback(
     needs the vendored masks.  Every frame's output is the vendored
     all-faces composite with one box per pasted face (PM open question 3,
     answered by the vendored tails ``face_restoration_helper.py:428-438``).
+
+    The reference crops with the vendored ``align_warp_face`` while the
+    shipped pipeline crops with the batched device warp (Opt 1), so the
+    composite carries that warp's residual - the same documented 3/255
+    bound the sibling vendored-fallback pin uses for this smooth corpus
+    (the measured drift is 1/255, the smooth envelope of
+    ``tests/test_gpu_batch_equivalence.py``).
     """
     frames_bgr = _smooth_frames(3)
     frames = _sequence_tensor(image_utils, frames_bgr)
@@ -634,8 +641,10 @@ def test_draw_box_pastes_every_frame_through_the_vendored_fallback(
         _vendored_frame_reference(ref_helper, frames_in[1], [FACE_C], draw_box=True),
         _vendored_frame_reference(ref_helper, frames_in[2], [], draw_box=True),
     ]))
-    assert torch.equal(output, expected), (
-        "every draw_box frame must be the vendored composite with its per-face boxes"
+    drift = (output - expected).abs().max().item()
+    assert drift <= 3.0 / 255.0 + 1e-6, (
+        f"the draw_box frames drifted {drift * 255:.2f}/255 from the vendored "
+        f"composite with their per-face boxes"
     )
 
 
@@ -806,7 +815,7 @@ def test_the_multiface_sequence_does_not_smooth_the_landmarks(
 
 
 # ---------------------------------------------------------------------------
-# P-M1 - the golden fixtures (the pre-restructure outputs, D-R2.0)
+# P-M1 - the golden fixtures (the round-6 pixel-policy baseline)
 # ---------------------------------------------------------------------------
 #: The fixture directory (``tests/fixtures``, the tool's default output).
 GOLDEN_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -828,10 +837,12 @@ def test_the_sequence_golden_fixtures_are_reproduced_bit_for_bit(
 ):
     """P-M1: the streamed re-run of a captured case is bitwise identical.
 
-    The fixtures were captured once by ``tools/capture_round4_golden.py``
-    from the **pre-restructure** processor (D-R2.0); this pin re-runs the
-    case through the current code and demands the same bytes - the returned
-    IMAGE tensor, the KEEP call shapes (the chunk boundaries are a quality
+    The fixtures were captured by ``tools/capture_round4_golden.py`` and
+    re-captured in round 6, after the owner-authorized pixel changes (Opt 1
+    - the GPU crop - and Opt 3 - the float32 normalization and smoothing);
+    they are the round-6 pixel-policy baseline.  This pin re-runs the case
+    through the current code and demands the same bytes - the returned IMAGE
+    tensor, the KEEP call shapes (the chunk boundaries are a quality
     contract) and the parse-call count.  ``single_seq`` is all sub-512
     (every frame carries the vendored upscale, so the re-derived crop
     source of the fused loop is exercised), ``multiface_seq`` has the gray
@@ -896,13 +907,18 @@ def test_the_crop_staging_stays_bounded_by_the_clip_length(
 
     4 frames x 10 faces through the real helper and the multi-face branch
     (``max_clip_length=10``): every ``np.empty`` / ``np.stack`` allocation
-    of the run is recorded.  The uint8 512-crop-shaped ``np.empty`` calls
+    of the run is recorded.  The 4-D ``(…, 3)`` uint8 ``np.empty`` calls
     must stay at or below one chunk of rows - the single exception is
-    D-R2.2.3's preallocated restored stack (the result, one allocation) -
-    and no ``np.stack`` of crops exists at all (the old crop list plus its
-    stack, the 2x staging peak, is gone).  Every frame carries faces and
-    none is gray, so both paste pass-through gates hold (D-R2.3.2) and
-    even the paste faces stack disappears from the record.
+    D-R2.2.3's preallocated restored stack (the result, one allocation),
+    told apart by its ``shape[0] == total_faces``.  Since the batched crop
+    (Opt 1) stages the **detection frames** (pre-warp), the staging rows
+    carry the detection image's shape - the filter no longer assumes the
+    512-crop shape (the frames sit at the 512 floor, so the staging is
+    ``(rows, 512, 640, 3)`` here).  No ``np.stack`` of crops exists at all
+    (the old crop list plus its stack, the 2x staging peak, is gone).
+    Every frame carries faces and none is gray, so both paste pass-through
+    gates hold (D-R2.3.2) and even the paste faces stack disappears from
+    the record.
     """
     faces_per_frame = [_ten_faces(row) for row in range(4)]
     face_helper = make_helper(use_parse=True)
@@ -933,10 +949,11 @@ def test_the_crop_staging_stays_bounded_by_the_clip_length(
     total_faces = 40
     crops = [
         (kind, shape) for kind, shape, dtype in allocs
-        if len(shape) == 4 and shape[1:] == (512, 512, 3) and dtype == np.uint8
+        if kind == "empty" and len(shape) == 4 and shape[-1] == 3
+        and dtype == np.uint8
     ]
     # the preallocated restored stack (D-R2.2.3) is the only unbounded one
-    restored = [shape for kind, shape in crops if kind == "empty" and shape[0] == total_faces]
+    restored = [shape for kind, shape in crops if shape[0] == total_faces]
     assert len(restored) == 1, crops
     staging = [(kind, shape) for kind, shape in crops if shape[0] != total_faces]
     assert staging, "the fused loop must allocate its chunk staging through np.empty"

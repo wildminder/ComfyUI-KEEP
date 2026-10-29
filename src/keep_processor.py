@@ -19,6 +19,7 @@ from .keep_image_utils import (
     resize_bgr_u8,
 )
 from .keep_gpu_ops import (
+    crop_faces_batch,
     estimate_affines,
     inverse_affines,
     tensor2img_batch,
@@ -84,6 +85,22 @@ def interpolate_sequence(sequence):
     return interpolated_sequence
 
 
+def _group_by_shape(frames: dict[int, np.ndarray],
+                    indices) -> dict[tuple[int, int], list[int]]:
+    """Group ``indices`` by the ``(height, width)`` of their detection image.
+
+    The batched crop warps one source-shape group per call: all frames of a
+    clip share ``(h, w)``, and the vendored ``read_image`` upscale maps the
+    sub-512 frames to one second shape, so in practice exactly one group
+    comes back.  The groups keep the insertion order of the first
+    occurrence, and every member list keeps the order of ``indices``.
+    """
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index in indices:
+        groups.setdefault(tuple(frames[index].shape[:2]), []).append(index)
+    return groups
+
+
 def _gaussian_smooth(values: np.ndarray, sigma: float = 5.0) -> np.ndarray:
     """Smooth a ``(frames, values)`` array along the frame axis.
 
@@ -92,20 +109,35 @@ def _gaussian_smooth(values: np.ndarray, sigma: float = 5.0) -> np.ndarray:
     implementation's own formula (``exp(-x**2 / (2*sigma**2))`` normalized
     by its sum, with the radius ``int(truncate * sigma + 0.5)`` of the
     ``truncate=4.0`` default), the boundary extension is symmetric (the
-    reference ``mode="reflect"``) and the correlation runs as a float64
-    depthwise ``conv1d`` - one channel per value column.  The output keeps
-    the dtype of the input; the measured difference against the reference is
-    ~4e-14 in float64 (``tests/test_image_op_equivalence.py``).
+    reference ``mode="reflect"``) and the correlation runs as a depthwise
+    ``conv1d`` - one channel per value column.
+
+    The whole chain runs in **float32** (round 6, Opt 3), same decision as
+    :func:`bgr_u8_batch_to_normalized`: the float64 positions / kernel /
+    signal doubled the transient bytes of the whole-clip ``(frames, 10)``
+    landmark array for a one-ulp-at-the-landmark-magnitude difference.  The
+    kernel still sums to one, so the landmarks move by at most
+    ``2**-23 * magnitude`` (~1e-4 px at the 512 landmark scale) - orders
+    below the warp tolerance the crops already carry, which is why the
+    sequence golden fixtures were regenerated rather than re-toleranced in
+    e5.  The output keeps the dtype of the input: float32 landmarks in,
+    float32 landmarks out (the ``conv1d`` result is cast back exactly once);
+    the measured difference against the scipy (float64) reference is
+    ~1e-5 (``tests/test_image_op_equivalence.py``).
+
+    There is **no** ``device`` parameter on purpose: the sole call site is a
+    ``(frames, 10)`` host array, and a CPU float32 ``conv1d`` is already the
+    cheaper of the two.
     """
     source = np.asarray(values)
     radius = int(4.0 * sigma + 0.5)
-    positions = torch.arange(-radius, radius + 1, dtype=torch.float64)
+    positions = torch.arange(-radius, radius + 1, dtype=torch.float32)
     kernel = torch.exp(-(positions**2) / (2.0 * sigma**2))
     kernel = (kernel / kernel.sum()).view(1, 1, -1)
     # ``mode="reflect"`` of the reference == numpy ``mode="symmetric"``: the
     # edges are mirrored with the edge value repeated.
     padded = np.pad(source, ((radius, radius), (0, 0)), mode="symmetric")
-    signal = torch.from_numpy(padded).double().T.unsqueeze(0)
+    signal = torch.from_numpy(padded).to(torch.float32).T.unsqueeze(0)
     weight = kernel.repeat(signal.shape[1], 1, 1)
     smoothed = F.conv1d(signal, weight, groups=signal.shape[1])
     result = smoothed.squeeze(0).T.contiguous().numpy()
@@ -420,6 +452,19 @@ class KEEPFaceProcessor:
         if not has_aligned and not only_center_face:
             return self._process_image_multiface(
                 cv2_image_orig, final_upscale_factor, draw_box)
+        # The aligned fast path (round 6, Opt 5, design section 5.2): the node
+        # hands the processor an **already aligned** 512x512 face, so the
+        # detection / crop / paste stages have nothing left to do and the
+        # whole pipeline is one resize, one KEEP call and one output resize
+        # (see :meth:`_restore_aligned_torch`).  The dispatch is in the
+        # processor (not in the node): the node pins assert ``process_image``
+        # is called, and the dispatch point is the only way to keep the
+        # duplicate-to-2 contract, the black-face guard and the offload-always
+        # ``finally`` in one place.  A configured face upsampler keeps the
+        # standard pipeline (the precondition below) - the fast path never
+        # applies one.
+        if has_aligned and self.face_upscale_model is None:
+            return self._restore_aligned_torch(cv2_image_orig, final_upscale_factor)
 
         try:
             self.face_helper.upscale_factor = final_upscale_factor
@@ -540,6 +585,74 @@ class KEEPFaceProcessor:
             # the list clear by reference.
             self.face_helper.clean_all()
             self.face_helper.input_img = None
+
+    @torch.no_grad()
+    def _restore_aligned_torch(self, cv2_image_orig: np.ndarray,
+                               final_upscale_factor: float) -> np.ndarray:
+        """The aligned single-image fast path (round 6, Opt 5).
+
+        ``has_aligned_face=True`` means the uploader already cropped and
+        aligned a face: the detection, the crop, the vendored paste and the
+        two ``512`` resizes of the standard leg all collapse into the one
+        resize that feeds the net, so the aligned leg runs **on the device**
+        without touching the face helper, the vendored ``img2tensor`` chain
+        or the vendored paste.
+
+        Deviations from the standard aligned leg (the owner-authorized pixel
+        changes of the design):
+
+        1. the input resize is the torch-native bilinear
+           :func:`torch.nn.functional.interpolate` on the float tensor - the
+           standard leg routes through :func:`resize_bgr_u8`
+           (``keep_processor.py:509``), which rounds to uint8 first;
+        2. the KEEP input tail keeps the spec's order: **``/255`` first, then**
+           the normalize.  ``img2tensor(cropped / 255.)``
+           (``keep_processor.py:515``) put the face in ``[0, 1]`` *before* the
+           ``(t - 0.5) / 0.5``; reordering the two would double the range
+           twice and feed the net ``~(-1, 509)`` instead of ``[-1, 1]``;
+        3. the final upscale is float **bicubic** - the standard leg runs
+           ``cv2.INTER_LANCZOS4`` on the uint8 face
+           (``keep_processor.py:572``);
+        4. the output quantizes at the very end, exactly like the vendored
+           ``tensor2img`` it replaces, so the return is the cv2 BGR ``uint8``
+           image the node expects - a float return would reach
+           ``cv2_to_comfy_image`` (``keep_image_utils.py:38-42``, no ndim
+           guard) and ``unsqueeze`` it into a 5-D "IMAGE" tensor.
+
+        The channel flips (BGR -> RGB before the net, RGB -> BGR on the way
+        out) exist because the node's ``comfy_image_to_cv2``
+        (``keep_image_utils.py:34``) hands this method cv2 BGR.  Both polls
+        survive - the io boundary one and the one after the KEEP call.
+        """
+        keep_interrupt.check_interrupted()
+        img = torch.from_numpy(np.ascontiguousarray(cv2_image_orig)).to(self.device)
+        # (H, W, 3) uint8 BGR -> (1, 3, 512, 512) float, bilinear.
+        img512 = F.interpolate(
+            img.permute(2, 0, 1).unsqueeze(0).float(),
+            size=(512, 512), mode="bilinear", align_corners=False)
+        # /255 first (the replaced tail's ``cropped_face_cv2 / 255``), then
+        # the BGR -> RGB flip and the normalize.
+        face_norm = img512[:, [2, 1, 0]].div_(255.0).sub_(0.5).div_(0.5)
+        input_seq = torch.cat([face_norm.unsqueeze(1), face_norm.unsqueeze(1)], dim=1)
+        net_output = self.keep_net(input_seq, need_upscale=False)   # (1, 2, 3, 512, 512)
+        keep_interrupt.check_interrupted()
+        restored = net_output[:, 0:1, ...].squeeze(0)               # (1, 3, 512, 512) RGB
+        restored = restored.clamp(-1, 1).add(1).div_(2)             # denormalize -> [0, 1]
+        # The all-black guard (the analogue of ``keep_processor.py:540``): a
+        # black restore returns the original, checked on the tensor before
+        # the quantization.
+        if not restored.any():
+            return cv2_image_orig
+        target = (int(512 * final_upscale_factor), int(512 * final_upscale_factor))
+        # The size check mirrors the standard leg (``keep_processor.py:566``):
+        # a factor below 1 still resizes.
+        if restored.shape[-1] != target[0] or restored.shape[-2] != target[1]:
+            restored = F.interpolate(
+                restored, size=target, mode="bicubic", align_corners=False)
+        # ``restored[0]`` drops the batch dim - ``process_image`` returns
+        # (H, W, 3).
+        return (restored[0].mul(255.0).round().clamp_(0, 255).to(torch.uint8)
+                .permute(1, 2, 0)[..., [2, 1, 0]].cpu().numpy())  # (H, W, 3) BGR uint8
 
     def _process_image_multiface(self, cv2_image_orig: np.ndarray,
                                  final_upscale_factor: float, draw_box: bool) -> np.ndarray:
@@ -878,93 +991,112 @@ class KEEPFaceProcessor:
 
             # The fused, chunk-bounded crop + restore (D-R2.2): the same
             # global chunks the restore always ran (``max_clip_length``
-            # frames - the quality contract, G4).  Per chunk the warps are
-            # staged into a preallocated ``max_clip_length``-bounded array
-            # (no list, no ``np.stack`` of the clip) and the restored rows
-            # land in one preallocated whole-clip stack through the
+            # frames - the quality contract, G4).  Per chunk the crops are
+            # warped in one batched device op per source-shape group from a
+            # preallocated ``max_clip_length``-bounded staging array (no
+            # list, no ``np.stack`` of the clip) and the restored rows land
+            # in one preallocated whole-clip stack through the
             # row-independent per-chunk ``tensor2img_batch`` - no whole-clip
             # device batch, no whole-clip tensor2img transient.
             all_restored_faces_cv2 = np.empty(
                 (num_input_frames, 512, 512, 3), np.uint8)
             logger.info("Restoring faces with KEEP")
-            for start_idx in range(0, num_input_frames, max_clip_length):
-                keep_interrupt.check_interrupted()
-                end_idx = min(start_idx + max_clip_length, num_input_frames)
-                if has_aligned_frames:
-                    # The aligned frames need no landmark/upscale
-                    # derivation: the chunk's frames convert, resize and
-                    # stack chunk-locally (the values of the whole-clip
-                    # stack, one chunk at a time).
-                    aligned_rows = comfy_batch_to_bgr_u8(
-                        image_sequence_tensor[start_idx:end_idx])
-                    resized_faces = [resize_bgr_u8(frame, (512, 512))
-                                     for frame in aligned_rows]
-                    del aligned_rows
-                    aligned_u8 = torch.from_numpy(
-                        np.stack(resized_faces)).permute(0, 3, 1, 2).to(self.device)
-                    del resized_faces
-                    current_clip_faces = bgr_u8_batch_to_normalized(aligned_u8)
-                    del aligned_u8
-                else:
-                    croppable_rows = [i for i in range(start_idx, end_idx)
-                                      if affine_matrices[i] is not None]
-                    staged_u8 = np.empty((len(croppable_rows), 512, 512, 3), np.uint8)
-                    # The crop step calls into the vendored facelib: its
-                    # console writes are routed to the logger of the pack
-                    # (D4) - the derivation's ``read_image`` included.
-                    with capture_console_to_logger():
-                        # The chunk's detection images in ONE group pass
-                        # (D-R2.2.1, grouped): the conversion is elementwise,
-                        # so the rows are bitwise the rows the per-row form
-                        # produced - one host transfer per chunk instead of
-                        # one per row.
-                        chunk_detection_frames = (
-                            self._detection_frames(
-                                image_sequence_tensor, croppable_rows,
-                                needs_upscale)
-                            if croppable_rows else {})
-                        for row, i in enumerate(croppable_rows):
-                            staged_u8[row] = cv2.warpAffine(
-                                chunk_detection_frames[i],
-                                affine_matrices[i], (512, 512),
-                                borderMode=cv2.BORDER_CONSTANT,
-                                borderValue=(135, 133, 132),
-                            )
-                    del chunk_detection_frames
-                    # The frames without a (croppable) face carry the base's
-                    # neutral crop (``torch.zeros(3, 512, 512) * 0.5`` of the
-                    # base - 0.5 in the normalized scale, not 0): the
-                    # chunk-local fill of the whole-clip tensor's values.
-                    current_clip_faces = torch.full(
-                        (end_idx - start_idx, 3, 512, 512), 0.5,
-                        dtype=torch.float32, device=self.device)
-                    if croppable_rows:
-                        warped = bgr_u8_batch_to_normalized(
-                            torch.from_numpy(staged_u8).permute(0, 3, 1, 2).to(self.device))
-                        current_clip_faces[torch.as_tensor(
-                            [i - start_idx for i in croppable_rows],
-                            dtype=torch.long, device=self.device)] = warped
-                        del warped
-                    del staged_u8
-                batched_clip_faces = current_clip_faces.unsqueeze(0)
-                if batched_clip_faces.shape[1] == 1:
-                    current_clip_faces_for_net = torch.cat(
-                        [batched_clip_faces, batched_clip_faces], dim=1)
-                    clip_output_tensor = self.keep_net(
-                        current_clip_faces_for_net, need_upscale=False)
-                    kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
-                else:
-                    clip_output_tensor = self.keep_net(
-                        batched_clip_faces, need_upscale=False)
-                    kept_clip_tensor = clip_output_tensor
-                restored_u8 = tensor2img_batch(kept_clip_tensor.squeeze(0), min_max=(-1, 1))
-                all_restored_faces_cv2[start_idx:end_idx] = restored_u8
-                del (current_clip_faces, batched_clip_faces, clip_output_tensor,
-                     kept_clip_tensor, restored_u8)
-                progress.update(end_idx - start_idx)
-                # P4.6: the chunk boundary - the cached blocks of the finished
-                # chunk are released before the next chunk is allocated.
+            try:
+                for start_idx in range(0, num_input_frames, max_clip_length):
+                    keep_interrupt.check_interrupted()
+                    end_idx = min(start_idx + max_clip_length, num_input_frames)
+                    if has_aligned_frames:
+                        # The aligned frames need no landmark/upscale
+                        # derivation: the chunk's frames convert, resize and
+                        # stack chunk-locally (the values of the whole-clip
+                        # stack, one chunk at a time).
+                        aligned_rows = comfy_batch_to_bgr_u8(
+                            image_sequence_tensor[start_idx:end_idx])
+                        resized_faces = [resize_bgr_u8(frame, (512, 512))
+                                         for frame in aligned_rows]
+                        del aligned_rows
+                        aligned_u8 = torch.from_numpy(
+                            np.stack(resized_faces)).permute(0, 3, 1, 2).to(self.device)
+                        del resized_faces
+                        current_clip_faces = bgr_u8_batch_to_normalized(aligned_u8)
+                        del aligned_u8
+                    else:
+                        croppable_rows = [i for i in range(start_idx, end_idx)
+                                          if affine_matrices[i] is not None]
+                        # The frames without a (croppable) face carry the
+                        # base's neutral crop (``torch.zeros(3, 512, 512) *
+                        # 0.5`` of the base - 0.5 in the normalized scale,
+                        # not 0): the chunk-local fill of the whole-clip
+                        # tensor's values.
+                        current_clip_faces = torch.full(
+                            (end_idx - start_idx, 3, 512, 512), 0.5,
+                            dtype=torch.float32, device=self.device)
+                        if croppable_rows:
+                            # The crop step calls into the vendored facelib:
+                            # its console writes are routed to the logger of
+                            # the pack (D4) - the derivation's ``read_image``
+                            # included.
+                            with capture_console_to_logger():
+                                # The chunk's detection images in ONE group
+                                # pass (D-R2.2.1, grouped): the conversion is
+                                # elementwise, so the rows are bitwise the
+                                # rows the per-row form produced - one host
+                                # transfer per chunk instead of one per row.
+                                chunk_detection_frames = self._detection_frames(
+                                    image_sequence_tensor, croppable_rows,
+                                    needs_upscale)
+                                # One batched device warp per source-shape
+                                # group replaces the per-row
+                                # ``cv2.warpAffine``: the staging holds the
+                                # detection frames (pre-warp) and stays
+                                # bounded by the chunk (at most
+                                # ``max_clip_length`` rows - in practice
+                                # exactly one group).
+                                for (h, w), members in _group_by_shape(
+                                        chunk_detection_frames,
+                                        croppable_rows).items():
+                                    staged_u8 = np.empty(
+                                        (len(members), h, w, 3), np.uint8)
+                                    for row, i in enumerate(members):
+                                        staged_u8[row] = chunk_detection_frames[i]
+                                    batch = torch.from_numpy(staged_u8).permute(
+                                        0, 3, 1, 2).to(self.device)
+                                    del staged_u8
+                                    warped_u8 = crop_faces_batch(
+                                        batch,
+                                        [affine_matrices[i] for i in members],
+                                        (512, 512))
+                                    del batch
+                                    current_clip_faces[torch.as_tensor(
+                                        [i - start_idx for i in members],
+                                        dtype=torch.long, device=self.device)] = (
+                                        bgr_u8_batch_to_normalized(warped_u8))
+                                    del warped_u8
+                            del chunk_detection_frames
+                    batched_clip_faces = current_clip_faces.unsqueeze(0)
+                    if batched_clip_faces.shape[1] == 1:
+                        current_clip_faces_for_net = torch.cat(
+                            [batched_clip_faces, batched_clip_faces], dim=1)
+                        clip_output_tensor = self.keep_net(
+                            current_clip_faces_for_net, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
+                    else:
+                        clip_output_tensor = self.keep_net(
+                            batched_clip_faces, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor
+                    restored_u8 = tensor2img_batch(
+                        kept_clip_tensor.squeeze(0), min_max=(-1, 1))
+                    all_restored_faces_cv2[start_idx:end_idx] = restored_u8
+                    del (current_clip_faces, batched_clip_faces,
+                         clip_output_tensor, kept_clip_tensor, restored_u8)
+                    progress.update(end_idx - start_idx)
+            except torch.cuda.OutOfMemoryError:
+                # The finished chunk's device transients die with the
+                # exception; the release hands the cached blocks back before
+                # ComfyUI sees the failure, and the exception propagates
+                # unchanged (fail loudly).  On CPU the clause never matches.
                 _soft_empty_cache()
+                raise
 
             # D-R2.3.1: convert-in #2 - the detection / crop / restore window
             # ran with no whole-clip uint8 BGR alive; the paste stage needs
@@ -1154,6 +1286,11 @@ class KEEPFaceProcessor:
             # the return carries survive the list clears by reference.
             self.face_helper.clean_all()
             self.face_helper.input_img = None
+            # P4.6 (Opt 6): the release is per run, not per chunk - the
+            # chunk shapes repeat, so the caching allocator reuses its
+            # blocks instead of accumulating, and the cached ones are
+            # handed back once, when the run is done.
+            _soft_empty_cache()
 
     def _process_sequence_multiface(self,
                                     image_sequence_tensor: torch.Tensor,
@@ -1289,70 +1426,100 @@ class KEEPFaceProcessor:
 
             # The fused, chunk-bounded crop + restore (D-R2.2): the same
             # global face chunks the restore always ran (``max_clip_length``
-            # faces).  Per chunk the warps stage into a preallocated
-            # ``max_clip_length``-bounded array - the involved frames are
-            # derived once (at most ``max_clip_length + 1`` of them, a
-            # frame's faces are contiguous) - and the restored rows land in
-            # one preallocated whole-clip stack through the row-independent
-            # per-chunk ``tensor2img_batch``.  The poll cadence is today's,
-            # interleaved: the chunk top (the restore loop's) and the per
-            # face (the crop loop's).
+            # faces).  Per chunk the crops are warped in one batched device
+            # op per source-shape group from a preallocated
+            # ``max_clip_length``-bounded staging array - the involved
+            # frames are derived once (at most ``max_clip_length + 1`` of
+            # them, a frame's faces are contiguous) - and the restored rows
+            # land in one preallocated whole-clip stack through the
+            # row-independent per-chunk ``tensor2img_batch``.  The poll
+            # cadence is today's, interleaved: the chunk top (the restore
+            # loop's) and the per face (the staging row copy's).
             all_restored_faces_cv2 = np.empty((total_faces, 512, 512, 3), np.uint8)
             logger.info("Restoring faces with KEEP")
-            for start_idx in range(0, total_faces, max_clip_length):
-                keep_interrupt.check_interrupted()
-                end_idx = min(start_idx + max_clip_length, total_faces)
-                staged_u8 = np.empty((end_idx - start_idx, 512, 512, 3), np.uint8)
-                # The crop step calls into the vendored facelib: its console
-                # writes are routed to the logger of the pack (D4) - the
-                # derivation's ``read_image`` included.
-                with capture_console_to_logger():
-                    # The chunk's involved frames in ONE group pass
-                    # (D-R2.2.1, grouped): the conversion is elementwise, so
-                    # the rows are bitwise the rows the per-row form produced
-                    # - one host transfer per chunk instead of one per
-                    # involved frame (a frame's faces are contiguous, so the
-                    # involved frames stay ``max_clip_length``-bounded).
-                    chunk_frames = self._detection_frames(
-                        image_sequence_tensor,
-                        face_frames[start_idx:end_idx], needs_upscale)
-                    for row, k in enumerate(range(start_idx, end_idx)):
-                        # The per-face poll of today's crop loop (the cadence
-                        # pin counts it; the chunk top polled above).
-                        keep_interrupt.check_interrupted()
-                        staged_u8[row] = cv2.warpAffine(
-                            chunk_frames[face_frames[k]], face_affines[k], (512, 512),
-                            borderMode=cv2.BORDER_CONSTANT,
-                            borderValue=(135, 133, 132),
-                        )
-                chunk_batch = bgr_u8_batch_to_normalized(
-                    torch.from_numpy(staged_u8).permute(0, 3, 1, 2).to(self.device))
-                del staged_u8, chunk_frames
-                # The flattened faces-only batch: the time axis is the faces,
-                # not the frames (design section 3.2) - the frames without a
-                # face contribute no entry.
-                current_clip_faces = chunk_batch.unsqueeze(0)
-                del chunk_batch
-                # The 1-entry chunk keeps the duplicate-to-2 trick, the
-                # progress counts faces.
-                if current_clip_faces.shape[1] == 1:
-                    current_clip_faces_for_net = torch.cat(
-                        [current_clip_faces, current_clip_faces], dim=1)
-                    clip_output_tensor = self.keep_net(
-                        current_clip_faces_for_net, need_upscale=False)
-                    kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
-                else:
-                    clip_output_tensor = self.keep_net(
-                        current_clip_faces, need_upscale=False)
-                    kept_clip_tensor = clip_output_tensor
-                restored_u8 = tensor2img_batch(kept_clip_tensor.squeeze(0), min_max=(-1, 1))
-                all_restored_faces_cv2[start_idx:end_idx] = restored_u8
-                del (current_clip_faces, clip_output_tensor, kept_clip_tensor,
-                     restored_u8)
-                progress.update(end_idx - start_idx)
-                # P4.6: the chunk boundary - the cached blocks of the finished
-                # chunk are released before the next chunk is allocated.
+            try:
+                for start_idx in range(0, total_faces, max_clip_length):
+                    keep_interrupt.check_interrupted()
+                    end_idx = min(start_idx + max_clip_length, total_faces)
+                    # The flattened faces-only batch: the time axis is the
+                    # faces, not the frames (design section 3.2) - the
+                    # frames without a face contribute no entry.  Every face
+                    # of the chunk carries a valid affine (the
+                    # ``croppable`` filter above), so the preallocated chunk
+                    # tensor is fully written by the shape groups below.
+                    current_clip_faces = torch.empty(
+                        (end_idx - start_idx, 3, 512, 512),
+                        dtype=torch.float32, device=self.device)
+                    # The crop step calls into the vendored facelib: its
+                    # console writes are routed to the logger of the pack
+                    # (D4) - the derivation's ``read_image`` included.
+                    with capture_console_to_logger():
+                        # The chunk's involved frames in ONE group pass
+                        # (D-R2.2.1, grouped): the conversion is elementwise,
+                        # so the rows are bitwise the rows the per-row form
+                        # produced - one host transfer per chunk instead of
+                        # one per involved frame (a frame's faces are
+                        # contiguous, so the involved frames stay
+                        # ``max_clip_length``-bounded).
+                        chunk_frames = self._detection_frames(
+                            image_sequence_tensor,
+                            face_frames[start_idx:end_idx], needs_upscale)
+                        # One batched device warp per source-shape group
+                        # replaces the per-face ``cv2.warpAffine``: the
+                        # staging holds the detection frames (pre-warp) and
+                        # stays bounded by the chunk (at most
+                        # ``max_clip_length`` rows - in practice one group).
+                        chunk_faces = {
+                            k: chunk_frames[face_frames[k]]
+                            for k in range(start_idx, end_idx)}
+                        for (h, w), members in _group_by_shape(
+                                chunk_faces, range(start_idx, end_idx)).items():
+                            staged_u8 = np.empty((len(members), h, w, 3), np.uint8)
+                            for row, k in enumerate(members):
+                                # The per-face poll of today's crop loop (the
+                                # cadence pin counts it; the chunk top
+                                # polled above).
+                                keep_interrupt.check_interrupted()
+                                staged_u8[row] = chunk_faces[k]
+                            batch = torch.from_numpy(staged_u8).permute(
+                                0, 3, 1, 2).to(self.device)
+                            del staged_u8
+                            warped_u8 = crop_faces_batch(
+                                batch, [face_affines[k] for k in members],
+                                (512, 512))
+                            del batch
+                            current_clip_faces[torch.as_tensor(
+                                [k - start_idx for k in members],
+                                dtype=torch.long, device=self.device)] = (
+                                bgr_u8_batch_to_normalized(warped_u8))
+                            del warped_u8
+                    del chunk_faces, chunk_frames
+                    current_clip_faces = current_clip_faces.unsqueeze(0)
+                    # The 1-entry chunk keeps the duplicate-to-2 trick, the
+                    # progress counts faces.
+                    if current_clip_faces.shape[1] == 1:
+                        current_clip_faces_for_net = torch.cat(
+                            [current_clip_faces, current_clip_faces], dim=1)
+                        clip_output_tensor = self.keep_net(
+                            current_clip_faces_for_net, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
+                    else:
+                        clip_output_tensor = self.keep_net(
+                            current_clip_faces, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor
+                    restored_u8 = tensor2img_batch(
+                        kept_clip_tensor.squeeze(0), min_max=(-1, 1))
+                    all_restored_faces_cv2[start_idx:end_idx] = restored_u8
+                    del (current_clip_faces, clip_output_tensor, kept_clip_tensor,
+                         restored_u8)
+                    progress.update(end_idx - start_idx)
+            except torch.cuda.OutOfMemoryError:
+                # The finished chunk's device transients die with the
+                # exception; the release hands the cached blocks back before
+                # ComfyUI sees the failure, and the exception propagates
+                # unchanged (fail loudly).  On CPU the clause never matches.
                 _soft_empty_cache()
+                raise
 
             # The faces of every frame, in detection order - the fused loop
             # keeps the entries ordered by (frame index, detection index).
@@ -1519,3 +1686,9 @@ class KEEPFaceProcessor:
             # detected frame used to survive the run in ``input_img``.
             self.face_helper.clean_all()
             self.face_helper.input_img = None
+            # P4.6 (Opt 6): the per-run release - the chunk-boundary clears
+            # are gone (see ``process_image_sequence``).  On the multi-face
+            # dispatch path this finally runs in addition to the outer one:
+            # two idempotent releases per run, cheap when there is nothing
+            # to release.
+            _soft_empty_cache()

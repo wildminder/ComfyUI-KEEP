@@ -148,39 +148,57 @@ def test_gray_to_bgr_equals_cv2_and_stays_writable(processor):
 
 @pytest.mark.unit
 def test_gaussian_smooth_matches_scipy_in_float64(processor):
-    """The torch smoothing equals scipy to 1e-10 (float64, the probe ran 4.3e-14)."""
+    """The torch smoothing equals scipy to 1e-4 (float32 compute, Opt 3).
+
+    The input is a float64 array, so the **specific contract** is that the
+    output dtype equals the input dtype (the ``.astype(source.dtype)`` cast
+    back of the function) - the compute itself is float32 now.  The bound is
+    the float32 residual of the kernel positions, the kernel sum and the
+    conv accumulation against scipy's float64 reference: ``2**-23`` relative
+    at the signal magnitude, i.e. ~1e-5 at the 100-scale below.  The
+    precedent is the float32-landmark pin's 1e-4 (:200 below).
+    """
     scipy_gaussian = pytest.importorskip("scipy.ndimage")
     rng = np.random.default_rng(42)
     for num_frames in (3, 5, 20, 51, 200):
         values = rng.normal(size=(num_frames, 10)) * 100.0
         reference = scipy_gaussian.gaussian_filter1d(values, sigma=5, axis=0)
         smoothed = processor._gaussian_smooth(values, sigma=5.0)
-        assert smoothed.dtype == np.float64
+        assert smoothed.dtype == values.dtype, (
+            "the output must keep the dtype of the input"
+        )
         diff = np.abs(reference - smoothed).max()
-        assert diff <= 1e-10, f"n={num_frames}: the difference is {diff:.3e}"
+        assert diff <= 1e-4, f"n={num_frames}: the difference is {diff:.3e}"
 
 
 @pytest.mark.unit
 def test_gaussian_smooth_matches_scipy_for_other_sigmas(processor):
-    """The kernel formula holds for the sigma neighbourhood of the call site."""
+    """The kernel formula holds for the sigma neighbourhood of the call site.
+
+    Same float32-compute rationale and the same documented 1e-4 bound as
+    ``test_gaussian_smooth_matches_scipy_in_float64``.
+    """
     scipy_gaussian = pytest.importorskip("scipy.ndimage")
     rng = np.random.default_rng(5)
     values = rng.normal(size=(40, 10)) * 100.0
     for sigma in (1.0, 2.5, 5.0):
         reference = scipy_gaussian.gaussian_filter1d(values, sigma=sigma, axis=0)
         smoothed = processor._gaussian_smooth(values, sigma=sigma)
+        assert smoothed.dtype == values.dtype
         diff = np.abs(reference - smoothed).max()
-        assert diff <= 1e-10, f"sigma={sigma}: the difference is {diff:.3e}"
+        assert diff <= 1e-4, f"sigma={sigma}: the difference is {diff:.3e}"
 
 
 @pytest.mark.unit
 def test_gaussian_smooth_keeps_the_float32_dtype_of_the_landmarks(processor):
     """The landmarks arrive as float32 - the output stays float32, like scipy's.
 
-    Both implementations compute in float64 and cast the final value once, so
-    the measured difference on the probe data is 0 (bit-equal); the bound is
-    one float32 ulp at the landmark magnitude, in case a value lands on a
-    rounding boundary.
+    The landmarks of the sequence path are the ``float32`` arrays the
+    detector produced, so this pin is the shape of the real call site
+    (``keep_processor.py``): float32 in, float32 out, with the 1e-4 bound of
+    the float32 compute (the radius-20 kernel reads ~40 taps whose float32
+    accumulation against scipy's float64 drifts a couple of ulp at the
+    512-magnitude - the measured difference is in the 1e-5..1e-4 px band).
     """
     scipy_gaussian = pytest.importorskip("scipy.ndimage")
     rng = np.random.default_rng(9)
@@ -290,3 +308,29 @@ def test_resize_lanczos_u8_on_the_gpu_matches_the_cpu_result(gpu_ops):
     gpu = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cuda"))
     diff = (cpu.float() - gpu.float().cpu()).abs().max()
     assert diff <= 4, f"the GPU result drifted {diff:.1f} levels"
+
+
+@pytest.mark.unit
+def test_the_lanczos_axis_cache_is_transparent(gpu_ops):
+    """The Lanczos axis-matrix cache changes no value and no device.
+
+    (a) two calls of the cached builder with the same sizes return the
+    **same object**; (b) the cached matrix is the one the uncached builder
+    returns; (c) a resize on a warm cache is bit-identical to a cold-cache
+    run (the cache cleared between the two compared runs).  The cache
+    holds the numpy array - the ``.to(device)`` stays per call, so one
+    entry serves both devices.
+    """
+    cached = gpu_ops._lanczos_axis_matrix_cached
+    cached.cache_clear()
+    matrix = cached(240, 480)
+    assert cached(240, 480) is matrix
+    assert np.array_equal(matrix, gpu_ops._lanczos_axis_matrix(240, 480))
+
+    frames = _lanczos_corpus(240, 320, 7)
+    gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu"))
+    warm = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu"))
+    cached.cache_clear()
+    cold = gpu_ops.resize_lanczos_u8(frames, (480, 360), torch.device("cpu"))
+    assert torch.equal(warm, cold)
+    cached.cache_clear()
