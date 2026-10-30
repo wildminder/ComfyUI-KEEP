@@ -232,12 +232,30 @@ def test_the_vram_is_released_through_comfyui(processor_module):
 def test_the_sequence_releases_the_vram_once_per_run(
     processor_module, monkeypatch
 ):
-    """P4.6 (Opt 6): the sequence releases the cached VRAM once per run.
+    """P4.6 (Opt 6) + round 7 (the paste-budget repair): the release cadence.
 
     30 frames with ``max_clip_length=20`` are two chunks - the chunk
-    boundaries do **not** release any more (the chunk shapes repeat, so the
-    caching allocator reuses its blocks instead of accumulating); the one
-    release comes from the ``finally`` when the run is done.
+    boundaries do **not** release (the chunk shapes repeat, so the caching
+    allocator reuses its blocks instead of accumulating).  A clean run now
+    releases **twice**:
+
+    1. the round-7 pre-paste release - after the restore loop's last
+       ``del`` and before the paste stage: the paste-mode verdict
+       (``device_output_mode``, ``keep_gpu_paste.py``) reads the **free**
+       VRAM through ComfyUI's ``get_free_memory(..., torch_free_too=True)``,
+       which counts what the torch cache can give back, so the cached
+       restore blocks hoard exactly the memory the verdict reads - the
+       budget shrinks, the mode flips to ``host`` and the paste takes the
+       host-CPU assembly (the round-6 owner's paste-stage stall).  The
+       release restores the pre-Opt-6 budget before the verdict, and
+    2. the ``finally`` release when the run is done.
+
+    An OOM run still releases twice for a different reason: the ``except``
+    handler before the ``raise``, then the ``finally`` - the pre-paste
+    site is not reached on OOM (the sibling OOM pin below).
+
+    (The round-6 id is kept for traceability with the run docs; the
+    cadence it pins changed in round 7.)
     """
     events: list[str] = []
 
@@ -263,7 +281,7 @@ def test_the_sequence_releases_the_vram_once_per_run(
         max_clip_length=20,
     )
 
-    assert events == ["net", "net", "empty_cache"], events
+    assert events == ["net", "net", "empty_cache", "empty_cache"], events
 
 
 @pytest.mark.mock_integration
@@ -306,6 +324,58 @@ def test_an_oom_in_the_restore_loop_releases_the_vram_and_propagates(
         )
 
     assert events == ["empty_cache", "empty_cache"], events
+
+
+@pytest.mark.mock_integration
+def test_the_pre_paste_release_fires_before_the_paste_stage(
+    processor_module, monkeypatch
+):
+    """Round 7 (the paste-budget repair): the release precedes the paste stage.
+
+    On the single-face path the pre-paste release must land **before** the
+    paste stage begins: the paste helper (``_batched_paste``) is the first
+    paste-stage consult on the default branch (``has_aligned_frames=False``)
+    and its mode verdict (``device_output_mode``) reads the cache-inclusive
+    free VRAM - a release after the verdict would be too late.  The helper
+    records its consult; the release event must precede it (one chunk - 3
+    frames, one ``net`` call; the ``finally`` release still closes the run).
+    """
+    events: list[str] = []
+
+    class _RecordingKeepNet(_StubKeepNet):
+        def __call__(self, frames, need_upscale=False):
+            events.append("net")
+            return super().__call__(frames, need_upscale=need_upscale)
+
+    monkeypatch.setattr(
+        processor_module, "_soft_empty_cache", lambda: events.append("empty_cache")
+    )
+    real_batched_paste = processor_module.KEEPFaceProcessor._batched_paste
+
+    def _recording_batched_paste(self, *args, **kwargs):
+        events.append("paste")
+        return real_batched_paste(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        processor_module.KEEPFaceProcessor, "_batched_paste", _recording_batched_paste
+    )
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_RecordingKeepNet(), face_helper)
+    )
+    frames = torch.rand((3, 64, 64, 3), dtype=torch.float32)
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    assert events == ["net", "empty_cache", "paste", "empty_cache"], events
 
 
 # ---------------------------------------------------------------------------

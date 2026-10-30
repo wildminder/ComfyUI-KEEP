@@ -1109,6 +1109,22 @@ class KEEPFaceProcessor:
             fallback_indices: list[int] = []
             device_canvas: torch.Tensor | None = None
             final_batch: torch.Tensor | None = None
+            # Round 7 (the paste-budget repair): the paste's mode verdict reads
+            # the **free** VRAM - ``device_canvas_budget`` (min of the 1 GiB cap
+            # and the free share, ``keep_gpu_paste.py:233-251``) through
+            # ComfyUI's ``get_free_memory(..., torch_free_too=True)``, which
+            # counts what the torch cache can give back
+            # (``keep_gpu_paste.py:178-192``).  Round 6 (Opt 6) deleted the
+            # per-chunk ``_soft_empty_cache()`` of the restore loop above, so
+            # the cached restore blocks hoard the memory the verdict reads: the
+            # budget shrinks, the mode flips from ``full`` / ``chunked`` to
+            # ``host``, and a clip that used to paste on the device takes the
+            # host CPU assembly (the owner's paste-stage stall).  One release
+            # here - after the last ``del`` of the restore loop and before the
+            # verdict - restores the pre-Opt-6 budget without the per-chunk
+            # sync cost Opt 6 removed (a single call per run, not one per
+            # chunk; the ``finally`` / OOM releases stay).
+            _soft_empty_cache()
             logger.info("Pasting faces and finalizing frames")
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
@@ -1537,6 +1553,22 @@ class KEEPFaceProcessor:
             fallback_indices: list[int] = []
             device_canvas: torch.Tensor | None = None
             final_batch: torch.Tensor | None = None
+            # Round 7 (the paste-budget repair): the paste's mode verdict reads
+            # the **free** VRAM - ``device_canvas_budget`` (min of the 1 GiB cap
+            # and the free share, ``keep_gpu_paste.py:233-251``) through
+            # ComfyUI's ``get_free_memory(..., torch_free_too=True)``, which
+            # counts what the torch cache can give back
+            # (``keep_gpu_paste.py:178-192``).  Round 6 (Opt 6) deleted the
+            # per-chunk ``_soft_empty_cache()`` of the restore loop above, so
+            # the cached restore blocks hoard the memory the verdict reads: the
+            # budget shrinks, the mode flips from ``full`` / ``chunked`` to
+            # ``host``, and a clip that used to paste on the device takes the
+            # host CPU assembly (the owner's paste-stage stall).  One release
+            # here - after the last ``del`` of the restore loop and before the
+            # verdict - restores the pre-Opt-6 budget without the per-chunk
+            # sync cost Opt 6 removed (a single call per run, not one per
+            # chunk; the ``finally`` / OOM releases stay).
+            _soft_empty_cache()
             logger.info("Pasting faces and finalizing frames")
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
