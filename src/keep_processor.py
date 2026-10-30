@@ -34,6 +34,7 @@ from .keep_gpu_paste import (
 )
 from .keep_logger import logger
 from .keep_progress import ProgressReporter
+from .keep_stage_progress import StageBar
 
 # Imports from vendored basicsr and facelib
 #
@@ -908,6 +909,9 @@ class KEEPFaceProcessor:
             group_size = max(1, max_clip_length)
             if not has_aligned_frames:
                 logger.info("Detecting face landmarks")
+                # The stage bar of the detection (the stage-bar design, D3
+                # #1): one tick per processed frame, face-less frames too.
+                detection_bar = StageBar("Detecting face landmarks", num_input_frames)
                 # The conversion spend is counted upfront (the group slices
                 # sum to the clip); the detection update lands after the
                 # pass, where the whole-clip loop used to report it.
@@ -950,7 +954,11 @@ class KEEPFaceProcessor:
                                     self.face_helper.all_landmarks_5[0].reshape((10,)))
                             else:
                                 raw_landmarks_list_video.append(np.array([np.nan] * 10))
+                            detection_bar.tick()
                         del bgr_group
+                # The final line lands before the all-NaN early return below:
+                # the early return carries the stage's bar line (D3 #1).
+                detection_bar.finish()
                 raw_landmarks_np_video = np.array(raw_landmarks_list_video)
                 if np.all(np.isnan(raw_landmarks_np_video)):
                     return image_sequence_tensor
@@ -978,16 +986,23 @@ class KEEPFaceProcessor:
                 with capture_console_to_logger():
                     valid_indices = [i for i in range(num_input_frames)
                                      if not np.isnan(avg_landmarks_sequence[i]).any()]
+                    # The stage bar of the crop (the stage-bar design, D3
+                    # #2): one tick per affine assignment; the aligned path
+                    # constructs no bar (its stage line stays alone).
+                    crop_bar = StageBar(
+                        "Cropping and aligning faces", len(valid_indices))
                     estimated_affines = estimate_affines(
                         [avg_landmarks_sequence[i] for i in valid_indices],
                         self.face_helper.face_template)
                     for i, affine_matrix in zip(valid_indices, estimated_affines):
                         affine_matrices[i] = affine_matrix
+                        crop_bar.tick()
                         if affine_matrix is None:
                             logger.warning(
                                 f"Warning: Could not estimate affine matrix for landmark set 0 "
                                 f"(frame {i}). Skipping this face."
                             )
+                    crop_bar.finish()
 
             # The fused, chunk-bounded crop + restore (D-R2.2): the same
             # global chunks the restore always ran (``max_clip_length``
@@ -1001,6 +1016,10 @@ class KEEPFaceProcessor:
             all_restored_faces_cv2 = np.empty(
                 (num_input_frames, 512, 512, 3), np.uint8)
             logger.info("Restoring faces with KEEP")
+            # The stage bar of the KEEP restore (the stage-bar design, D3
+            # #3): one tick of the chunk's frame count per chunk; an OOM
+            # leaves without the final line (the exception is the report).
+            restore_bar = StageBar("Restoring faces with KEEP", num_input_frames)
             try:
                 for start_idx in range(0, num_input_frames, max_clip_length):
                     keep_interrupt.check_interrupted()
@@ -1090,6 +1109,7 @@ class KEEPFaceProcessor:
                     del (current_clip_faces, batched_clip_faces,
                          clip_output_tensor, kept_clip_tensor, restored_u8)
                     progress.update(end_idx - start_idx)
+                    restore_bar.tick(end_idx - start_idx)
             except torch.cuda.OutOfMemoryError:
                 # The finished chunk's device transients die with the
                 # exception; the release hands the cached blocks back before
@@ -1097,6 +1117,8 @@ class KEEPFaceProcessor:
                 # unchanged (fail loudly).  On CPU the clause never matches.
                 _soft_empty_cache()
                 raise
+
+            restore_bar.finish()
 
             # D-R2.3.1: convert-in #2 - the detection / crop / restore window
             # ran with no whole-clip uint8 BGR alive; the paste stage needs
@@ -1126,6 +1148,10 @@ class KEEPFaceProcessor:
             # chunk; the ``finally`` / OOM releases stay).
             _soft_empty_cache()
             logger.info("Pasting faces and finalizing frames")
+            # The stage bar of the paste (the stage-bar design, D3 #4): one
+            # tick per loop iteration regardless of branch - the batched
+            # rows' paste already happened inside ``_batched_paste``.
+            paste_bar = StageBar("Pasting faces and finalizing frames", num_input_frames)
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
             with capture_console_to_logger():
@@ -1185,6 +1211,7 @@ class KEEPFaceProcessor:
                     chunks_out = None
                 for i in range(num_input_frames):
                     keep_interrupt.check_interrupted()
+                    paste_bar.tick()
                     original_frame_bgr = input_frames_bgr[i]
                     if i in batched_outputs:
                         # the device modes already hold the frame (the canvas
@@ -1265,6 +1292,8 @@ class KEEPFaceProcessor:
                     output_frames_cv2.append(final_pasted_frame)
                     fallback_indices.append(i)
                     progress.update(1)
+
+            paste_bar.finish()
 
             # The paste stage was the last reader of the whole-clip BGR (the
             # paste calls and the fallback loop) - release it before the
@@ -1374,6 +1403,9 @@ class KEEPFaceProcessor:
             face_frames: list[int] = []
             face_landmarks: list[np.ndarray] = []
             logger.info("Detecting face landmarks")
+            # The stage bar of the detection (the stage-bar design, D3 #5):
+            # one tick per processed frame; a face-less frame ticks too.
+            detection_bar = StageBar("Detecting face landmarks", num_input_frames)
             # The detection step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
             with capture_console_to_logger():
@@ -1410,8 +1442,12 @@ class KEEPFaceProcessor:
                             # ``np.array`` materializes copies that survive the
                             # ``clean_all`` calls of the stages below.
                             face_landmarks.append(np.array(landmark, dtype=np.float64))
+                        detection_bar.tick()
                     del bgr_group
 
+            # The final line lands before the zero-faces early return below:
+            # the early return carries the stage's bar line (D3 #5).
+            detection_bar.finish()
             total_faces = len(face_landmarks)
             # Zero faces in the whole clip - the mirror of the all-NaN guard of
             # the single-face path (design section 3.2): the input comes back.
@@ -1425,11 +1461,19 @@ class KEEPFaceProcessor:
             progress.total = num_input_frames * 4 + total_faces
 
             logger.info("Cropping and aligning faces")
+            # The stage bar of the crop (the stage-bar design, D3 #6): ONE
+            # tick after the estimate_affines call - the per-face LMEDS loop
+            # lives in keep_gpu_ops.py and is opaque to the bar.  The unit
+            # is **faces** (the pre-filter face count).
+            crop_bar = StageBar(
+                "Cropping and aligning faces", total_faces, unit="faces")
             # Crop (design section 3.3): the same vendored LMEDS call over all
             # the face landmarks (``keep_gpu_ops.estimate_affines``) and the
             # same cv2 warp per face - the affine once, reused by every paste.
             face_affines = list(estimate_affines(
                 face_landmarks, self.face_helper.face_template))
+            crop_bar.tick(len(face_landmarks))
+            crop_bar.finish()
             # A ``None`` affine drops its face from the batch; with every affine
             # failed there is nothing to restore or paste.
             croppable = [k for k in range(total_faces) if face_affines[k] is not None]
@@ -1453,6 +1497,10 @@ class KEEPFaceProcessor:
             # loop's) and the per face (the staging row copy's).
             all_restored_faces_cv2 = np.empty((total_faces, 512, 512, 3), np.uint8)
             logger.info("Restoring faces with KEEP")
+            # The stage bar of the KEEP restore (the stage-bar design, D3
+            # #7): one tick of the chunk's face count per chunk; an OOM
+            # leaves without the final line (the exception is the report).
+            restore_bar = StageBar("Restoring faces with KEEP", total_faces, unit="faces")
             try:
                 for start_idx in range(0, total_faces, max_clip_length):
                     keep_interrupt.check_interrupted()
@@ -1529,6 +1577,7 @@ class KEEPFaceProcessor:
                     del (current_clip_faces, clip_output_tensor, kept_clip_tensor,
                          restored_u8)
                     progress.update(end_idx - start_idx)
+                    restore_bar.tick(end_idx - start_idx)
             except torch.cuda.OutOfMemoryError:
                 # The finished chunk's device transients die with the
                 # exception; the release hands the cached blocks back before
@@ -1536,6 +1585,8 @@ class KEEPFaceProcessor:
                 # unchanged (fail loudly).  On CPU the clause never matches.
                 _soft_empty_cache()
                 raise
+
+            restore_bar.finish()
 
             # The faces of every frame, in detection order - the fused loop
             # keeps the entries ordered by (frame index, detection index).
@@ -1570,6 +1621,10 @@ class KEEPFaceProcessor:
             # chunk; the ``finally`` / OOM releases stay).
             _soft_empty_cache()
             logger.info("Pasting faces and finalizing frames")
+            # The stage bar of the paste (the stage-bar design, D3 #8): one
+            # tick per loop iteration regardless of branch - the batched
+            # rows' paste already happened inside ``_batched_paste_multiface``.
+            paste_bar = StageBar("Pasting faces and finalizing frames", num_input_frames)
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
             with capture_console_to_logger():
@@ -1625,6 +1680,7 @@ class KEEPFaceProcessor:
                     chunks_out = None
                 for i in range(num_input_frames):
                     keep_interrupt.check_interrupted()
+                    paste_bar.tick()
                     original_frame_bgr = input_frames_bgr[i]
                     if i in batched_outputs:
                         # the device modes already hold the frame (the canvas
@@ -1685,6 +1741,8 @@ class KEEPFaceProcessor:
                     output_frames_cv2.append(final_pasted_frame)
                     fallback_indices.append(i)
                     progress.update(1)
+
+            paste_bar.finish()
 
             # The paste stage was the last reader of the whole-clip BGR (the
             # paste calls and the fallback loop) - release it before the
