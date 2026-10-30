@@ -355,18 +355,22 @@ def test_the_multi_face_composite_matches_the_vendored_at_upscale_two(
 
 
 @pytest.mark.unit
-def test_a_one_face_per_row_map_is_bit_identical_to_the_identity_path(
+def test_a_one_face_per_row_map_matches_the_identity_path_within_the_measured_residual(
     gpu_paste, gpu_ops
 ):
-    """``face_frame=[0, 1, 2]`` on one-face rows == the shipped identity path.
+    """``face_frame=[0, 1, 2]`` on one-face rows vs the shipped identity path.
 
-    The multi-face chunk has to degenerate to the single-face math
-    exactly: the union box of a 1-face row is the face's ROI, the
-    accumulator is its background patch and the tail decides on the same
-    row maximum.  All three assemblies - the host stack, the
-    device-output canvas and the chunked IMAGE rows - come out identical
-    on the CPU device, where every op of the paste is batch-invariant
-    (measured, the design's D3).
+    Fix 2.1 (2026-10-30, the owner's ``keep-fix3.txt``) vectorized the
+    single-face chunk (the identity path): the full-canvas ``grid_sample``
+    face warp replaced the cv2 fixed-point warp + ROI slicing, while the
+    multi-face chunk (the mapped path) keeps that cv2-exact ROI math - so
+    a 1-face row no longer degenerates to the identity path byte for byte.
+    The pin holds the measured residual instead: per assembly, the max
+    diff of the mapped rows against the identity rows - measured **3/255**
+    (host stack and device canvas) and **2/255** (chunked IMAGE rows),
+    pinned at the 8/255 class bound of the batched warps.  The mapped
+    device canvas stays bit-exact against its own host stack (the sibling
+    pin below).
     """
     faces, affines, face_frame, background = _multiface_corpus(
         gpu_ops,
@@ -396,16 +400,18 @@ def test_a_one_face_per_row_map_is_bit_identical_to_the_identity_path(
     identity = gpu_paste.paste_faces_batch(**batch_kwargs)
     mapped = gpu_paste.paste_faces_batch(face_frame=face_frame, **batch_kwargs)
     for row, (identity_frame, mapped_frame) in enumerate(zip(identity, mapped)):
-        assert np.array_equal(identity_frame, mapped_frame), (
-            f"row {row}: the mapped host stack drifted from the identity path"
+        diff = np.abs(identity_frame.astype(int) - mapped_frame.astype(int)).max()
+        assert diff <= 8, (
+            f"row {row}: the mapped host stack drifted {diff}/255 from the identity path"
         )
 
     identity_canvas = gpu_paste.paste_faces_batch(device_output=True, **batch_kwargs)
     mapped_canvas = gpu_paste.paste_faces_batch(
         device_output=True, face_frame=face_frame, **batch_kwargs
     )
-    assert torch.equal(identity_canvas, mapped_canvas), (
-        "the mapped device canvas drifted from the identity path"
+    canvas_diff = int((identity_canvas.float() - mapped_canvas.float()).abs().max())
+    assert canvas_diff <= 8, (
+        f"the mapped device canvas drifted {canvas_diff}/255 from the identity path"
     )
 
     chunked_identity = gpu_paste.paste_faces_batch_chunked(
@@ -414,8 +420,9 @@ def test_a_one_face_per_row_map_is_bit_identical_to_the_identity_path(
     chunked_mapped = gpu_paste.paste_faces_batch_chunked(
         **chunked_kwargs, face_frame=face_frame, **batch_kwargs
     )
-    assert torch.equal(chunked_identity, chunked_mapped), (
-        "the mapped chunked assembly drifted from the identity path"
+    chunked_diff = (chunked_identity - chunked_mapped).abs().max().item() * 255
+    assert chunked_diff <= 8 + 1e-6, (
+        f"the mapped chunked assembly drifted {chunked_diff:.2f}/255 from the identity path"
     )
 
 

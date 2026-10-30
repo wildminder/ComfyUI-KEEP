@@ -185,19 +185,28 @@ class KEEPFaceProcessor:
                        final_upscale_factor: float,
                        draw_box: bool,
                        gray_flags: np.ndarray,
-                       canvas_hw: tuple[int, int] | None = None) -> dict:
+                       canvas_hw: tuple[int, int] | None = None,
+                       stage_bar=None) -> dict:
         """The batched paste of the default branch (design section 7.7).
 
         The frames the batched paste can handle - a valid affine, a
-        restored face of the ParseNet size, no box, no face upsampler, a
-        color frame and an available parse net - are pasted on the device:
-        the chunked ParseNet forward, the batched parse mask, the batched
-        inverse warp and the batched blend.
+        restored face of the ParseNet size, no box, no face upsampler and
+        an available parse net - are pasted on the device: the chunked
+        ParseNet forward, the batched parse mask, the batched inverse warp
+        and the batched blend.  Since the owner's fix 1.2 (2026-10-30) a
+        grayscale frame is batch-eligible - the device blend handles it
+        with the same tensor logic (``gray_flags`` stays a parameter; the
+        fallback loop still reads it, the eligibility no longer does).
 
         Every other frame keeps the vendored ``paste_faces_to_input_image``
         (design section 7.7, step 6): the box, the face upsampler, the
-        grayscale frames, the frames without a face and a face helper
-        without a parse net.
+        frames without a face and a face helper without a parse net.
+
+        Args:
+            stage_bar: the optional paste-stage progress bar - forwarded
+                into the paste core, which ticks the eligible rows per
+                completed chunk/group (the fallback rows are ticked by the
+                processor's loop).
 
         Returns:
             ``{frame index: the pasted frame}`` - the frames that are not
@@ -223,8 +232,9 @@ class KEEPFaceProcessor:
                 continue
             if i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
                 continue
-            if gray_flags[i]:
-                continue
+            # The gray skip is gone (the owner's fix 1.2, 2026-10-30): the
+            # device blend pastes a grayscale frame with the same tensor
+            # logic as a color frame.
             if restored_faces[i].shape[:2] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
                 continue
             eligible.append(i)
@@ -273,7 +283,8 @@ class KEEPFaceProcessor:
                 background_bgr=background,
                 device=self.device,
                 parse_net=parse_net,
-                device_output=True)
+                device_output=True,
+                stage_bar=stage_bar)
             return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
         if mode == "chunked":
             chunks = paste_mod.paste_faces_batch_chunked(
@@ -284,7 +295,8 @@ class KEEPFaceProcessor:
                 bg_upscale_model=self.bg_upscale_model,
                 device=self.device,
                 canvas_hw=canvas_hw,
-                parse_net=parse_net)
+                parse_net=parse_net,
+                stage_bar=stage_bar)
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
         background = batched_bg_frames(
             background_stacked, final_upscale_factor, self.bg_upscale_model,
@@ -294,7 +306,8 @@ class KEEPFaceProcessor:
             inverse_affines=inverses,
             background_bgr=background,
             device=self.device,
-            parse_net=parse_net)
+            parse_net=parse_net,
+            stage_bar=stage_bar)
         return dict(zip(eligible, pasted))
 
     def _batched_paste_multiface(self,
@@ -1148,9 +1161,11 @@ class KEEPFaceProcessor:
             # chunk; the ``finally`` / OOM releases stay).
             _soft_empty_cache()
             logger.info("Pasting faces and finalizing frames")
-            # The stage bar of the paste (the stage-bar design, D3 #4): one
-            # tick per loop iteration regardless of branch - the batched
-            # rows' paste already happened inside ``_batched_paste``.
+            # The stage bar of the paste (the stage-bar design, D3 #4): the
+            # fallback rows tick here in the loop; the batched rows tick
+            # inside the paste core per completed chunk/group - nobody ticks
+            # twice, so the bar totals ``num_input_frames`` exactly (the
+            # owner's fix 1.1, 2026-10-30).
             paste_bar = StageBar("Pasting faces and finalizing frames", num_input_frames)
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
@@ -1167,14 +1182,17 @@ class KEEPFaceProcessor:
                 # the paste stage runs on the device - the chunked ParseNet
                 # forward, the batched parse mask, the batched inverse warp and
                 # the batched blend.  The vendored paste stays reachable for
-                # the non-default branches (``draw_box``, the face upsampler,
-                # the grayscale frames and a helper without a parse net).
+                # the non-default branches (``draw_box``, the face upsampler
+                # and a helper without a parse net); since the owner's fix 1.2
+                # (2026-10-30) the grayscale frames ride the batched core.
+                # The paste bar is threaded in (fix 1.1): the core ticks the
+                # eligible rows per completed chunk/group.
                 batched_outputs = {}
                 if not has_aligned_frames:
                     batched_outputs = self._batched_paste(
                         input_frames_bgr, all_restored_faces_cv2, affine_matrices,
                         avg_landmarks_sequence, final_upscale_factor, draw_box, gray_flags,
-                        canvas_hw=canvas_hw)
+                        canvas_hw=canvas_hw, stage_bar=paste_bar)
 
                 # The single tail buffer (review F4): the mode booleans are
                 # set at allocation - and in the device modes the mapping
@@ -1186,45 +1204,80 @@ class KEEPFaceProcessor:
                 device_canvas_mode = False
                 chunks_mode = False
                 if canvas is not None:
-                    # one device canvas of the whole batch: the batched indices
-                    # are already in it (it is the group canvas, indexed copy),
-                    # the vendored-fallback frames are uploaded as one stack
-                    # below, and the single convert-out runs on the device
-                    device_canvas = torch.empty(
-                        (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
-                        device=self.device)
-                    device_canvas[list(batched_outputs)] = canvas
+                    if len(batched_outputs) == num_input_frames:
+                        # every frame is batched: the canvas already holds the
+                        # rows in order - alias it (no fresh buffer, no copy)
+                        device_canvas = canvas
+                    else:
+                        # one device canvas of the whole batch: the batched
+                        # indices are already in it (it is the group canvas,
+                        # indexed copy), the vendored-fallback frames are
+                        # uploaded as one stack below, and the single
+                        # convert-out runs on the device
+                        device_canvas = torch.empty(
+                            (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
+                            device=self.device)
+                        device_canvas[list(batched_outputs)] = canvas
                     device_canvas_mode = True
                     batched_outputs = set(batched_outputs)
                     canvas = None
                 if chunks_out is not None:
-                    # one float32 host buffer of the whole batch: the chunked
-                    # mode's per-group convert-outs already landed in it (the
-                    # eligible rows are IMAGE rows) - one indexed copy places
-                    # them; the vendored-fallback frames are converted host-side
-                    # below (one stack, never per-frame transfers)
-                    final_batch = torch.empty(
-                        (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
-                    final_batch[list(batched_outputs)] = chunks_out
+                    if len(batched_outputs) == num_input_frames:
+                        # every frame is batched: the chunk buffer already
+                        # holds the rows in order - alias it (no fresh
+                        # buffer, no copy)
+                        final_batch = chunks_out
+                    else:
+                        # one float32 host buffer of the whole batch: the
+                        # chunked mode's per-group convert-outs already
+                        # landed in it (the eligible rows are IMAGE rows) -
+                        # one indexed copy places them; the vendored-fallback
+                        # frames are converted host-side below (one stack,
+                        # never per-frame transfers)
+                        final_batch = torch.empty(
+                            (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
+                        final_batch[list(batched_outputs)] = chunks_out
                     chunks_mode = True
                     batched_outputs = set(batched_outputs)
                     chunks_out = None
                 for i in range(num_input_frames):
                     keep_interrupt.check_interrupted()
-                    paste_bar.tick()
-                    original_frame_bgr = input_frames_bgr[i]
                     if i in batched_outputs:
                         # the device modes already hold the frame (the canvas
                         # or the chunk buffer); the host mode keeps the mapping
-                        # value
+                        # value.  No bar tick here: the core ticked the row
+                        # when its chunk/group completed (fix 1.1).
                         if not device_canvas_mode and not chunks_mode:
                             output_frames_cv2.append(batched_outputs[i])
                         progress.update(1)
                         continue
+                    # Fallback path for frames skipped by GPU batching: the
+                    # loop owns this row's paste, so it ticks the bar.
+                    paste_bar.tick(1)
+                    original_frame_bgr = input_frames_bgr[i]
+                    # If the affine matrix is None, NO FACE was detected for
+                    # the frame: do not run the vendored paste on it - return
+                    # the background (the owner's fix 1.1, the critical fix).
+                    if not has_aligned_frames:
+                        if (
+                            affine_matrices[i] is None
+                            or avg_landmarks_sequence is None
+                            or i >= len(avg_landmarks_sequence)
+                            or np.isnan(avg_landmarks_sequence[i]).any()
+                        ):
+                            final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
+                            output_frames_cv2.append(final_pasted_frame)
+                            # the same bookkeeping as the sibling fallback rows:
+                            # the device-output tails index the fallback rows by
+                            # this list, so an unrecorded frame length-mismatches
+                            fallback_indices.append(i)
+                            progress.update(1)
+                            continue
                     if i >= len(all_restored_faces_cv2):
                         final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
                         output_frames_cv2.append(final_pasted_frame)
                         fallback_indices.append(i)
+                        progress.update(1)
                         continue
                     restored_face_patch_cv2 = all_restored_faces_cv2[i]
                     self.face_helper.clean_all()
@@ -1246,14 +1299,6 @@ class KEEPFaceProcessor:
                     self.face_helper.add_restored_face(restored_face_patch_cv2)
 
                     if not has_aligned_frames:
-                        if avg_landmarks_sequence is None or i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
-                            final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
-                            output_frames_cv2.append(final_pasted_frame)
-                            # the same bookkeeping as the sibling fallback rows:
-                            # the device-output tails index the fallback rows by
-                            # this list, so an unrecorded frame length-mismatches
-                            fallback_indices.append(i)
-                            continue
                         # Affine once (design section 7.3): the crop step
                         # computed the matrix - the paste loop of today ran
                         # a second ``align_warp_face`` to compute it again.

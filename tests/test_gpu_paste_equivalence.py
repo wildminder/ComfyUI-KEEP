@@ -32,9 +32,15 @@ as well: the ROI face warp (cv2's fixed-point bilinear, re-implemented in
 int32 on the device), the ROI mask warp (the full-canvas grid, sliced),
 the ROI blend, the support of the warped parse mask, the transfer
 accounting and the frame-global maximum of the quantizing tail.  Those
-pins are **bit-exact** - the ROI path has to reproduce the crop of the
-full-canvas result byte for byte (a tolerance would be a QA failure, not
-an acceptance).
+pins were **bit-exact** - the ROI path had to reproduce the crop of the
+full-canvas result byte for byte.  Fix 2.1 (2026-10-30, the owner's
+``keep-fix3.txt``) vectorized the shipped single-face chunk
+(``_paste_chunk_roi``): the full-canvas ``grid_sample`` face warp
+replaced the cv2 fixed-point warp + ROI slicing, so the whole-paste pins
+against the unchanged full-canvas reference hold the **measured
+residual** now (the 8/255 drift class, documented per pin); the warp-op
+pins (``warp_face_roi`` and friends) stay bit-exact - the op keeps its
+production call site in ``_paste_chunk_faces``.
 
 The **device-output assembly** (the GPU-resident-output round) is pinned
 here as well: the VRAM budget of the device canvas, the three-way mode
@@ -726,19 +732,24 @@ def test_the_warped_parse_mask_stays_inside_the_roi(gpu_paste, gpu_ops):
 @pytest.mark.unit
 @pytest.mark.parametrize("corpus", ["smooth", "noise"])
 @pytest.mark.parametrize("position", ["interior", "edge"])
-def test_the_roi_paste_is_bit_identical_to_the_full_canvas_paste(
+def test_the_roi_paste_matches_the_full_canvas_paste_within_the_measured_residual(
     gpu_paste, corpus, position
 ):
-    """The whole ROI paste == the whole full-canvas paste, byte for byte.
+    """The vectorized ROI paste vs the full-canvas reference: the measured residual.
 
-    The ROI path is the shipped path (``use_roi=True``); the full-canvas
-    path (``use_roi=False``) is the reference the ROI path replaces.  The
-    pin is bit-exact: the face warp, the mask warp, the blend and the host
-    assembly reproduce the full-canvas result on every pixel.
+    Fix 2.1 (2026-10-30, the owner's ``keep-fix3.txt``) vectorized the ROI
+    chunk: the full-canvas ``grid_sample`` face warp replaced the cv2
+    fixed-point warp + ROI slicing, so the ROI path is no longer
+    byte-identical to the full-canvas reference (``_paste_chunk``,
+    unchanged).  The pin holds the measured residual instead: per
+    corpus/position, the max diff against the reference - measured
+    **4/255** on the noise corpus and **1/255** on the smooth one, the
+    un-amplified drift class of the batched warps, pinned at the **8/255**
+    class bound of the batched-paste noise pin.
 
-    The two frames of the chunk have **different** ROIs (a different
-    scale), so the per-frame ROI of the chunk - and the padded batched
-    mask warp that serves it - is exercised.
+    The two frames of the chunk still have **different** ROIs (a different
+    scale), so the interior and the edge-clipped grid positions of the old
+    bit-exact pin stay covered.
     """
     height, width = ROI_CANVAS_HW
     rng = np.random.default_rng(109)
@@ -764,9 +775,10 @@ def test_the_roi_paste_is_bit_identical_to_the_full_canvas_paste(
     full_paste = gpu_paste.paste_faces_batch(use_roi=False, **kwargs)
 
     for index, (roi_frame, full_frame) in enumerate(zip(roi_paste, full_paste)):
-        assert np.array_equal(roi_frame, full_frame), (
-            f"frame {index}: the ROI paste drifted from the full-canvas paste "
-            f"on the {corpus} corpus at the {position} ROI"
+        diff = np.abs(roi_frame.astype(int) - full_frame.astype(int)).max()
+        assert diff <= 8, (
+            f"frame {index}: the vectorized ROI paste drifted {diff}/255 from the "
+            f"full-canvas reference on the {corpus} corpus at the {position} ROI"
         )
 
 
@@ -781,6 +793,11 @@ def test_the_device_output_stack_is_bit_identical_to_the_host_stack(gpu_paste):
     CPU device the two modes run the same arithmetic on the same data, so
     the canvas equals the list of the host frames exactly, on every pixel,
     for every ROI position of the corpus.
+
+    Fix 2.1 (2026-10-30) retired the ROI staging counters of the chunk
+    (``roi_staged_bytes`` counted the ROI patches that no longer travel) -
+    the pin asserts the retired zero, the bit-equality itself survives
+    (both modes share the vectorized chunk).
     """
     height, width = ROI_CANVAS_HW
     rng = np.random.default_rng(109)
@@ -810,7 +827,7 @@ def test_the_device_output_stack_is_bit_identical_to_the_host_stack(gpu_paste):
         )
     stats = gpu_paste.PASTE_TRANSFER_STATS
     assert stats["h2d_bytes"] == 0 and stats["d2h_bytes"] == 0, stats
-    assert stats["roi_staged_bytes"] > 0, stats
+    assert stats["roi_staged_bytes"] == 0, stats
     assert stats["roi_frames"] == 2 and stats["fallback_frames"] == 0, stats
 
 
@@ -855,13 +872,18 @@ def test_the_device_canvas_keeps_the_near_black_full_canvas_fallback(gpu_paste):
 
 @pytest.mark.unit
 def test_the_roi_transfers_are_roi_sized(gpu_paste):
-    """The transfer counters are ROI-sized, not canvas-sized.
+    """The transfer counters of the vectorized paste (fix 2.1, 2026-10-30).
 
-    The counters are the product's own accounting
-    (``PASTE_TRANSFER_STATS``) - the probe reads them for the before/after
-    table, so the claim "no full-canvas H2D / D2H of the background and of
-    the blended canvas" is checkable here: the background patch and the
-    blended patch that travel are the ROI ones.
+    Fix 2.1 vectorized the ROI chunk (the owner's ``keep-fix3.txt``): no
+    ROI patch is staged any more, so the old body's counters are retired -
+    ``h2d_bytes`` / ``d2h_bytes`` (the ROI patch upload/download),
+    ``roi_staged_bytes`` (the device-output staging) and ``canvas_bytes``
+    (the canvas size the ROI claim was measured against);
+    ``fallback_frames`` counted the near-black full-canvas fallback, whose
+    explicit branch the vectorized body deleted (the 255 factor lives in
+    the whole-canvas maximum).  The keys stay in ``PASTE_TRANSFER_STATS``
+    and report 0; the survivors keep their meaning: ``face_h2d_bytes``
+    (the restored faces upload whole) and ``roi_frames`` (the chunk's rows).
     """
     height, width = ROI_CANVAS_HW
     rng = np.random.default_rng(137)
@@ -883,42 +905,40 @@ def test_the_roi_transfers_are_roi_sized(gpu_paste):
         frame_chunk=2,
     )
     stats = gpu_paste.PASTE_TRANSFER_STATS
-    roi_bytes = 0
-    for matrix in matrices:
-        x0, y0, x1, y1 = gpu_paste.face_roi_box(matrix, ROI_CANVAS_HW)
-        roi_bytes += (x1 - x0) * (y1 - y0) * 3
 
     assert stats["frames"] == 2
     assert stats["roi_frames"] == 2
     assert stats["fallback_frames"] == 0
-    assert stats["canvas_bytes"] == height * width * 3
-    assert stats["h2d_bytes"] == roi_bytes, stats
-    assert stats["d2h_bytes"] == roi_bytes, stats
+    # the restored faces upload whole - they are not ROI-sized by nature
     assert stats["face_h2d_bytes"] == 2 * 512 * 512 * 3, stats
-    # the ROI transfers are a small part of the canvas transfers
-    assert stats["h2d_bytes"] < 2 * stats["canvas_bytes"], stats
-    assert stats["d2h_bytes"] < 2 * stats["canvas_bytes"], stats
+    # retired by fix 2.1 (2026-10-30): the vectorized chunk stages no ROI
+    # patch and takes no explicit near-black fallback branch
+    assert stats["canvas_bytes"] == 0, stats
+    for key in ("h2d_bytes", "d2h_bytes", "roi_staged_bytes"):
+        assert stats[key] == 0, (key, stats)
 
 
 @pytest.mark.unit
-def test_a_dark_frame_takes_the_full_canvas_fallback(gpu_paste, face_helper):
-    """A near-black frame falls back to the full-canvas path.
+def test_a_dark_frame_keeps_the_whole_canvas_255_factor(gpu_paste, face_helper):
+    """A near-black frame keeps the vendored tail's whole-canvas 255 factor.
 
     The vendored tail multiplies the **whole canvas** by 255 when the
-    blended frame is near black (``face_restoration_helper.py:504-505``) -
-    a frame-global operation the ROI cannot reproduce.  Such a frame falls
-    back to the full-canvas path.
+    blended frame is near black (``face_restoration_helper.py:504-505``).
+    Fix 2.1 (2026-10-30, the owner's ``keep-fix3.txt``) deleted the old
+    body's explicit full-canvas fallback branch: the tail lives in the
+    whole-canvas maximum now (``_quantize_and_clip`` with ``maximum=None``
+    measures the frame maximum over the entire canvas), so the factor is
+    the same without the branch - the pin holds that property.
 
-    The pin: the fallback counter is on, the ROI paste is bit-identical to
-    the full-canvas paste and the output matches the vendored paste.  The
-    residual against the vendored paste is the mask-warp residual of the
-    other pins (the vendored mask is cv2's 1/32-quantised warp, the
-    product's is the float32 grid sample) - **not** a residual of the ROI
-    path, which is bit-identical to the full-canvas paste.  The near-black
-    branch multiplies the blend by 255, so that residual is amplified:
-    measured on this content, **5/255** (the un-amplified residual is
-    5/255/255, well inside the 8/255 the noise pin of the batched paste
-    measures).
+    The residual against the vendored paste is the whole-canvas 255
+    amplification of the batched-warp drift (float32 ``grid_sample`` vs
+    cv2's 1/32 fixed-point sampling - the face warp joined the mask warp's
+    class under fix 2.1; the old pin's ROI==full bit-equality is gone with
+    the branch).  Measured on this content, **133/255**: a single sampled
+    tap flip on the 0/1 corpus is a full unit after the amplification.  A
+    lost 255 factor would exceed the bound by construction (the bright-frame
+    sibling below pins the inverse case), so the tail's survival stays
+    checkable.
     """
     height, width = ROI_CANVAS_HW
     matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
@@ -941,20 +961,15 @@ def test_a_dark_frame_takes_the_full_canvas_fallback(gpu_paste, face_helper):
 
     roi_paste = gpu_paste.paste_faces_batch(use_roi=True, **kwargs)
     stats = gpu_paste.PASTE_TRANSFER_STATS
-    assert stats["fallback_frames"] == 1, stats
-    assert stats["roi_frames"] == 0, stats
-
-    full_paste = gpu_paste.paste_faces_batch(use_roi=False, **kwargs)
-    assert np.array_equal(roi_paste[0], full_paste[0]), (
-        "the dark frame's ROI paste drifted from the full-canvas paste"
-    )
+    assert stats["fallback_frames"] == 0, stats
+    assert stats["roi_frames"] == 1, stats
 
     reference = _vendored_paste(
         face_helper, background[0], face, cv2.invertAffineTransform(matrix),
         1.0, parse_net,
     )
     diff = np.abs(reference.astype(int) - roi_paste[0].astype(int))
-    assert diff.max() <= 5, (
+    assert diff.max() <= 133, (
         f"the dark frame drifted {diff.max()}/255 from the vendored paste"
     )
 
@@ -968,6 +983,12 @@ def test_a_dark_roi_in_a_bright_frame_keeps_the_frame_global_branch(gpu_paste):
     vendored tail comes from the frame-global maximum, so the ROI keeps its
     values.  A ROI-local maximum would scale the ROI by 255 and ruin the
     frame - the pin catches exactly that.
+
+    Fix 2.1 (2026-10-30) note: with the vectorized chunk the ROI path is
+    no longer bit-identical to the full-canvas reference - the pin holds
+    the measured residual instead (measured **1/255** on this corpus,
+    pinned at the 8/255 class bound) and keeps the outside-ROI background
+    preservation, which the zero mask outside the footprint guarantees.
     """
     height, width = ROI_CANVAS_HW
     matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
@@ -992,8 +1013,9 @@ def test_a_dark_roi_in_a_bright_frame_keeps_the_frame_global_branch(gpu_paste):
     assert stats["roi_frames"] == 1, stats
 
     full_paste = gpu_paste.paste_faces_batch(use_roi=False, **kwargs)
-    assert np.array_equal(roi_paste[0], full_paste[0]), (
-        "the dark ROI's paste drifted from the full-canvas paste"
+    diff = np.abs(roi_paste[0].astype(int) - full_paste[0].astype(int)).max()
+    assert diff <= 8, (
+        f"the dark ROI's paste drifted {diff}/255 from the full-canvas paste"
     )
     # the pixels outside the ROI keep their background value
     outside = np.ones((height, width), dtype=bool)
@@ -1056,10 +1078,13 @@ def test_the_device_output_mode_selects_full_chunked_or_host(gpu_paste, monkeypa
     the owner's complaint: 100 frames on a 2880x5120 canvas are ~4.1 GiB
     of uint8, past the 1 GiB cap, so the full mode disengages; one chunk
     of 4 frames (the 2 GiB staging over ~436 MiB per frame) still fits, so
-    the chunked mode engages; a starved card (the budget below one
-    frame's canvas) keeps the host assembly.  The last two assertions pin
-    the boundary itself: ``num_frames * canvas_bytes == budget`` stays
-    ``full`` (the ``<=``), one frame past it falls to ``chunked``.
+    the chunked mode engages.  Fix 2.2 (2026-10-30, the owner's
+    ``keep-fix3.txt``): a starved card no longer keeps the host assembly -
+    a CUDA device never gets ``"host"``; the chunked mode takes it with
+    the group floored at one frame (:func:`paste_chunk_size`), the OOM
+    handler stays the net.  The last two assertions pin the boundary
+    itself: ``num_frames * canvas_bytes == budget`` stays ``full`` (the
+    ``<=``), one frame past it falls to ``chunked``.
     """
     cuda = torch.device("cuda")
     # a CPU device keeps the host output (the F1 behavior, unpatched)
@@ -1070,7 +1095,7 @@ def test_the_device_output_mode_selects_full_chunked_or_host(gpu_paste, monkeypa
     assert gpu_paste.device_output_mode(cuda, 100, 2880, 5120) == "chunked"
 
     monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 64 << 20)
-    assert gpu_paste.device_output_mode(cuda, 100, 2880, 5120) == "host"
+    assert gpu_paste.device_output_mode(cuda, 100, 2880, 5120) == "chunked"
 
     # the exact budget boundary: four frames of a 256x384 canvas are
     # exactly a quarter of 4,718,592 bytes of "free" memory
@@ -1490,14 +1515,45 @@ def test_the_vendored_paste_stays_reachable_for_the_box(processor_module):
 
 
 @pytest.mark.unit
-def test_the_vendored_paste_stays_reachable_for_the_grayscale_frames(processor_module):
-    """A grayscale frame keeps the vendored paste (the gray face conversion)."""
+def test_the_grayscale_frames_ride_the_batched_core(processor_module):
+    """A grayscale frame rides the batched core (fix 1.2, 2026-10-30).
+
+    The gray skip of the eligibility is gone: the device blend pastes a
+    grayscale frame with the same tensor logic as a color frame, so the
+    gray corpus of the old
+    ``test_the_vendored_paste_stays_reachable_for_the_grayscale_frames``
+    takes the batched paste - the vendored paste is not called and the
+    output shape holds.
+    """
     landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
     face_helper = _ParseFaceHelper(parse_net=_StubParseNet(), landmarks=landmarks)
     gray = torch.full((1, 64, 96, 3), 0.4, dtype=torch.float32)
     gray[..., 1] = 0.5
 
     output, _ = _run_sequence(processor_module, face_helper, gray)
+
+    assert "paste_faces_to_input_image" not in face_helper.calls, face_helper.calls
+    assert tuple(output.shape) == (1, 64, 96, 3), output.shape
+
+
+@pytest.mark.unit
+def test_the_vendored_paste_stays_reachable_for_a_non_parse_face(processor_module, monkeypatch):
+    """The vendored paste stays reachable for a restored face off the ParseNet size.
+
+    The gray routing this file used to pin is gone (fix 1.2, 2026-10-30):
+    the per-frame ineligibility that keeps a frame on the vendored paste
+    (with a parse net, no box and no face upsampler) is the restored face
+    of a size other than ``PARSE_FACE_SIZE``.  The pin patches the
+    processor's ``PARSE_FACE_SIZE`` to 256, so the restored 512 faces are
+    ineligible while the landmarks and the affines stay valid (no
+    short-circuit) - the frame takes the vendored paste.
+    """
+    landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _ParseFaceHelper(parse_net=_StubParseNet(), landmarks=landmarks)
+    frames = torch.rand((1, 64, 96, 3), dtype=torch.float32)
+    monkeypatch.setattr(processor_module, "PARSE_FACE_SIZE", 256)
+
+    output, _ = _run_sequence(processor_module, face_helper, frames)
 
     assert "paste_faces_to_input_image" in face_helper.calls, face_helper.calls
     assert tuple(output.shape) == (1, 64, 96, 3), output.shape
@@ -1572,48 +1628,48 @@ def test_the_batched_paste_returns_the_device_output_sentinels(
 
 @pytest.mark.unit
 def test_the_device_modes_keep_the_sequence_output_end_to_end(
-    processor_module, gpu_paste, image_utils, monkeypatch
+    processor_module, gpu_paste, monkeypatch
 ):
     """AC 3c: the chunked and the full device modes ship the same IMAGE batch.
 
-    A four-frame sequence (three faces + one **gray** frame) runs through
-    ``process_image_sequence`` four times: the unpatched host run at the
-    factor of one, the full mode forced at one, then both device modes
-    forced at four.  Within one factor the final IMAGE tensors are
-    identical, byte for byte - and the gray frame rides along to pin the
-    vendored-fallback row across the modes (the stub paste returns a
-    canvas-sized pattern, converted by the same elementwise chain
-    everywhere).  The factor-4 host run is **not** compared: its
-    background is the cv2 Lanczos while the device modes use the
-    owner-accepted device Lanczos - a documented tolerance route, not a
-    drift.
+    A four-frame sequence runs through ``process_image_sequence`` four
+    times: the unpatched host run at the factor of one, the full mode
+    forced at one, then both device modes forced at four.  Within one
+    factor the final IMAGE tensors are identical, byte for byte.
+
+    Fix 1.2 (2026-10-30): the corpus's fourth frame used to be gray
+    (``frames[3] = 0.4``) and pinned the vendored-fallback row across the
+    modes; with the gray skip gone it is batch-eligible, so all four rows
+    ride the batched core and the whole-tensor comparisons cover the gray
+    row too (all assemblies share the reworked ``_paste_chunk_roi``).
+    Every frame batched, the device modes take the reuse fast path (fix
+    1.1, the buffer alias) - the canvas / chunk buffer ships as the final
+    IMAGE with no fresh whole-clip allocation.  The mixed corpus with a
+    real fallback row stays pinned by the NaN-landmark pin below.  The
+    factor-4 host run is **not** compared: its background is the cv2
+    Lanczos while the device modes use the owner-accepted device Lanczos
+    - a documented tolerance route, not a drift.
     """
 
     def run(final_upscale_factor, canvas_hw, mode):
-        rng = np.random.default_rng(271)
-        pattern = rng.integers(0, 256, size=(*canvas_hw, 3), dtype=np.uint8)
         landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
         face_helper = _ParseFaceHelper(
             parse_net=_StubParseNet(seed=277), landmarks=landmarks)
-        # the vendored paste of the fallback frame: a canvas-sized pattern,
-        # so the fallback row carries content (not zeros) and the same
-        # bytes in every run
-        face_helper.paste_faces_to_input_image = lambda *a, **k: pattern.copy()
         frames = torch.rand(
             (4, 64, 96, 3), generator=torch.Generator().manual_seed(281))
-        frames[3] = 0.4  # one channel value everywhere -> the gray flag
+        frames[3] = 0.4  # the gray frame: batch-eligible since fix 1.2
         if mode is not None:
             monkeypatch.setattr(
                 gpu_paste, "device_output_mode", lambda *a, **k: mode)
         output, _ = _run_sequence(
             processor_module, face_helper, frames,
             final_upscale_factor=final_upscale_factor)
-        return output, pattern
+        return output
 
-    host_f1, _ = run(1.0, (64, 96), None)
-    full_f1, pattern_f1 = run(1.0, (64, 96), "full")
-    full_f4, pattern_f4 = run(4.0, (256, 384), "full")
-    chunked_f4, _ = run(4.0, (256, 384), "chunked")
+    host_f1 = run(1.0, (64, 96), None)
+    full_f1 = run(1.0, (64, 96), "full")
+    full_f4 = run(4.0, (256, 384), "full")
+    chunked_f4 = run(4.0, (256, 384), "chunked")
 
     assert tuple(host_f1.shape) == (4, 64, 96, 3), host_f1.shape
     assert torch.equal(full_f1, host_f1), (
@@ -1626,19 +1682,95 @@ def test_the_device_modes_keep_the_sequence_output_end_to_end(
         "the chunked mode drifted from the full mode at the factor of four"
     )
 
-    # the gray fallback row: the stub's canvas-sized pattern, converted by
-    # the same elementwise chain in every mode
-    gray_row = image_utils.bgr_u8_batch_to_comfy(torch.from_numpy(pattern_f4))
-    assert gray_row.abs().sum() > 0
-    assert torch.equal(full_f4[3], gray_row), (
-        "the full mode's fallback row drifted from the stub's pattern"
-    )
-    assert torch.equal(chunked_f4[3], gray_row), (
-        "the chunked mode's fallback row drifted from the stub's pattern"
-    )
-    assert torch.equal(
-        full_f1[3], image_utils.bgr_u8_batch_to_comfy(torch.from_numpy(pattern_f1))
-    )
+
+@pytest.mark.unit
+def test_the_paste_bar_ticks_every_frame_exactly_once_across_the_modes(
+    processor_module, gpu_paste, monkeypatch
+):
+    """The paste bar totals ``num_input_frames`` in every mode (fix 1.1, 2026-10-30).
+
+    The paste bar's discipline (the owner's fix 1.1): the fallback rows
+    tick in the processor's loop, the batched rows tick inside the paste
+    core per completed chunk/group.  A five-frame all-eligible corpus runs
+    host, forced full and forced chunked: the core ticks the five rows per
+    chunk - ``[5]`` in every mode (one chunk at the 64x96 canvas, the
+    chunk cap is 16).  A five-frame corpus with one None-affine frame
+    (``estimate_affines`` patched to return ``None`` for the first frame -
+    the LMEDS failure of the production route) runs host, full and
+    chunked: the core ticks ``[4]``, the loop ticks ``[1]`` for the
+    background-only row - the sum is the frame count, nobody ticks twice,
+    nobody is missed.  Before the fix the host mode's batched rows were
+    never ticked (the cores had no bar) and an all-eligible CPU clip
+    finished its bar under its total.
+    """
+    bars: list = []
+
+    class _RecordingStageBar:
+        """The StageBar double: it records every tick the processor makes."""
+
+        def __init__(self, label, total, *, unit="frames",
+                     interval_s=None, clock=None, stream=None):
+            self.label = label
+            self.total = total
+            self.ticks: list[int] = []
+            self.finishes = 0
+            bars.append(self)
+
+        def tick(self, n=1):
+            self.ticks.append(n)
+
+        def finish(self):
+            self.finishes += 1
+
+    monkeypatch.setattr(processor_module, "StageBar", _RecordingStageBar)
+
+    def paste_bar():
+        return next(
+            bar for bar in bars
+            if bar.label == "Pasting faces and finalizing frames")
+
+    def run(mode, drop_first_affine):
+        landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
+        face_helper = _ParseFaceHelper(
+            parse_net=_StubParseNet(seed=353), landmarks=landmarks)
+        if drop_first_affine:
+            real_estimate = processor_module.estimate_affines
+
+            def one_none(landmark_list, template):
+                result = list(real_estimate(landmark_list, template))
+                result[0] = None
+                return result
+
+            monkeypatch.setattr(processor_module, "estimate_affines", one_none)
+        frames = torch.rand(
+            (5, 64, 96, 3), generator=torch.Generator().manual_seed(359))
+        if mode is not None:
+            monkeypatch.setattr(
+                gpu_paste, "device_output_mode", lambda *a, **k: mode)
+        output, _ = _run_sequence(
+            processor_module, face_helper, frames, final_upscale_factor=1.0)
+        return output
+
+    output = run(None, False)
+    assert tuple(output.shape) == (5, 64, 96, 3), output.shape
+    assert paste_bar().total == 5
+    assert paste_bar().ticks == [5], paste_bar().ticks
+    assert paste_bar().finishes == 1
+
+    for mode in ("full", "chunked"):
+        bars.clear()
+        run(mode, False)
+        assert paste_bar().ticks == [5], (mode, paste_bar().ticks)
+        assert paste_bar().finishes == 1
+
+    for mode in (None, "full", "chunked"):
+        bars.clear()
+        output = run(mode, True)
+        assert tuple(output.shape) == (5, 64, 96, 3), output.shape
+        # the core ticks the four batched rows, the loop the background-only
+        # row - the bar's sum is the frame count in every mode
+        assert paste_bar().ticks == [4, 1], (mode, paste_bar().ticks)
+        assert paste_bar().finishes == 1
 
 
 @pytest.mark.unit
@@ -1693,3 +1825,61 @@ def test_the_nan_landmark_short_circuit_keeps_the_device_tails_aligned(
     assert torch.equal(chunked, full), (
         "the chunked mode drifted from the full mode with a NaN landmark frame"
     )
+
+
+@pytest.mark.unit
+def test_the_none_affine_fallback_stays_background_only(
+    processor_module, gpu_paste, monkeypatch
+):
+    """A None-affine frame stops taking the vendored paste (fix 1.1, 2026-10-30).
+
+    The owner's critical fix: a frame whose affine matrix is ``None`` (the
+    LMEDS failure of ``estimate_affines``) with valid landmarks used to
+    reach the vendored paste - which handles a ``None`` inverse gracefully
+    - and now short-circuits to the background-only row, aligning the
+    fallback condition with the batched eligibility.  The pin patches
+    ``estimate_affines`` to return ``None`` for the second frame (the
+    production route's failure shape), so the frame hits the new first
+    disjunct of the short-circuit: the frame never touches the face
+    helper (no ``add_restored_face``, no vendored paste) and its output
+    row is the background (the converted raw frame, non-zero - the stub
+    paste returns zeros), recorded in ``fallback_indices`` - the three
+    output modes stay byte-for-byte equal (the device tails aligned).
+    """
+
+    def run(mode):
+        landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
+        face_helper = _ParseFaceHelper(
+            parse_net=_StubParseNet(seed=367), landmarks=landmarks)
+        real_estimate = processor_module.estimate_affines
+
+        def one_none(landmark_list, template):
+            result = list(real_estimate(landmark_list, template))
+            result[1] = None
+            return result
+
+        monkeypatch.setattr(processor_module, "estimate_affines", one_none)
+        if mode is not None:
+            monkeypatch.setattr(
+                gpu_paste, "device_output_mode", lambda *a, **k: mode)
+        frames = torch.rand(
+            (2, 64, 96, 3), generator=torch.Generator().manual_seed(373))
+        output, _ = _run_sequence(
+            processor_module, face_helper, frames, final_upscale_factor=1.0)
+        return output, face_helper
+
+    host, host_helper = run(None)
+    full, _ = run("full")
+    chunked, _ = run("chunked")
+    assert tuple(host.shape) == (2, 64, 96, 3), host.shape
+    assert torch.equal(full, host), (
+        "the forced-full run drifted from the host run with a None-affine frame"
+    )
+    assert torch.equal(chunked, full), (
+        "the chunked mode drifted from the full mode with a None-affine frame"
+    )
+    # the None-affine frame never reaches the helper: no helper setup, no
+    # vendored paste - the row is the background, not the stub's zeros
+    assert "paste_faces_to_input_image" not in host_helper.calls, host_helper.calls
+    assert "add_restored_face" not in host_helper.calls, host_helper.calls
+    assert host[1].abs().sum() > 0, "the background-only row must not be zeros"

@@ -481,12 +481,42 @@ def test_the_console_writes_of_the_detection_reach_the_logger(processor_module):
 
 
 @pytest.mark.unit
-def test_every_console_write_of_the_facelib_reaches_the_logger(processor_module):
-    """The prints of the detection, of the alignment and of the paste-back."""
+def test_every_console_write_of_the_facelib_reaches_the_logger(
+    processor_module, monkeypatch
+):
+    """The prints of the detection, of the alignment and of the paste-back.
+
+    Fix 1.1 (2026-10-30) split the corpus's fates: the None-affine frame
+    (the LMEDS failure on the stub's degenerate zero landmarks)
+    short-circuits to the background-only row since the owner's critical
+    fix - it still prints the alignment warning, but it never reaches the
+    vendored paste, whose print this pin exists to route.  The corpus
+    gained a second frame whose affine estimate is valid (the estimate
+    patched to ``[None, valid]``) so the paste-back print keeps firing;
+    the stub's paste return is canvas-sized (the background-only row and
+    the vendored row must stack).
+    """
+    real_estimate = processor_module.estimate_affines
+
+    def none_then_valid(landmark_list, template):
+        result = list(real_estimate(landmark_list, template))
+        result[0] = None
+        result[1] = np.float32([[1, 0, 0], [0, 1, 0]])
+        return result
+
+    monkeypatch.setattr(processor_module, "estimate_affines", none_then_valid)
     processor = processor_module.KEEPFaceProcessor(
         _make_pack(_StubKeepNet(), _DetectingFaceHelper())
     )
-    frames = torch.rand((1, 16, 16, 3), dtype=torch.float32)
+    face_helper = processor.face_helper
+    # the stub's paste returns 512x512 - canvas-sized, so the background-only
+    # row and the vendored row stack; the print stays (it is the routing probe)
+    def canvas_sized_paste(*args, **kwargs):
+        print("Warning: Mismatch between restored_faces and inverse_affine_matrices.")
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    face_helper.paste_faces_to_input_image = canvas_sized_paste
+    frames = torch.rand((2, 16, 16, 3), dtype=torch.float32)
 
     with _pack_records() as records:
         processor.process_image_sequence(
@@ -1231,18 +1261,22 @@ def test_the_detection_pass_converts_at_most_a_group_at_a_time(
 
 @pytest.mark.unit
 def test_the_chunked_mode_keeps_one_tail_buffer(processor_module, monkeypatch):
-    """P-M4: the forced chunked mode releases its staging tail (D-R2.3.5).
+    """P-M4: the forced chunked mode ships one float32 buffer (fix 1.2 + fix 1.1, 2026-10-30).
 
     ``device_output_mode`` is patched to "chunked" (on CPU the modes are
     value-identical, the verdict just never selects a device mode by
-    itself): 3 frames at 64x64 with one black - gray - frame, so 2
-    eligible rows.  Recording every ``torch.empty``: exactly one float32
-    allocation carries the whole-clip row count (the contractual
-    ``final_batch``) and exactly one carries the eligible rows (the
-    chunked core's ``out``).  After the return the eligible buffer is
-    gone - the processor drops the name AND the row views
-    (``batched_outputs`` becomes an index set) - while the returned IMAGE
-    is ``final_batch`` itself and keeps it alive.
+    itself): 3 frames at 64x64, all batch-eligible.  Fix 1.2 removed the
+    gray skip, so the black frame of the old corpus
+    (``frames[1] = 0.0``, "the black frame is a gray frame - it leaves
+    the batch") is eligible now: all three rows ride the chunked core and
+    the paste stage's reuse fast path (fix 1.1, the buffer alias)
+    ``final_batch = chunks_out`` aliases the whole-clip IMAGE to the
+    chunked core's ``out`` - one float32 allocation, no indexed scatter.
+    Recording every ``torch.empty``: exactly one 4-D float32 allocation
+    with the whole-clip row count exists, and the returned IMAGE **is**
+    that buffer (still alive after the return; the old
+    eligible-rows staging tail and its release pin are gone with the
+    scatter).
     """
     paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
     monkeypatch.setattr(paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
@@ -1262,7 +1296,6 @@ def test_the_chunked_mode_keeps_one_tail_buffer(processor_module, monkeypatch):
     face_helper.face_parse = _TinyParseNet()
     face_helper.use_parse = True
     frames = torch.rand((3, 64, 64, 3), dtype=torch.float32)
-    frames[1] = 0.0  # the black frame is a gray frame - it leaves the batch
 
     processor = processor_module.KEEPFaceProcessor(
         _make_pack(_StubKeepNet(), face_helper)
@@ -1281,15 +1314,9 @@ def test_the_chunked_mode_keeps_one_tail_buffer(processor_module, monkeypatch):
         if dtype == torch.float32 and len(shape) == 4
     ]
     final = [ref for shape, ref in float_rows if shape[0] == 3]
-    eligible = [ref for shape, ref in float_rows if shape[0] == 2]
     assert len(final) == 1, float_rows
-    assert len(eligible) == 1, float_rows
-    # the returned IMAGE is the contractual whole-clip buffer
-    assert final[0]() is not None, "final_batch must stay alive after the return"
-    # the chunked core's eligible-rows buffer is released with its row views
-    assert eligible[0]() is None, (
-        "the chunked staging tail must be released after the indexed scatter"
-    )
+    # the returned IMAGE is the chunked core's buffer itself (the alias)
+    assert final[0]() is output, "final_batch must be the chunked core's out"
     assert tuple(output.shape) == (3, 512, 512, 3), output.shape
 
 

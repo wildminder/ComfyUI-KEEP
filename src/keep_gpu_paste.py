@@ -256,14 +256,21 @@ def device_output_mode(
 ) -> str:
     """The output-assembly mode of one paste call: ``full`` | ``chunked`` | ``host``.
 
+    Fix 2.2 (2026-10-30, the owner's ``keep-fix3.txt``): a CUDA device
+    never gets ``"host"`` - the free-VRAM chunk gate of the former body is
+    gone and the selector returns ``"full"`` while the whole eligible
+    batch's canvas fits the budget (:func:`device_canvas_budget`) and
+    ``"chunked"`` otherwise.  A genuinely starved card now enters the
+    chunked mode with the group floored at one frame
+    (:func:`paste_chunk_size`) instead of the host assembly - the OOM
+    handler stays the net (the owner-authorized trade).
+
     ``"full"`` - the F1 device canvas of the whole eligible batch
     (:func:`paste_faces_batch` with ``device_output=True``); ``"chunked"``
     - the same device assembly over frame groups, per group convert-out
     downloaded into a preallocated host buffer
     (:func:`paste_faces_batch_chunked`); ``"host"`` - the processor's host
-    assembly (a CPU device, or a canvas the budget cannot hold even one
-    chunk of - a genuinely starved card, since one chunk's canvas fits
-    whenever about 800 MB of free VRAM do).
+    assembly (a CPU device).
 
     The chunk operand is :func:`paste_chunk_size` of the canvas - the same
     value the full mode derives internally - so the chunked mode's group
@@ -281,10 +288,7 @@ def device_output_mode(
     budget = device_canvas_budget(device)
     if int(num_frames) * canvas_bytes <= budget:
         return "full"
-    chunk = paste_chunk_size(canvas_h, canvas_w, device)
-    if int(chunk) * canvas_bytes <= budget:
-        return "chunked"
-    return "host"
+    return "chunked"
 
 
 def paste_canvas_hw(
@@ -380,6 +384,7 @@ def paste_faces_batch_chunked(
     parse_chunk: int | None = None,
     face_frame: Sequence[int] | None = None,
     num_frames: int | None = None,
+    stage_bar=None,
 ) -> torch.Tensor:
     """The device-output paste of the whole eligible batch, in frame groups.
 
@@ -443,6 +448,11 @@ def paste_faces_batch_chunked(
         num_frames: the number of canvas rows - ``None`` derives it (the
             background rows with the map, the face count without).  When
             given it has to match the background stack.
+        stage_bar: the optional paste-stage progress bar - ticked with the
+            row count of every completed single-face group, after its
+            convert-out (fix 2.3, 2026-10-30).  ``None`` (the default)
+            ticks nothing.  The multi-face groups get no tick - the
+            multiface stage owns its bar and ticks it per frame.
 
     Returns:
         The ``(N, canvas_h, canvas_w, 3)`` float32 **CPU** tensor - the
@@ -531,6 +541,11 @@ def paste_faces_batch_chunked(
                 if key not in ("frames", "canvas_bytes"):
                     totals[key] += value
             comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+            # the paste bar (fix 2.3, 2026-10-30): the group's rows are
+            # done - converted out into the host buffer.  The multi-face
+            # groups below get no tick: the multiface stage owns its bar.
+            if stage_bar is not None:
+                stage_bar.tick(stop - start)
     else:
         # The multi-face groups (the cancel + multi-face round, t3):
         # frame-wise - a group never splits a frame's faces, so the inner
@@ -959,6 +974,7 @@ def paste_faces_batch(
     device_output: bool = False,
     face_frame: Sequence[int] | None = None,
     num_frames: int | None = None,
+    stage_bar=None,
 ) -> list[np.ndarray] | torch.Tensor:
     """The batched paste-back of the restored faces (design section 7.7).
 
@@ -1007,6 +1023,12 @@ def paste_faces_batch(
         num_frames: the number of canvas rows - ``None`` derives it (the
             background rows with the map, the face count without).  When
             given it has to match the background stack.
+        stage_bar: the optional paste-stage progress bar - ticked with the
+            row count of every completed chunk, after the chunk body (the
+            spec's bar threading realized as the signature the spec never
+            spelled out; 2026-10-30).  ``None`` (the default) ticks
+            nothing.  The multi-face loop gets no tick - the multiface
+            stage owns its bar and ticks it per frame.
 
     Returns:
         The pasted frames as uint8 BGR arrays - one per canvas row - or
@@ -1123,6 +1145,12 @@ def paste_faces_batch(
                         parse_chunk,
                     )
                 )
+            # the paste bar (the spec's fix-1.2 threading, 2026-10-30): the
+            # chunk's rows are pasted - host rows appended, canvas rows
+            # scattered.  The processor's loop ticks only its fallback rows,
+            # so the eligible rows tick here, per completed chunk.
+            if stage_bar is not None:
+                stage_bar.tick(stop - start)
         return canvas if device_output else pasted
 
     # The multi-face mode (the cancel + multi-face round, t3): frame-wise
@@ -1497,143 +1525,77 @@ def _paste_chunk_roi(
     canvas: torch.Tensor | None = None,
     frame_offset: int = 0,
 ) -> list[np.ndarray] | None:
-    """One chunk of the ROI paste (the steps of :func:`paste_faces_batch`).
+    """One chunk of the ROI paste, vectorized (the steps of :func:`paste_faces_batch`).
 
-    Every frame is pasted in the ROI of its transformed face: the face warp
-    runs on the device (cv2's fixed-point bilinear, bit-exact), the parse
-    mask is warped on the device (the full-canvas grid, sliced), the blend
-    runs on the device inside the ROI and only the ROI patch travels
-    between the host and the device.  The frame is assembled on the host
-    from the untouched background and the ROI patch.
+    Fix 2.1 (2026-10-30, the owner's ``keep-fix3.txt``): the chunk is one
+    batched GPU tail - the restored faces and the parse masks are warped to
+    the **full canvas** in one :func:`~.keep_gpu_ops.warp_affine_batch`
+    call each (``grid_sample``), the alpha blend runs as one tensor
+    expression and the vendored quantizing tail measures its frame-global
+    maximum over the **whole canvas** (:func:`_quantize_and_clip` with
+    ``maximum=None`` on the 4-D blend).  The per-face ROI machinery
+    (``warp_face_roi``, the fixed-point warp terms, the ROI patch
+    uploads/downloads) is gone from this path; ``warp_face_roi`` itself
+    stays live in :func:`_paste_chunk_faces` (the multi-face sibling).
 
-    With a ``canvas`` (the device-output mode) the frame is never assembled
-    on the host: the background is a device tensor, the ROI patch is sliced
-    out of it on the device and the blended ROI is scattered back into
-    ``canvas[frame_offset + index]``.  The output stack stays on the device
-    until the one convert-out - the point of the change.  The bytes that
-    would have travelled are recorded in ``roi_staged_bytes`` so the
-    ROI-sized staging claim survives.
+    The pixel change is owner-authorized (the design's rule 9): the
+    full-canvas ``grid_sample`` face warp replaces the cv2 fixed-point warp
+    and the ROI slicing - the documented drift class of the reference
+    chunk (up to 8/255 on high-frequency content).  Outside a warped face's
+    footprint the warped mask is 0, so the blend there is the untouched
+    background; a whole near-black frame keeps the vendored tail's 255
+    factor implicitly (the whole-canvas maximum **is** the frame maximum),
+    so the old body's explicit full-canvas fallback branch is gone.
+
+    Transfer counters (the design's D3, dated 2026-10-30): the chunk no
+    longer stages ROI patches, so ``h2d_bytes``, ``d2h_bytes``,
+    ``roi_staged_bytes``, ``fallback_frames`` and ``canvas_bytes`` are
+    retired on this path - the keys stay in :data:`PASTE_TRANSFER_STATS`
+    and report 0 from here; ``face_h2d_bytes`` and ``roi_frames`` survive
+    (``roi_frames`` now counts the whole chunk at once).
+
+    With a ``canvas`` (the device-output mode) the quantized rows scatter
+    into ``canvas[frame_offset : frame_offset + len(faces)]`` and the
+    return stays ``None``; without it the chunk returns the pasted rows as
+    host arrays.
     """
-    faces_u8 = torch.from_numpy(np.ascontiguousarray(faces)).to(device)
+    faces_u8 = torch.from_numpy(np.ascontiguousarray(faces)).to(device, non_blocking=True)
     PASTE_TRANSFER_STATS["face_h2d_bytes"] += faces_u8.numel() * faces_u8.element_size()
     faces_bchw = faces_u8.permute(0, 3, 1, 2)  # (N, 3, 512, 512) BGR
 
     # 1. the parse mask of the faces
     masks = parse_soft_masks_batched(parse_net, faces_bchw, device, parse_chunk)
 
-    # 2. the ROI of every frame
+    background_t = (
+        background if torch.is_tensor(background)
+        else torch.from_numpy(np.ascontiguousarray(background)).to(device)
+    )
+    # the full-canvas background in the BCHW float32 the blend shares with
+    # the two batched warps
+    bg_bchw = background_t.permute(0, 3, 1, 2).float()
+
+    # 2. the inverse warp of the faces and of the parse masks at the full
+    # canvas - one batched call each; the ROI patch uploads/downloads and
+    # the per-face host arithmetic are gone
+    warped_faces = warp_affine_batch(faces_bchw.float(), inverse_affines, out_size)
+    warped_masks = warp_affine_batch(masks, inverse_affines, out_size)
+
+    # 3. the blend and the vendored quantizing tail - the frame-global
+    # maximum is measured over the whole canvas (the vendored granularity),
+    # which keeps the near-black 255 factor implicit
+    blended = warped_masks * warped_faces + (1.0 - warped_masks) * bg_bchw
+    quantized = _quantize_and_clip(blended).round_().to(torch.uint8)
+
+    # 4. the output
     if canvas is not None:
-        background = background.to(device) if not torch.is_tensor(background) else background
-    height, width = background.shape[1:3]
-    PASTE_TRANSFER_STATS["canvas_bytes"] = int(height * width * 3)
-    rois = [
-        face_roi_box(inverse_affines[index], (height, width))
-        for index in range(len(inverse_affines))
-    ]
-    terms = [
-        warp_fixed_point_terms(inverse_affines[index], width, height)
-        for index in range(len(inverse_affines))
-    ]
-
-    # the warped parse masks of the ROIs - one batched call for the whole
-    # chunk (the sampling arithmetic of the kernel depends on the batch, so
-    # a per-frame call would drift by a last bit)
-    warped_masks = warp_affine_batch(masks, inverse_affines, out_size, rois=rois)
-
-    blends: list[torch.Tensor] = []
-    maxima: list[torch.Tensor] = []
-    for index, roi in enumerate(rois):
-        x0, y0, x1, y1 = roi
-        warped_face = warp_face_roi(faces_bchw[index], terms[index], roi).to(torch.float32)
-        warped_mask = warped_masks[index][0]
-        if canvas is None:
-            patch = np.ascontiguousarray(background[index][y0:y1, x0:x1])
-            patch_t = torch.from_numpy(patch).to(device)
-            PASTE_TRANSFER_STATS["h2d_bytes"] += patch_t.numel() * patch_t.element_size()
-            patch_t = patch_t.permute(2, 0, 1).to(torch.float32)
-        else:
-            # the device-output mode: the ROI patch is sliced out of the
-            # device background - nothing travels, the bytes are recorded
-            patch_t = background[index][y0:y1, x0:x1].permute(2, 0, 1).to(torch.float32)
-            PASTE_TRANSFER_STATS["roi_staged_bytes"] += patch_t.numel() * patch_t.element_size()
-        blends.append(warped_mask * warped_face + (1.0 - warped_mask) * patch_t)
-        maxima.append(blends[-1].amax())
-
-    # one synchronisation for the whole chunk: the frame-global maximum of
-    # the vendored tail is the only place where the whole frame matters
-    frame_maxima = torch.stack(maxima).cpu().numpy()
-
-    pasted: list[np.ndarray] = []
-    full_masks: list[torch.Tensor] | None = None
-    for index, roi in enumerate(rois):
-        x0, y0, x1, y1 = roi
-        maximum = maxima[index]
-        if float(frame_maxima[index]) <= 1.001:
-            # the rare branch: the four bands of the background.  In the
-            # canvas mode the background is a device tensor - the helper is
-            # a numpy one, and the branch is rare by construction, so this
-            # one frame is downloaded rather than the helper being
-            # duplicated for the device.
-            outside = _background_max_outside(
-                background[index].cpu().numpy() if canvas is not None
-                and torch.is_tensor(background) else background[index],
-                roi)
-
-            if outside <= 1.001:
-                # the whole frame is near black: the vendored tail scales the
-                # **whole canvas** by 255 - the full-canvas fallback
-                PASTE_TRANSFER_STATS["fallback_frames"] += 1
-                if full_masks is None:
-                    # the batched full-canvas warp of the masks - the
-                    # fallback has to use the very same sampling as the
-                    # full-canvas path
-                    full_masks = list(warp_affine_batch(masks, inverse_affines, out_size))
-                if canvas is not None:
-                    # the device-output mode writes the fallback straight
-                    # into the canvas (``_paste_frame_full_canvas`` takes a
-                    # numpy background there - the frame is downloaded only
-                    # for the fallback, which is rare by construction)
-                    canvas[frame_offset + index] = _paste_frame_full_canvas(
-                        faces[index],
-                        inverse_affines[index],
-                        full_masks[index][0],
-                        background[index].cpu().numpy() if torch.is_tensor(background)
-                        else background[index],
-                        device,
-                        out_size,
-                        return_device=True,
-                    )
-                    PASTE_TRANSFER_STATS["roi_frames"] += 1
-                    continue
-                pasted.append(
-                    _paste_frame_full_canvas(
-                        faces[index],
-                        inverse_affines[index],
-                        full_masks[index][0],
-                        background[index],
-                        device,
-                        out_size,
-                    )
-                )
-                continue
-            maximum = torch.tensor(
-                max(float(frame_maxima[index]), outside), device=device
-            )
-        quantized = _quantize_and_clip(blends[index], maximum=maximum).round_().to(torch.uint8)
-        if canvas is not None:
-            # the device-output mode: the blended ROI is scattered into the
-            # canvas - no download, no host assembly
-            canvas[frame_offset + index, y0:y1, x0:x1] = quantized.permute(1, 2, 0)
-            PASTE_TRANSFER_STATS["roi_staged_bytes"] += quantized.numel()
-            PASTE_TRANSFER_STATS["roi_frames"] += 1
-            continue
-        patch = quantized.permute(1, 2, 0).contiguous().cpu().numpy()
-        PASTE_TRANSFER_STATS["d2h_bytes"] += patch.nbytes
-        frame = background[index].copy()
-        frame[y0:y1, x0:x1] = patch
-        pasted.append(frame)
-        PASTE_TRANSFER_STATS["roi_frames"] += 1
-    return pasted
+        # the device-output mode: the whole rows scatter into the canvas -
+        # no download, no host assembly
+        canvas[frame_offset : frame_offset + len(faces)] = quantized.permute(0, 2, 3, 1)
+        PASTE_TRANSFER_STATS["roi_frames"] += len(faces)
+        return None
+    result_np = quantized.permute(0, 2, 3, 1).cpu().numpy()
+    PASTE_TRANSFER_STATS["roi_frames"] += len(faces)
+    return list(result_np)
 
 
 def _paste_chunk_faces(

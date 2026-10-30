@@ -20,11 +20,13 @@ What it pins:
   (:data:`CROP_TOLERANCE`, Opt 1) to both paste branches, and the parse
   mask blur of the device adds :data:`PASTE_TOLERANCE` on the batched-paste
   branch;
-- the **ROI path** - the shipped paste runs in the ROI of the transformed
-  face, and the suite asserts the ROI marker (the product's own transfer
-  accounting) over both paste branches (with and without a parse net) and
-  the small-frame case: the pixels alone cannot prove that the ROI path
-  ran, because it produces the same image as the full-canvas paste.
+- the **ROI path** - the shipped paste runs the vectorized chunk (fix 2.1,
+  2026-10-30: the full-canvas ``grid_sample`` face warp replaced the cv2
+  fixed-point warp + ROI slicing), and the suite asserts the ROI marker
+  (the product's own transfer accounting) over both paste branches (with
+  and without a parse net) and the small-frame case: the pixels alone
+  cannot prove that the vectorized chunk ran, because it produces a
+  within-tolerance image of the full-canvas paste.
 
 The test is skipped when the base implementation cannot be reached (a
 distribution without the git history) - it never fails silently.
@@ -366,25 +368,30 @@ def _run_marked(gpu_paste, module, helper, frames, **kwargs):
 def test_the_batched_paste_takes_the_roi_path(
     helper_module, base_module, shipped_module, gpu_paste, frame_hw
 ):
-    """The shipped paste runs in the ROI of the transformed face.
+    """The shipped paste runs the vectorized chunk (the fix-2.1 marker).
 
-    The ROI paste (the paste-stage CPU optimization round) is the shipped
-    path of the batched paste: the face warp, the parse-mask warp and the
-    blend run on the ROI of the transformed face and only the ROI patch
-    travels between the host and the device.
+    The paste-stage CPU optimization round made the ROI path the shipped
+    path of the batched paste; fix 2.1 (2026-10-30, the owner's
+    ``keep-fix3.txt``) vectorized that chunk - the full-canvas
+    ``grid_sample`` face warp replaced the cv2 fixed-point warp + ROI
+    slicing, and the ROI patch transfers are gone with it.
 
     The **ROI marker** - the product's own transfer accounting - is what
     proves that the path was taken.  The pixels alone would not: the
-    full-canvas paste produces the same image (the next test pins that),
-    so a suite that only compared the output would stay green with the
-    ROI path switched off.
+    full-canvas paste produces a within-tolerance image (the next test
+    pins that), so a suite that only compared the output would stay green
+    with the vectorized chunk switched off.
 
     Both frame sizes are covered: the normal 720x1280 and the
     ``min(h, w) < 512`` frame, whose canvas is the 512 px upscaled frame
     of the vendored ``read_image``.  The tolerance against the base
-    implementation is the device crop's envelope (:data:`CROP_TOLERANCE`,
-    Opt 1) plus the documented :data:`PASTE_TOLERANCE` (1/255) of the
-    parse blur - the ROI path must not widen it further.
+    implementation is re-measured (2026-10-30): the vectorized paste's
+    full-canvas ``grid_sample`` face warp joins the documented drift class
+    of the batched warps (up to 8/255 on high-frequency content) - the
+    whole-pipeline residual measured **4/255** (720x1280) and **2/255**
+    (300x400), pinned inside the crop's own class bound
+    (:data:`CROP_TOLERANCE`); the parse blur (:data:`PASTE_TOLERANCE`)
+    rides inside the same envelope.
     """
     height, width = frame_hw
     frames = _synthetic_frames(2, height, width)
@@ -401,22 +408,21 @@ def test_the_batched_paste_takes_the_roi_path(
         f"{shipped.shape} != {base.shape}"
     )
     diff = np.abs(base.astype(np.float32) - shipped.astype(np.float32))
-    assert diff.max() <= (CROP_TOLERANCE + PASTE_TOLERANCE) / 255.0 + 1e-6, (
-        f"the ROI paste drifted {diff.max() * 255:.2f}/255 from the base "
+    assert diff.max() <= CROP_TOLERANCE / 255.0 + 1e-6, (
+        f"the vectorized paste drifted {diff.max() * 255:.2f}/255 from the base "
         f"for {height}x{width}"
     )
 
-    # the ROI marker: both frames took the ROI path, none of them fell
-    # back to the full canvas (the near-black branch)
+    # the ROI marker: both frames took the vectorized chunk, none of them
+    # fell back (the near-black branch of the old body is deleted)
     assert marker["frames"] == 2, marker
     assert marker["roi_frames"] == 2, marker
     assert marker["fallback_frames"] == 0, marker
-    # the transfers are ROI-sized, not canvas-sized: the ROI patch of every
-    # frame is smaller than the canvas it was cut from (the counters sum
-    # the frames of the call)
-    assert marker["h2d_bytes"] == marker["d2h_bytes"], marker
-    assert 0 < marker["h2d_bytes"] < 2 * marker["canvas_bytes"], marker
-    assert marker["h2d_bytes"] / marker["frames"] < marker["canvas_bytes"], marker
+    # retired by fix 2.1 (2026-10-30): no ROI patch travels any more - the
+    # vectorized chunk warps and blends at the full canvas on the device
+    assert marker["h2d_bytes"] == 0, marker
+    assert marker["d2h_bytes"] == 0, marker
+    assert marker["canvas_bytes"] == 0, marker
     # the restored faces are uploaded whole - they are not ROI-sized by nature
     assert marker["face_h2d_bytes"] == 2 * 512 * 512 * 3, marker
 
@@ -461,23 +467,24 @@ def test_the_vendored_paste_branch_does_not_take_the_roi_path(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("frame_hw", [(720, 1280), (300, 400)])
-def test_the_roi_path_is_bit_identical_to_the_full_canvas_path(
+def test_the_roi_path_matches_the_full_canvas_path_within_the_measured_residual(
     helper_module, shipped_module, gpu_paste, monkeypatch, frame_hw
 ):
-    """The end-to-end output of the ROI path == the output of the full canvas.
+    """The end-to-end vectorized ROI path vs the full-canvas reference.
 
-    The full-canvas paste (``use_roi=False``) is the reference the ROI
-    path replaces.  Forcing it **inside the same pipeline** isolates the
-    ROI change - the crop, the restore and the background are the very
-    same operations - so the two outputs have to be the same bytes.
-
-    The pin is bit-exact: the ROI path may not change a pixel of the
-    shipped output - the two paths differ in **where** the paste
-    computes, not in **what** it computes.
+    The full-canvas paste (``use_roi=False``) is the reference (the
+    unchanged ``_paste_chunk``).  Forcing it **inside the same pipeline**
+    isolates the paste change - the crop, the restore and the background
+    are the very same operations.  Fix 2.1 (2026-10-30, the owner's
+    ``keep-fix3.txt``) vectorized the ROI chunk - the full-canvas
+    ``grid_sample`` face warp replaced the cv2 fixed-point warp + ROI
+    slicing, so the two paths are no longer byte-identical; the pin holds
+    the measured residual instead: **2/255** (720x1280) and **1/255**
+    (300x400), pinned at the 8/255 class bound of the batched warps.
 
     The small-frame case (``min(h, w) < 512``) is covered as well: its
     canvas is the 512 px upscaled frame of the vendored ``read_image``
-    (512x683 here), so the ROI is cut from a second canvas geometry.
+    (512x683 here), so the warp runs at a second canvas geometry.
     """
     height, width = frame_hw
     frames = _synthetic_frames(2, height, width)
@@ -504,6 +511,10 @@ def test_the_roi_path_is_bit_identical_to_the_full_canvas_path(
     assert full_marker["h2d_bytes"] == 0, full_marker
     assert full_marker["d2h_bytes"] == 0, full_marker
 
-    assert np.array_equal(roi_out.numpy(), full_out.numpy()), (
-        f"the ROI path changed the output of the {height}x{width} pipeline"
+    diff = np.abs(
+        roi_out.numpy().astype(np.float32) - full_out.numpy().astype(np.float32)
+    ).max()
+    assert diff <= CROP_TOLERANCE / 255.0 + 1e-6, (
+        f"the vectorized ROI path drifted {diff * 255:.2f}/255 from the "
+        f"full-canvas reference for the {height}x{width} pipeline"
     )

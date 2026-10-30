@@ -839,15 +839,20 @@ def test_the_sequence_golden_fixtures_are_reproduced_bit_for_bit(
 
     The fixtures were captured by ``tools/capture_round4_golden.py`` and
     re-captured in round 6, after the owner-authorized pixel changes (Opt 1
-    - the GPU crop - and Opt 3 - the float32 normalization and smoothing);
-    they are the round-6 pixel-policy baseline.  This pin re-runs the case
-    through the current code and demands the same bytes - the returned IMAGE
-    tensor, the KEEP call shapes (the chunk boundaries are a quality
-    contract) and the parse-call count.  ``single_seq`` is all sub-512
-    (every frame carries the vendored upscale, so the re-derived crop
-    source of the fused loop is exercised), ``multiface_seq`` has the gray
-    face-less frame (the background gather) and the 3/3/1 restore chunks
-    (the 1-face duplicate-to-2).
+    - the GPU crop - and Opt 3 - the float32 normalization and smoothing),
+    and on 2026-10-30 after keep-fix3 (fix 2.1 - the vectorized
+    ``_paste_chunk_roi`` - moved the pasted pixels, and fix 1.2 made
+    ``single_seq``'s gray frame batch-eligible, moving its
+    ``output_frames`` and ``parse_calls``; the other three cases are
+    byte-identical to the round-6 capture).  They are the keep-fix3
+    pixel-policy baseline.  This pin re-runs the case through the current
+    code and demands the same bytes - the returned IMAGE tensor, the KEEP
+    call shapes (the chunk boundaries are a quality contract) and the
+    parse-call count.  ``single_seq`` is all sub-512 (every frame carries
+    the vendored upscale, so the re-derived crop source of the fused loop
+    is exercised) and its gray frame rides the batched core since fix 1.2,
+    ``multiface_seq`` has the gray face-less frame (the background gather)
+    and the 3/3/1 restore chunks (the 1-face duplicate-to-2).
     """
     monkeypatch.setattr(helper_module, "init_detection_model", lambda *a, **k: object())
     monkeypatch.setattr(helper_module, "init_parsing_model", lambda *a, **k: object())
