@@ -2,10 +2,13 @@
 
 The batched paste of ``src/keep_gpu_paste.py`` gains the ``face_frame``
 map: the faces, the affines and the ROIs are **face-indexed**, the
-background, the canvas and the output stay **frame-indexed**, and a row's
-faces composite **sequentially** into a per-row float32 accumulator - the
-vendored op order (``face_restoration_helper.py:495``) - with the
-quantizing tail once per row (``:497-507``).
+background, the canvas and the output stay **frame-indexed**.  The owner's
+fix 4 (2026-10-31) reworked the chunk: every face runs the per-face ROI
+tail of the single-face chunk (``_compute_roi_theta`` + ``F.affine_grid``
+/ ``F.grid_sample``, the plain ``round_().clamp_(0, 255)`` quantize) into
+its row - the t3 sequential per-row accumulator and the near-black
+full-canvas fallback are gone, so overlapping ROIs no longer see an
+earlier face's blend and a fully near-black row stays dark.
 
 The pins:
 
@@ -14,15 +17,16 @@ The pins:
    one ``paste_faces_to_input_image`` call (the reference of design
    section 4) - on the smooth and the noise corpus, with overlapping and
    with disjoint ROIs, at the upscale factors 1 and 2;
-2. the 1-face degeneration is **bit-exact** against the shipped identity
-   path (``face_frame=None``), in the host, device-output and chunked
-   assemblies;
+2. the 1-face degeneration holds the **measured residual** against the
+   shipped identity path (``face_frame=None``), in the host, device-output
+   and chunked assemblies;
 3. the device-output canvas and the chunked assembly are **bit-exact**
    against the host stack for a ragged multi-face layout, across group
    boundaries (a group never splits a frame's faces);
-4. the near-black tail is per **row**: a fully near-black row takes the
-   full-canvas fallback with all its faces, a near-black face inside a
-   bright row does not;
+4. the near-black tail is plain on this path: a fully near-black row
+   stays dark (no fallback, no 255 factor) while the vendored composite
+   amplifies, and a near-black face inside a bright row does not disturb
+   the row;
 5. the cancel poll runs once per group (the C1 contract of the new
    loops);
 6. the map is validated loudly (wrong length, out-of-range row, the
@@ -268,9 +272,12 @@ def test_the_multi_face_rows_match_the_vendored_composite_on_noise_content(
     gradients reach 255 per pixel); the overlapping pair rides the same
     bound the single-face noise pin measures.
 
-    Measured: **2/255** at worst, ~0.1% of the pixels differing at all -
-    below the single-face noise bound, the sequential blend propagating
-    the warp residual with a weight below one.
+    Round 10 (the owner's fix 4, 2026-10-31): the chunk's per-face ROI
+    ``grid_sample`` warp (``_compute_roi_theta``) replaced the cv2-exact
+    fixed-point ROI warp, and a face blends against the background patch,
+    not against the earlier faces' composite - so the drift class moved.
+    Measured on this content: **4/255** at worst (the overlapping pair of
+    row 0), pinned at the 8/255 class bound of the batched warps.
     """
     faces, affines, face_frame, background = _multiface_corpus(
         gpu_ops,
@@ -298,7 +305,7 @@ def test_the_multi_face_rows_match_the_vendored_composite_on_noise_content(
             1.0, parse_net,
         )
         diff = np.abs(reference.astype(int) - pasted[row].astype(int))
-        assert diff.max() <= 2, (
+        assert diff.max() <= 8, (
             f"row {row}: the multi-face paste drifted {diff.max()}/255 on noise"
         )
 
@@ -361,16 +368,13 @@ def test_a_one_face_per_row_map_matches_the_identity_path_within_the_measured_re
     """``face_frame=[0, 1, 2]`` on one-face rows vs the shipped identity path.
 
     Fix 2.1 (2026-10-30, the owner's ``keep-fix3.txt``) vectorized the
-    single-face chunk (the identity path): the full-canvas ``grid_sample``
-    face warp replaced the cv2 fixed-point warp + ROI slicing, while the
-    multi-face chunk (the mapped path) keeps that cv2-exact ROI math - so
-    a 1-face row no longer degenerates to the identity path byte for byte.
-    The pin holds the measured residual instead: per assembly, the max
-    diff of the mapped rows against the identity rows - measured **3/255**
-    (host stack and device canvas) and **2/255** (chunked IMAGE rows),
-    pinned at the 8/255 class bound of the batched warps.  The mapped
-    device canvas stays bit-exact against its own host stack (the sibling
-    pin below).
+    single-face chunk (the identity path), which left the mapped path a
+    measured residual off it (3/255).  Round 10 (the owner's fix 4,
+    2026-10-31) gives both chunks the same per-face ROI tail - a 1-face
+    row degenerates to the identity path **byte for byte** again: the
+    mapped rows are bit-exact against the identity rows in every assembly
+    (host stack, device canvas, chunked IMAGE rows; measured 0/255, the
+    bound stays at the 8/255 class limit of the batched warps).
     """
     faces, affines, face_frame, background = _multiface_corpus(
         gpu_ops,
@@ -436,7 +440,9 @@ def test_the_device_output_canvas_is_bit_identical_to_the_host_stack_multi_face(
     device; with the map the scatter targets are the mapped rows.  The
     canvas has to equal the list of the host rows exactly - on every
     pixel, for every row of the ragged layout - and the counters keep
-    their row semantics.
+    their row semantics.  Round 10 (the owner's fix 4, 2026-10-31): the
+    ROI patch staging retired with the accumulator - ``roi_staged_bytes``
+    stays 0 on this path and only ``face_h2d_bytes`` counts the upload.
     """
     faces, affines, face_frame, background = _multiface_corpus(
         gpu_ops,
@@ -469,7 +475,8 @@ def test_the_device_output_canvas_is_bit_identical_to_the_host_stack_multi_face(
         )
     stats = gpu_paste.PASTE_TRANSFER_STATS
     assert stats["h2d_bytes"] == 0 and stats["d2h_bytes"] == 0, stats
-    assert stats["roi_staged_bytes"] > 0, stats
+    assert stats["roi_staged_bytes"] == 0, stats
+    assert stats["face_h2d_bytes"] > 0, stats
     assert stats["frames"] == 3 and stats["roi_frames"] == 3, stats
     assert stats["fallback_frames"] == 0, stats
 
@@ -585,22 +592,24 @@ def test_the_chunked_multi_face_assembly_is_independent_of_the_group_boundaries(
 
 
 @pytest.mark.unit
-def test_a_near_black_row_takes_the_full_canvas_fallback_with_all_its_faces(
+def test_a_near_black_row_stays_dark_without_the_full_canvas_fallback(
     gpu_paste, gpu_ops, face_helper
 ):
-    """A row that is near black **everywhere** falls back with all faces.
+    """A row that is near black **everywhere** stays dark - no fallback (round 10).
 
     The vendored tail scales the **whole canvas** by 255 when the blended
-    frame is near black (``:497-507``) - a row-global operation the ROI
-    cannot reproduce.  With two faces on the row the fallback has to
-    re-blend **all** of them at the full canvas (the vendored ``:495``
-    order) before the tail.  The pin holds the fallback row bit-identical
-    between the host and the device-output modes and bound-checked
-    against the vendored composite, which takes the same branch.
-
-    Measured against the vendored: **1/255** at worst, ~0.1% of the pixels
-    differing at all - the parse-mask drift, amplified once by the x255
-    tail.
+    frame is near black (``:497-507``); the t3 chunk re-blended such a row
+    at the full canvas to reproduce it.  The owner's fix 4 (2026-10-31)
+    replaces the chunk's quantizing tail with the plain
+    ``round_().clamp_(0, 255)`` - the near-black branch (and its fallback)
+    is gone from this path (owner-authorized pixel change): the 0/1 blend
+    quantizes back to 0/1 and the row stays dark, while the vendored
+    composite still amplifies to 255.  The pin holds exactly that: no
+    fallback counter, the row bit-identical between the host and the
+    device-output modes, dark on the batched path and amplified on the
+    vendored one (the measured behavior replacing the old
+    ``test_a_near_black_row_takes_the_full_canvas_fallback_with_all_its_faces``
+    pin, which bound the amplified row at 1/255).
     """
     canvas_hw = MULTI_CANVAS_HW
     rng = np.random.default_rng(277)
@@ -628,22 +637,23 @@ def test_a_near_black_row_takes_the_full_canvas_fallback_with_all_its_faces(
 
     host_rows = gpu_paste.paste_faces_batch(**kwargs)
     stats = gpu_paste.PASTE_TRANSFER_STATS
-    assert stats["fallback_frames"] == 1, stats
+    assert stats["fallback_frames"] == 0, stats
 
     device_canvas = gpu_paste.paste_faces_batch(device_output=True, **kwargs)
     stats = gpu_paste.PASTE_TRANSFER_STATS
-    assert stats["fallback_frames"] == 1 and stats["roi_frames"] == 1, stats
+    assert stats["fallback_frames"] == 0 and stats["roi_frames"] == 1, stats
     assert np.array_equal(
         device_canvas[0].numpy(), host_rows[0]
-    ), "the near-black fallback drifted between the host and the device modes"
+    ), "the near-black row drifted between the host and the device modes"
+
+    # the plain tail keeps the near-black row dark - no 255 factor here
+    assert int(host_rows[0].max()) <= 1, int(host_rows[0].max())
 
     reference = _vendored_multi_paste(
         face_helper, background[0], list(faces), list(affines), 1.0, parse_net,
     )
-    diff = np.abs(reference.astype(int) - host_rows[0].astype(int))
-    assert diff.max() <= 1, (
-        f"the near-black fallback drifted {diff.max()}/255 from the vendored tail"
-    )
+    # the vendored composite still takes its near-black branch
+    assert int(reference.max()) == 255, int(reference.max())
 
 
 @pytest.mark.unit

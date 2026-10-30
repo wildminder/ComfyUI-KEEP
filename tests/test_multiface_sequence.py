@@ -558,16 +558,21 @@ def test_an_all_failed_crop_set_returns_the_input_tensor(
 # Pin 5 - the ineligible frame goes entirely to the vendored fallback
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_a_gray_frame_goes_to_the_vendored_fallback_with_all_its_faces(
+def test_a_gray_frame_rides_the_batched_core_with_all_its_faces(
     processor_module, make_helper, image_utils
 ):
-    """A grayscale frame takes the vendored paste with **all** of its faces.
+    """A grayscale frame rides the batched core (round 10, the owner's fix 4).
 
-    The all-or-nothing eligibility (design section 3.4): the gray frame is
-    not device-batched, so its two faces composite through one vendored
-    ``paste_faces_to_input_image`` call - the reference composite including
-    the vendored gray conversion of ``add_restored_face`` - while the color
-    frame next to it stays on the batched path.
+    The gray skip of the multiface eligibility is gone (the owner's fix 4,
+    2026-10-31, matching the sibling's fix 1.2): the gray frame is
+    device-batched with its two faces like a color frame - no vendored
+    ``paste_faces_to_input_image`` call happens at all - and both frames'
+    outputs stay the vendored all-faces composite within the batched-crop
+    warp residual (measured **0/255** on the gray frame, **1/255** on the
+    color one, the documented 3/255 class bound).  The measured behavior
+    replacing the old
+    ``test_a_gray_frame_goes_to_the_vendored_fallback_with_all_its_faces``
+    pin (which routed the gray frame to the vendored paste).
     """
     gray = np.full((*FRAME_HW, 3), 102, dtype=np.uint8)
     frames_bgr = np.stack([gray, _smooth_frames(1)[0]])
@@ -587,8 +592,8 @@ def test_a_gray_frame_goes_to_the_vendored_fallback_with_all_its_faces(
 
     output = _run_sequence(processor_module, _KeepNet(), face_helper, frames)
 
-    assert paste_calls == [2], (
-        f"exactly the gray frame takes the vendored paste, with both faces: {paste_calls}"
+    assert paste_calls == [], (
+        f"the gray frame rides the batched core like a color frame: {paste_calls}"
     )
     ref_helper = make_helper(use_parse=True)
     ref_helper.face_parse = _StubParseNet(seed=127)
@@ -596,55 +601,59 @@ def test_a_gray_frame_goes_to_the_vendored_fallback_with_all_its_faces(
         _vendored_frame_reference(ref_helper, frames_in[0], [FACE_A, FACE_B]),
         _vendored_frame_reference(ref_helper, frames_in[1], [FACE_A, FACE_B]),
     ]))
-    assert torch.equal(output[0], expected[0]), (
-        "the gray frame must composite through the vendored paste, bit-exact"
-    )
-    drift = (output[1] - expected[1]).abs().max().item()
-    assert drift <= 3.0 / 255.0 + 1e-6, (
-        f"the color frame drifted {drift * 255:.2f}/255 from the vendored composite"
-    )
+    for row in range(2):
+        drift = (output[row] - expected[row]).abs().max().item()
+        assert drift <= 3.0 / 255.0 + 1e-6, (
+            f"frame {row} drifted {drift * 255:.2f}/255 from the vendored composite"
+        )
 
 
 @pytest.mark.unit
-def test_draw_box_pastes_every_frame_through_the_vendored_fallback(
+def test_draw_box_rides_the_batched_core_and_the_host_draws_no_box(
     processor_module, make_helper, image_utils
 ):
-    """``draw_box=True`` takes every frame to the vendored paste.
+    """``draw_box=True`` rides the batched core (round 10, the owner's fix 4).
 
-    The global gate of the batched paste (design section 3.4): the box
-    needs the vendored masks.  Every frame's output is the vendored
-    all-faces composite with one box per pasted face (PM open question 3,
-    answered by the vendored tails ``face_restoration_helper.py:428-438``).
-
-    The reference crops with the vendored ``align_warp_face`` while the
-    shipped pipeline crops with the batched device warp (Opt 1), so the
-    composite carries that warp's residual - the same documented 3/255
-    bound the sibling vendored-fallback pin uses for this smooth corpus
-    (the measured drift is 1/255, the smooth envelope of
-    ``tests/test_gpu_batch_equivalence.py``).
+    The global draw_box gate of the batched paste is gone (the owner's
+    fix 4, 2026-10-31): the boxes are drawn on the device-output canvases
+    (:meth:`_draw_boxes_on_canvas`), not through the vendored masks.  On
+    the CPU device the host branch draws none - the fix's disclosed
+    limitation - so the run's output is **bit-identical** to the
+    ``draw_box=False`` run and no vendored paste call happens (the
+    measured behavior replacing the old
+    ``test_draw_box_pastes_every_frame_through_the_vendored_fallback``
+    pin, which compared the boxed vendored composites).
     """
     frames_bgr = _smooth_frames(3)
     frames = _sequence_tensor(image_utils, frames_bgr)
-    frames_in = image_utils.comfy_batch_to_bgr_u8(frames)
     face_helper = make_helper(use_parse=True)
     face_helper.face_parse = _StubParseNet(seed=131)
     _attach_detector(face_helper, _SequenceDetector([[FACE_A, FACE_B], [FACE_C], []]))
     keep_net = _KeepNet()
+    paste_calls: list[int] = []
+    real_paste = face_helper.paste_faces_to_input_image
+
+    def recording_paste(*args, **kwargs):
+        paste_calls.append(len(face_helper.restored_faces))
+        return real_paste(*args, **kwargs)
+
+    face_helper.paste_faces_to_input_image = recording_paste
 
     output = _run_sequence(processor_module, keep_net, face_helper, frames, draw_box=True)
 
     assert keep_net.calls == [((1, 3, 3, 512, 512), False)], keep_net.calls
-    ref_helper = make_helper(use_parse=True)
-    ref_helper.face_parse = _StubParseNet(seed=131)
-    expected = image_utils.bgr_u8_batch_to_comfy(np.stack([
-        _vendored_frame_reference(ref_helper, frames_in[0], [FACE_A, FACE_B], draw_box=True),
-        _vendored_frame_reference(ref_helper, frames_in[1], [FACE_C], draw_box=True),
-        _vendored_frame_reference(ref_helper, frames_in[2], [], draw_box=True),
-    ]))
-    drift = (output - expected).abs().max().item()
-    assert drift <= 3.0 / 255.0 + 1e-6, (
-        f"the draw_box frames drifted {drift * 255:.2f}/255 from the vendored "
-        f"composite with their per-face boxes"
+    assert paste_calls == [], (
+        f"draw_box no longer routes to the vendored paste: {paste_calls}"
+    )
+    plain_helper = make_helper(use_parse=True)
+    plain_helper.face_parse = _StubParseNet(seed=131)
+    _attach_detector(
+        plain_helper, _SequenceDetector([[FACE_A, FACE_B], [FACE_C], []]))
+    plain = _run_sequence(
+        processor_module, _KeepNet(), plain_helper, frames, draw_box=False)
+    assert torch.equal(output, plain), (
+        "the CPU draw_box run drew on the host path - the fix draws the "
+        "boxes on the device canvases only"
     )
 
 
@@ -840,19 +849,25 @@ def test_the_sequence_golden_fixtures_are_reproduced_bit_for_bit(
     The fixtures were captured by ``tools/capture_round4_golden.py`` and
     re-captured in round 6, after the owner-authorized pixel changes (Opt 1
     - the GPU crop - and Opt 3 - the float32 normalization and smoothing),
-    and on 2026-10-30 after keep-fix3 (fix 2.1 - the vectorized
+    on 2026-10-30 after keep-fix3 (fix 2.1 - the vectorized
     ``_paste_chunk_roi`` - moved the pasted pixels, and fix 1.2 made
     ``single_seq``'s gray frame batch-eligible, moving its
-    ``output_frames`` and ``parse_calls``; the other three cases are
-    byte-identical to the round-6 capture).  They are the keep-fix3
-    pixel-policy baseline.  This pin re-runs the case through the current
-    code and demands the same bytes - the returned IMAGE tensor, the KEEP
-    call shapes (the chunk boundaries are a quality contract) and the
-    parse-call count.  ``single_seq`` is all sub-512 (every frame carries
-    the vendored upscale, so the re-derived crop source of the fused loop
-    is exercised) and its gray frame rides the batched core since fix 1.2,
-    ``multiface_seq`` has the gray face-less frame (the background gather)
-    and the 3/3/1 restore chunks (the 1-face duplicate-to-2).
+    ``output_frames`` and ``parse_calls``), and on 2026-10-31 after
+    keep-fix4 (round 10: the per-face ROI ``grid_sample`` chunks and the
+    plain quantize tail moved the pasted pixels of both sequence cases -
+    the multiface gray face-less frame keeps its pixels, the paste canvas
+    resize of the adapted background short-circuit is the identity on its
+    constant content; the two image cases are byte-identical to the
+    round-6 capture, the image paths never enter the batched paste).
+    They are the keep-fix4 pixel-policy baseline.  This pin re-runs the
+    case through the current code and demands the same bytes - the
+    returned IMAGE tensor, the KEEP call shapes (the chunk boundaries are
+    a quality contract) and the parse-call count.  ``single_seq`` is all
+    sub-512 (every frame carries the vendored upscale, so the re-derived
+    crop source of the fused loop is exercised) and its gray frame rides
+    the batched core since fix 1.2, ``multiface_seq`` has the gray
+    face-less frame (the background short-circuit) and the 3/3/1 restore
+    chunks (the 1-face duplicate-to-2).
     """
     monkeypatch.setattr(helper_module, "init_detection_model", lambda *a, **k: object())
     monkeypatch.setattr(helper_module, "init_parsing_model", lambda *a, **k: object())

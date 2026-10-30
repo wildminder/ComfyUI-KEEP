@@ -38,9 +38,16 @@ full-canvas result byte for byte.  Fix 2.1 (2026-10-30, the owner's
 (``_paste_chunk_roi``): the full-canvas ``grid_sample`` face warp
 replaced the cv2 fixed-point warp + ROI slicing, so the whole-paste pins
 against the unchanged full-canvas reference hold the **measured
-residual** now (the 8/255 drift class, documented per pin); the warp-op
-pins (``warp_face_roi`` and friends) stay bit-exact - the op keeps its
-production call site in ``_paste_chunk_faces``.
+residual** now (the 8/255 drift class, documented per pin).  The owner's
+fix 4 (2026-10-31) went further: both ROI chunks warp each face straight
+into its canvas ROI (``_compute_roi_theta`` + ``F.affine_grid`` /
+``F.grid_sample``) and quantize with the plain ``round_().clamp_(0, 255)``
+tail - the near-black 255-factor scaling is gone from the ROI paths
+(owner-authorized pixel change), so the dark-frame pin holds the
+divergence instead of a residual.  The warp-op pins (``warp_face_roi``
+and friends) stay bit-exact - the ops outlived their production call
+site (the fix-4 chunks stopped calling them) and are pinned as the
+reference implementations they are.
 
 The **device-output assembly** (the GPU-resident-output round) is pinned
 here as well: the VRAM budget of the device canvas, the three-way mode
@@ -920,25 +927,20 @@ def test_the_roi_transfers_are_roi_sized(gpu_paste):
 
 @pytest.mark.unit
 def test_a_dark_frame_keeps_the_whole_canvas_255_factor(gpu_paste, face_helper):
-    """A near-black frame keeps the vendored tail's whole-canvas 255 factor.
+    """A near-black frame stays dark on the batched path (round 10, the owner's fix 4).
 
     The vendored tail multiplies the **whole canvas** by 255 when the
     blended frame is near black (``face_restoration_helper.py:504-505``).
-    Fix 2.1 (2026-10-30, the owner's ``keep-fix3.txt``) deleted the old
-    body's explicit full-canvas fallback branch: the tail lives in the
-    whole-canvas maximum now (``_quantize_and_clip`` with ``maximum=None``
-    measures the frame maximum over the entire canvas), so the factor is
-    the same without the branch - the pin holds that property.
-
-    The residual against the vendored paste is the whole-canvas 255
-    amplification of the batched-warp drift (float32 ``grid_sample`` vs
-    cv2's 1/32 fixed-point sampling - the face warp joined the mask warp's
-    class under fix 2.1; the old pin's ROI==full bit-equality is gone with
-    the branch).  Measured on this content, **133/255**: a single sampled
-    tap flip on the 0/1 corpus is a full unit after the amplification.  A
-    lost 255 factor would exceed the bound by construction (the bright-frame
-    sibling below pins the inverse case), so the tail's survival stays
-    checkable.
+    The owner's fix 4 (2026-10-31) replaces the ROI chunk's quantizing
+    tail with the plain ``round_().clamp_(0, 255)`` - the near-black
+    255-factor scaling (:func:`_quantize_and_clip`) is gone from this
+    path (owner-authorized pixel change), so a near-black frame no longer
+    amplifies: the blend of the 0/1 corpus quantizes back to 0/1 and the
+    frame stays dark, while the vendored paste still scales its canvas by
+    255.  The pin holds exactly that contrast - the batched frame's
+    maximum stays at the raw blend level and the vendored reference
+    amplifies - the measured behavior replacing the fix-2.1 residual pin
+    (which bound the drift at 133/255 while the factor survived).
     """
     height, width = ROI_CANVAS_HW
     matrix = _face_to_canvas(ROI_CANVAS_HW, "interior")
@@ -964,14 +966,17 @@ def test_a_dark_frame_keeps_the_whole_canvas_255_factor(gpu_paste, face_helper):
     assert stats["fallback_frames"] == 0, stats
     assert stats["roi_frames"] == 1, stats
 
+    # the plain tail keeps the near-black frame dark: the 0/1 blend
+    # quantizes back to 0/1 - no whole-canvas 255 factor on this path
+    assert int(roi_paste[0].max()) <= 1, int(roi_paste[0].max())
+
     reference = _vendored_paste(
         face_helper, background[0], face, cv2.invertAffineTransform(matrix),
         1.0, parse_net,
     )
-    diff = np.abs(reference.astype(int) - roi_paste[0].astype(int))
-    assert diff.max() <= 133, (
-        f"the dark frame drifted {diff.max()}/255 from the vendored paste"
-    )
+    # the vendored paste still takes its near-black branch: the whole
+    # canvas is scaled by 255 - the documented divergence of the fix
+    assert int(reference.max()) == 255, int(reference.max())
 
 
 @pytest.mark.unit
@@ -1502,16 +1507,63 @@ def test_the_default_branch_of_the_paste_runs_on_the_device(processor_module):
 
 
 @pytest.mark.unit
-def test_the_vendored_paste_stays_reachable_for_the_box(processor_module):
-    """``draw_box=True`` keeps the vendored paste (the box needs its masks)."""
+def test_the_box_rides_the_batched_core(processor_module, gpu_paste, gpu_ops, monkeypatch):
+    """``draw_box=True`` rides the batched core (round 10, the owner's fix 4).
+
+    The box no longer disqualifies the batch (the owner's fix 4,
+    2026-10-31): the vendored paste is not called and the boxes are drawn
+    on the device-output canvases (:meth:`_draw_boxes_on_canvas`) - the
+    green 2-px ``face_roi_box`` border on the forced-``"full"`` canvas.
+    The host branch draws none (the disclosed CPU gap of the fix): the
+    unpatched CPU run's output is bit-identical to the ``draw_box=False``
+    run - the measured behavior replacing the old
+    ``test_the_vendored_paste_stays_reachable_for_the_box`` pin (which
+    routed the box through the vendored paste).
+    """
     landmarks = (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0])
     face_helper = _ParseFaceHelper(parse_net=_StubParseNet(), landmarks=landmarks)
     frames = torch.rand((1, 64, 96, 3), dtype=torch.float32)
 
     output, _ = _run_sequence(processor_module, face_helper, frames, draw_box=True)
 
-    assert "paste_faces_to_input_image" in face_helper.calls, face_helper.calls
+    assert "paste_faces_to_input_image" not in face_helper.calls, face_helper.calls
     assert tuple(output.shape) == (1, 64, 96, 3), output.shape
+
+    # the host branch of the same run draws no box: the output is the
+    # draw_box=False run bit for bit
+    plain, _ = _run_sequence(processor_module, face_helper, frames, draw_box=False)
+    assert torch.equal(output, plain), "the CPU draw_box run drew on the host path"
+
+    # the device canvas carries the green 2-px border of the face's ROI
+    frames_u8 = smooth_frames_u8(1, (64, 96), seed=293)
+    landmarks_u8 = synthetic_landmarks(1, (64, 96), seed=297)
+    rng = np.random.default_rng(307)
+    faces = rng.integers(0, 256, size=(1, 512, 512, 3), dtype=np.uint8)
+    affines = gpu_ops.estimate_affines(landmarks_u8, FACE_TEMPLATE)
+    inverses = gpu_ops.inverse_affines(affines, upscale_factor=1.0)
+    gray_flags = np.zeros(1, dtype=bool)
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _ParseFaceHelper(parse_net=_StubParseNet(seed=311))))
+
+    monkeypatch.setattr(gpu_paste, "device_output_mode", lambda *a, **k: "full")
+    boxed = processor._batched_paste(
+        frames_u8, faces, list(affines), landmarks_u8, 1.0, True, gray_flags)
+    canvas = boxed.pop(gpu_paste.DEVICE_CANVAS_KEY)
+    x0, y0, x1, y1 = gpu_paste.face_roi_box(inverses[0], (64, 96))
+    assert x1 > x0 + 2 and y1 > y0 + 2, (x0, y0, x1, y1)
+    green = torch.tensor([0, 255, 0], dtype=torch.uint8)
+    assert torch.equal(canvas[0, y0 : y0 + 2, x0:x1], green.expand(2, x1 - x0, 3)), (
+        "the top border of the box is missing from the canvas"
+    )
+    assert torch.equal(canvas[0, y1 - 2 : y1, x0:x1], green.expand(2, x1 - x0, 3)), (
+        "the bottom border of the box is missing from the canvas"
+    )
+    assert torch.equal(canvas[0, y0:y1, x0 : x0 + 2], green.expand(y1 - y0, 2, 3)), (
+        "the left border of the box is missing from the canvas"
+    )
+    assert torch.equal(canvas[0, y0:y1, x1 - 2 : x1], green.expand(y1 - y0, 2, 3)), (
+        "the right border of the box is missing from the canvas"
+    )
 
 
 @pytest.mark.unit

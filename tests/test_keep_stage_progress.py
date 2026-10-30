@@ -766,9 +766,14 @@ def test_the_multiface_stage_bars_count_the_stages(
     5 frames with the layout ``[[A, B], [C], [], [A], [C]]``: the
     detection ticks are 5x1 (frames); the crop is ONE tick equal to the
     face count (``unit="faces"``); the restore per-chunk ticks sum to the
-    face count (``[2, 2, 1]`` at ``max_clip_length=2``); the paste ticks
-    are 5x1 (frames).  The V3 reporter keeps its exact sequence and its
-    faces-aware total.
+    face count (``[2, 2, 1]`` at ``max_clip_length=2``).  Round 10 (the
+    owner's fix 4, 2026-10-31): the paste bar is threaded into the
+    batched multiface paste - the four batched rows tick per completed
+    group (``[4]``, one group at this canvas) and the face-less frame 2
+    ticks in the loop (``[1]``), so the bar still totals the frame count
+    exactly (previously the stage ticked every row in the loop,
+    ``[1, 1, 1, 1, 1]``).  The V3 reporter keeps its exact sequence and
+    its faces-aware total.
     """
     bars: list = []
     progress_events: list = []
@@ -824,7 +829,10 @@ def test_the_multiface_stage_bars_count_the_stages(
     assert detection.ticks == [1, 1, 1, 1, 1], detection.ticks
     assert crop.ticks == [5], crop.ticks  # ONE tick of the face count
     assert restore.ticks == [2, 2, 1], restore.ticks
-    assert paste.ticks == [1, 1, 1, 1, 1], paste.ticks
+    # the batched rows tick per group in the paste core, the face-less
+    # frame ticks in the loop - the sum stays the frame count
+    assert paste.ticks == [4, 1], paste.ticks
+    assert sum(paste.ticks) == paste.total, paste.ticks
     assert [bar.total for bar in bars] == [5, 5, 5, 5], [bar.total for bar in bars]
     assert [bar.finishes for bar in bars] == [1, 1, 1, 1], [bar.finishes for bar in bars]
     assert [bar.ops[-1] for bar in bars] == [("finish",)] * 4, [bar.ops[-1] for bar in bars]

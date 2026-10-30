@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 import cv2
 import numpy as np
+from collections.abc import Sequence
+
 from .keep_console import capture_console_to_logger
 from .keep_image_utils import (
     bgr_u8_batch_to_comfy,
@@ -177,6 +179,53 @@ class KEEPFaceProcessor:
         s = torch.clamp(s.movedim(-3, -1), min=0, max=1.0)
         return comfy_image_to_cv2(s)
 
+    def _draw_boxes_on_canvas(
+        self,
+        canvas: torch.Tensor,
+        affines: Sequence[np.ndarray | None],
+        canvas_hw: tuple[int, int],
+        face_rows: Sequence[int] | None = None,
+    ) -> None:
+        """Draw the 2-px green face boxes onto the paste canvas, in place.
+
+        The owner's fix 4 (2026-10-31): ``draw_box`` no longer disqualifies
+        the batched paste - the box is drawn on the device canvas / chunk
+        buffer after the paste, one box per face at the face's
+        :func:`~.keep_gpu_paste.face_roi_box` (the same box geometry the
+        vendored paste's border masks cover).
+
+        Disclosed limitations of the fix: the boxes land on the
+        **device-output** canvases only (the ``"full"`` uint8 canvas and
+        the ``"chunked"`` float32 buffer) - the host branch draws none, so
+        a CPU run with ``draw_box`` loses the boxes on the batched frames.
+        On the float32 chunk buffer the uint8 color casts on assignment
+        (the box lands at ``255.0`` in the 0..1 IMAGE scale; the ComfyUI
+        consumers clamp after the ``*255`` round trip, so the rendered box
+        is the same green).
+
+        Args:
+            canvas: the ``(N, H, W, 3)`` canvas tensor (uint8 or float32),
+                modified in place.
+            affines: the paste's inverse affines, face-indexed - ``None``
+                skips the face (no box).
+            canvas_hw: the ``(height, width)`` of the canvas.
+            face_rows: the canvas row of every face - ``None`` keeps the
+                one-face-per-row identity (face ``i`` -> row ``i``).
+        """
+        color = torch.tensor([0, 255, 0], dtype=torch.uint8, device=canvas.device)
+        h, w = canvas_hw
+        for idx, aff in enumerate(affines):
+            if aff is None:
+                continue
+            row = idx if face_rows is None else face_rows[idx]
+            x0, y0, x1, y1 = paste_mod.face_roi_box(aff, (h, w))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            canvas[row, y0 : min(y0 + 2, h), x0:x1] = color
+            canvas[row, max(0, y1 - 2) : y1, x0:x1] = color
+            canvas[row, y0:y1, x0 : min(x0 + 2, w)] = color
+            canvas[row, y0:y1, max(0, x1 - 2) : x1] = color
+
     def _batched_paste(self,
                        input_frames_bgr: np.ndarray,
                        restored_faces: np.ndarray,
@@ -190,17 +239,24 @@ class KEEPFaceProcessor:
         """The batched paste of the default branch (design section 7.7).
 
         The frames the batched paste can handle - a valid affine, a
-        restored face of the ParseNet size, no box, no face upsampler and
-        an available parse net - are pasted on the device: the chunked
+        restored face of the ParseNet size, no face upsampler and an
+        available parse net - are pasted on the device: the chunked
         ParseNet forward, the batched parse mask, the batched inverse warp
         and the batched blend.  Since the owner's fix 1.2 (2026-10-30) a
         grayscale frame is batch-eligible - the device blend handles it
         with the same tensor logic (``gray_flags`` stays a parameter; the
         fallback loop still reads it, the eligibility no longer does).
 
+        Since the owner's fix 4 (2026-10-31) ``draw_box`` no longer
+        disqualifies the batch: in the device-output modes the boxes are
+        drawn on the canvas / chunk buffer after the paste
+        (:meth:`_draw_boxes_on_canvas` - the host branch draws none, so a
+        CPU run with ``draw_box`` keeps no boxes on the batched frames;
+        see the method's disclosed limitations).
+
         Every other frame keeps the vendored ``paste_faces_to_input_image``
-        (design section 7.7, step 6): the box, the face upsampler, the
-        frames without a face and a face helper without a parse net.
+        (design section 7.7, step 6): the face upsampler, the frames
+        without a face and a face helper without a parse net.
 
         Args:
             stage_bar: the optional paste-stage progress bar - forwarded
@@ -221,7 +277,7 @@ class KEEPFaceProcessor:
         parse_net = getattr(self.face_helper, "face_parse", None)
         if parse_net is None or not getattr(self.face_helper, "use_parse", False):
             return {}
-        if draw_box or self.face_upscale_model is not None:
+        if self.face_upscale_model is not None:
             return {}
         if avg_landmarks_sequence is None:
             return {}
@@ -232,9 +288,6 @@ class KEEPFaceProcessor:
                 continue
             if i >= len(avg_landmarks_sequence) or np.isnan(avg_landmarks_sequence[i]).any():
                 continue
-            # The gray skip is gone (the owner's fix 1.2, 2026-10-30): the
-            # device blend pastes a grayscale frame with the same tensor
-            # logic as a color frame.
             if restored_faces[i].shape[:2] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
                 continue
             eligible.append(i)
@@ -252,9 +305,9 @@ class KEEPFaceProcessor:
         # pass-through is bitwise the gather.  The faces pass through when
         # the batch covers every restored face in order; the background only
         # when every frame is eligible - the core enforces
-        # ``background.shape[0] == num_rows`` (``keep_gpu_paste.py:1058-1067``,
-        # ``num_rows = len(eligible)`` here), so a clip with a face-less or
-        # gray frame keeps the frame gather.
+        # ``background.shape[0] == num_rows`` (``num_rows = len(eligible)``
+        # here), so a clip with a face-less or gray frame keeps the frame
+        # gather.
         if eligible == list(range(len(restored_faces))):
             faces_bgr = restored_faces
         else:
@@ -263,16 +316,11 @@ class KEEPFaceProcessor:
             background_stacked = input_frames_bgr
         else:
             background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
+
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
             background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
         mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
-        if mode == "host" and self.device.type == "cuda":
-            logger.info(
-                f"Device output assembly disengaged: {len(eligible)} frames on a "
-                f"{canvas_h}x{canvas_w} canvas exceed the "
-                f"{paste_mod.device_canvas_budget(self.device)}-byte device budget "
-                "- the host assembly runs"
-            )
+
         if mode == "full":
             background = batched_bg_frames(
                 background_stacked, final_upscale_factor, self.bg_upscale_model,
@@ -285,7 +333,10 @@ class KEEPFaceProcessor:
                 parse_net=parse_net,
                 device_output=True,
                 stage_bar=stage_bar)
+            if draw_box:
+                self._draw_boxes_on_canvas(canvas, inverses, (canvas_h, canvas_w))
             return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
+
         if mode == "chunked":
             chunks = paste_mod.paste_faces_batch_chunked(
                 faces_bgr=faces_bgr,
@@ -297,7 +348,10 @@ class KEEPFaceProcessor:
                 canvas_hw=canvas_hw,
                 parse_net=parse_net,
                 stage_bar=stage_bar)
+            if draw_box:
+                self._draw_boxes_on_canvas(chunks, inverses, (canvas_h, canvas_w))
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
+
         background = batched_bg_frames(
             background_stacked, final_upscale_factor, self.bg_upscale_model,
             self.device, canvas_hw=canvas_hw)
@@ -319,26 +373,44 @@ class KEEPFaceProcessor:
                                  final_upscale_factor: float,
                                  draw_box: bool,
                                  gray_flags: np.ndarray,
-                                 canvas_hw: tuple[int, int] | None = None) -> dict:
+                                 canvas_hw: tuple[int, int] | None = None,
+                                 stage_bar=None) -> dict:
         """The batched paste of the multi-face branch (design section 3.4).
 
-        The sibling of :meth:`_batched_paste` - which stays byte-untouched for
-        the shipped one-face-per-frame path - for the frames with **several**
-        faces: the canvas rows, the background and the output stay
-        **frame-indexed** while the faces, the inverses, the masks and the
-        ROIs are **face-indexed**, joined by the ``face_frame`` map of
+        The sibling of :meth:`_batched_paste` for the frames with
+        **several** faces: the canvas rows, the background and the output
+        stay **frame-indexed** while the faces, the inverses, the masks and
+        the ROIs are **face-indexed**, joined by the ``face_frame`` map of
         ``src/keep_gpu_paste.py`` (the t3 paste core).
 
         The eligibility is **per frame, all-or-nothing**: a frame is
-        device-batched iff it has at least one face, is not gray, and
-        **every** face is eligible (an affine, no NaN landmarks, a restored
-        face of the ParseNet size) - a frame with any ineligible face goes
-        entirely to the vendored fallback with all its faces (mixing device
-        ROIs and a vendored composite in one frame would need a float
-        accurate hand-off).  A ``None`` affine or NaN landmarks never reach
-        here in practice - the crop stage of the multi-face branch drops
-        those faces (``_process_sequence_multiface``) - the checks are the
-        contract of the design, kept like the sibling's.
+        device-batched iff it has at least one face and **every** face is
+        eligible (an affine, no NaN landmarks, a restored face of the
+        ParseNet size) - a frame with any ineligible face goes entirely to
+        the vendored fallback with all its faces (mixing device ROIs and a
+        vendored composite in one frame would need a float accurate
+        hand-off).  A ``None`` affine or NaN landmarks never reach here in
+        practice - the crop stage of the multi-face branch drops those
+        faces (``_process_sequence_multiface``) - the checks are the
+        contract of the design, kept like the sibling's.  Since the
+        owner's fix 4 (2026-10-31) a grayscale frame is batch-eligible
+        here too - the gray skip is gone from the eligibility
+        (``gray_flags`` stays a parameter; the fallback loop still reads
+        it), matching the sibling's fix 1.2.
+
+        Since the owner's fix 4 (2026-10-31) ``draw_box`` no longer
+        disqualifies the batch: in the device-output modes the boxes are
+        drawn on the canvas / chunk buffer after the paste
+        (:meth:`_draw_boxes_on_canvas` with the ``face_frame`` map - the
+        host branch draws none, so a CPU run with ``draw_box`` keeps no
+        boxes on the batched frames; see the method's disclosed
+        limitations).
+
+        Args:
+            stage_bar: the optional paste-stage progress bar - forwarded
+                into the paste core, which ticks the eligible rows per
+                completed chunk/group (the fallback rows are ticked by the
+                processor's loop; the owner's fix 4, 2026-10-31).
 
         Returns:
             The ``{frame index: ...}`` mapping of the **eligible** frames -
@@ -352,7 +424,7 @@ class KEEPFaceProcessor:
         parse_net = getattr(self.face_helper, "face_parse", None)
         if parse_net is None or not getattr(self.face_helper, "use_parse", False):
             return {}
-        if draw_box or self.face_upscale_model is not None:
+        if self.face_upscale_model is not None:
             return {}
 
         # The faces of every frame, in detection order (design section 3.2:
@@ -364,8 +436,6 @@ class KEEPFaceProcessor:
 
         eligible = []
         for frame, face_indices in faces_by_frame.items():
-            if gray_flags[frame]:
-                continue
             if any(
                 face_affines[k] is None
                 or np.isnan(face_landmarks[k]).any()
@@ -393,8 +463,8 @@ class KEEPFaceProcessor:
         # the eligible frames' faces are ``range(len(restored_faces))``
         # exactly then); the background only when every frame is eligible -
         # the core enforces ``background.shape[0] == num_rows``
-        # (``keep_gpu_paste.py:1058-1067``, ``num_rows = len(eligible)``
-        # here), so a clip with a face-less or gray frame keeps the gather.
+        # (``num_rows = len(eligible)`` here), so a clip with a face-less or
+        # gray frame keeps the gather.
         if batch_faces == list(range(len(restored_faces))):
             faces_stacked = restored_faces
         else:
@@ -403,18 +473,13 @@ class KEEPFaceProcessor:
             background_stacked = input_frames_bgr
         else:
             background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
+
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
             background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
         # the canvas budget counts canvas rows - the eligible **frame**
         # count, not the face count (design section 3.4)
         mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
-        if mode == "host" and self.device.type == "cuda":
-            logger.info(
-                f"Device output assembly disengaged: {len(eligible)} frames on a "
-                f"{canvas_h}x{canvas_w} canvas exceed the "
-                f"{paste_mod.device_canvas_budget(self.device)}-byte device budget "
-                "- the host assembly runs"
-            )
+
         if mode == "full":
             background = batched_bg_frames(
                 background_stacked, final_upscale_factor, self.bg_upscale_model,
@@ -427,8 +492,12 @@ class KEEPFaceProcessor:
                 parse_net=parse_net,
                 device_output=True,
                 face_frame=face_frame,
-                num_frames=len(eligible))
+                num_frames=len(eligible),
+                stage_bar=stage_bar)
+            if draw_box:
+                self._draw_boxes_on_canvas(canvas, inverses, (canvas_h, canvas_w), face_rows=face_frame)
             return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
+
         if mode == "chunked":
             chunks = paste_mod.paste_faces_batch_chunked(
                 faces_bgr=faces_stacked,
@@ -440,8 +509,12 @@ class KEEPFaceProcessor:
                 canvas_hw=canvas_hw,
                 parse_net=parse_net,
                 face_frame=face_frame,
-                num_frames=len(eligible))
+                num_frames=len(eligible),
+                stage_bar=stage_bar)
+            if draw_box:
+                self._draw_boxes_on_canvas(chunks, inverses, (canvas_h, canvas_w), face_rows=face_frame)
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
+
         background = batched_bg_frames(
             background_stacked, final_upscale_factor, self.bg_upscale_model,
             self.device, canvas_hw=canvas_hw)
@@ -452,7 +525,8 @@ class KEEPFaceProcessor:
             device=self.device,
             parse_net=parse_net,
             face_frame=face_frame,
-            num_frames=len(eligible))
+            num_frames=len(eligible),
+            stage_bar=stage_bar)
         return dict(zip(eligible, pasted))
 
     @torch.no_grad()
@@ -1182,9 +1256,11 @@ class KEEPFaceProcessor:
                 # the paste stage runs on the device - the chunked ParseNet
                 # forward, the batched parse mask, the batched inverse warp and
                 # the batched blend.  The vendored paste stays reachable for
-                # the non-default branches (``draw_box``, the face upsampler
-                # and a helper without a parse net); since the owner's fix 1.2
-                # (2026-10-30) the grayscale frames ride the batched core.
+                # the non-default branches (the face upsampler and a helper
+                # without a parse net); since the owner's fix 1.2
+                # (2026-10-30) the grayscale frames ride the batched core and
+                # since the owner's fix 4 (2026-10-31) ``draw_box`` rides it
+                # too - the boxes land on the device canvases.
                 # The paste bar is threaded in (fix 1.1): the core ticks the
                 # eligible rows per completed chunk/group.
                 batched_outputs = {}
@@ -1666,9 +1742,13 @@ class KEEPFaceProcessor:
             # chunk; the ``finally`` / OOM releases stay).
             _soft_empty_cache()
             logger.info("Pasting faces and finalizing frames")
-            # The stage bar of the paste (the stage-bar design, D3 #8): one
-            # tick per loop iteration regardless of branch - the batched
-            # rows' paste already happened inside ``_batched_paste_multiface``.
+            # The stage bar of the paste (the stage-bar design, D3 #8; the
+            # owner's fix 4, 2026-10-31): the bar is threaded into
+            # ``_batched_paste_multiface`` - the batched rows tick inside
+            # the paste core per completed chunk/group, the fallback rows
+            # tick here in the loop - nobody ticks twice, so the bar totals
+            # ``num_input_frames`` exactly (the sibling stage's fix-1.1
+            # cadence).
             paste_bar = StageBar("Pasting faces and finalizing frames", num_input_frames)
             # The paste step calls into the vendored facelib: its console
             # writes are routed to the logger of the pack (D4).
@@ -1682,13 +1762,15 @@ class KEEPFaceProcessor:
                 # paste on the device through the face-to-frame map - the faces,
                 # the affines and the ROIs are face-indexed, the canvas, the
                 # chunk buffer and the mapping stay frame-indexed.  The vendored
-                # paste stays reachable for the non-default branches (the box,
-                # the face upsampler, the grayscale frames, the frames without a
-                # parse net and the frames with an ineligible face).
+                # paste stays reachable for the non-default branches (the face
+                # upsampler, the frames without a parse net and the frames with
+                # an ineligible face); since the owner's fix 4 (2026-10-31)
+                # ``draw_box`` rides the batch (the boxes land on the device
+                # canvases) and the grayscale frames do too.
                 batched_outputs = self._batched_paste_multiface(
                     input_frames_bgr, all_restored_faces_cv2, face_affines,
                     face_frames, face_landmarks, final_upscale_factor, draw_box,
-                    gray_flags, canvas_hw=canvas_hw)
+                    gray_flags, canvas_hw=canvas_hw, stage_bar=paste_bar)
 
                 # The single tail buffer (review F4): the mode booleans are
                 # set at allocation - and in the device modes the mapping
@@ -1700,50 +1782,89 @@ class KEEPFaceProcessor:
                 device_canvas_mode = False
                 chunks_mode = False
                 if canvas is not None:
-                    # one device canvas of the whole batch: the batched indices
-                    # are already in it (it is the group canvas, indexed copy),
-                    # the vendored-fallback frames are uploaded as one stack
-                    # below, and the single convert-out runs on the device
-                    device_canvas = torch.empty(
-                        (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
-                        device=self.device)
-                    device_canvas[list(batched_outputs)] = canvas
+                    if len(batched_outputs) == num_input_frames:
+                        # every frame is batched: the canvas already holds the
+                        # rows in order - alias it (no fresh buffer, no copy)
+                        device_canvas = canvas
+                    else:
+                        # one device canvas of the whole batch: the batched indices
+                        # are already in it (it is the group canvas, indexed copy),
+                        # the vendored-fallback frames are uploaded as one stack
+                        # below, and the single convert-out runs on the device
+                        device_canvas = torch.empty(
+                            (num_input_frames, *canvas.shape[1:]), dtype=torch.uint8,
+                            device=self.device)
+                        device_canvas[list(batched_outputs)] = canvas
                     device_canvas_mode = True
                     batched_outputs = set(batched_outputs)
                     canvas = None
+
                 if chunks_out is not None:
-                    # one float32 host buffer of the whole batch: the chunked
-                    # mode's per-group convert-outs already landed in it (the
-                    # eligible rows are IMAGE rows) - one indexed copy places
-                    # them; the vendored-fallback frames are converted host-side
-                    # below (one stack, never per-frame transfers)
-                    final_batch = torch.empty(
-                        (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
-                    final_batch[list(batched_outputs)] = chunks_out
+                    if len(batched_outputs) == num_input_frames:
+                        # every frame is batched: the chunk buffer already
+                        # holds the rows in order - alias it (no fresh
+                        # buffer, no copy)
+                        final_batch = chunks_out
+                    else:
+                        # one float32 host buffer of the whole batch: the chunked
+                        # mode's per-group convert-outs already landed in it (the
+                        # eligible rows are IMAGE rows) - one indexed copy places
+                        # them; the vendored-fallback frames are converted host-side
+                        # below (one stack, never per-frame transfers)
+                        final_batch = torch.empty(
+                            (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
+                        final_batch[list(batched_outputs)] = chunks_out
                     chunks_mode = True
                     batched_outputs = set(batched_outputs)
                     chunks_out = None
                 for i in range(num_input_frames):
                     keep_interrupt.check_interrupted()
-                    paste_bar.tick()
-                    original_frame_bgr = input_frames_bgr[i]
                     if i in batched_outputs:
                         # the device modes already hold the frame (the canvas
                         # or the chunk buffer); the host mode keeps the mapping
-                        # value
+                        # value.  No bar tick here: the core ticked the row
+                        # when its chunk/group completed (the owner's fix 4).
                         if not device_canvas_mode and not chunks_mode:
                             output_frames_cv2.append(batched_outputs[i])
                         progress.update(1)
                         continue
+                    # Fallback path for the frames skipped by the batch: the
+                    # loop owns this row's paste, so it ticks the bar.
+                    paste_bar.tick(1)
+                    original_frame_bgr = input_frames_bgr[i]
+                    # The background short-circuit (the owner's fix 4,
+                    # 2026-10-31): a frame without a face - or whose every
+                    # face lost its affine - has nothing to paste: skip the
+                    # vendored helper entirely and return the background.
+                    # The snippet's raw upscaler output cannot join the
+                    # IMAGE batch when the vendored ``read_image`` upscaled
+                    # the clip (a 256 frame among 512 rows) - the output
+                    # size is the paste canvas, reached with the same
+                    # LANCZOS4 resize the vendored paste applied to its
+                    # no-face frames (adapted 2026-10-31, disclosed
+                    # deviation).
+                    frame_face_indices = faces_by_frame.get(i, [])
+                    if not frame_face_indices or any(face_affines[k] is None for k in frame_face_indices):
+                        final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
+                        canvas_h, canvas_w = paste_mod.paste_canvas_hw(
+                            original_frame_bgr.shape[:2], final_upscale_factor, canvas_hw)
+                        if final_pasted_frame.shape[0] != canvas_h or final_pasted_frame.shape[1] != canvas_w:
+                            final_pasted_frame = cv2.resize(
+                                final_pasted_frame, (canvas_w, canvas_h),
+                                interpolation=cv2.INTER_LANCZOS4)
+                        output_frames_cv2.append(final_pasted_frame)
+                        fallback_indices.append(i)
+                        progress.update(1)
+                        continue
+
                     # The vendored fallback (design section 3.5): the helper gets
                     # **all** of the frame's faces at once - the restored faces
                     # and the crop matrices of the frame, one
                     # ``get_inverse_affine``, one ``paste_faces_to_input_image``
-                    # - the reference composite by construction.  A frame without
-                    # a face pastes nothing: the vendored call then returns the
-                    # background at the target size.  ``draw_box=True`` draws one
-                    # box per pasted face for free (the vendored per-face border
-                    # masks, ``face_restoration_helper.py:428-438``).
+                    # - the reference composite by construction.
+                    # ``draw_box=True`` draws one box per pasted face for free
+                    # (the vendored per-face border masks,
+                    # ``face_restoration_helper.py:428-438``).
                     self.face_helper.clean_all()
                     # Read once (design section 7.2): ``input_img`` is the
                     # image the vendored ``read_image`` produced - re-derived
@@ -1757,7 +1878,6 @@ class KEEPFaceProcessor:
                     else:
                         self.face_helper.input_img = original_frame_bgr
                     self.face_helper.is_gray = bool(gray_flags[i])
-                    frame_face_indices = faces_by_frame.get(i, [])
                     for k in frame_face_indices:
                         # ``tensor2img_batch`` rows are uint8 already - no copy
                         # (D-R2.3.4; ``add_restored_face`` does not mutate).
