@@ -1342,6 +1342,20 @@ class KEEPFaceProcessor:
                             or np.isnan(avg_landmarks_sequence[i]).any()
                         ):
                             final_pasted_frame = self._run_upscaler(self.bg_upscale_model, original_frame_bgr)
+                            # Round 11 (2026-10-31): the fix-1.1 snippet's raw
+                            # upscaler output cannot join the IMAGE batch when
+                            # frame x model.scale != canvas x factor (the same
+                            # disclosed deviation as the multiface
+                            # short-circuit's resize): the output size is the
+                            # paste canvas, reached with the same LANCZOS4
+                            # resize the vendored paste applied to its no-face
+                            # frames.
+                            canvas_h, canvas_w = paste_mod.paste_canvas_hw(
+                                original_frame_bgr.shape[:2], final_upscale_factor, canvas_hw)
+                            if final_pasted_frame.shape[0] != canvas_h or final_pasted_frame.shape[1] != canvas_w:
+                                final_pasted_frame = cv2.resize(
+                                    final_pasted_frame, (canvas_w, canvas_h),
+                                    interpolation=cv2.INTER_LANCZOS4)
                             output_frames_cv2.append(final_pasted_frame)
                             # the same bookkeeping as the sibling fallback rows:
                             # the device-output tails index the fallback rows by

@@ -495,6 +495,12 @@ def test_every_console_write_of_the_facelib_reaches_the_logger(
     patched to ``[None, valid]``) so the paste-back print keeps firing;
     the stub's paste return is canvas-sized (the background-only row and
     the vendored row must stack).
+
+    Round 11 (2026-10-31): the short-circuit row is canvas-sized since the
+    short-circuit resize (the fix-1.1 snippet's raw output cannot join the
+    IMAGE batch at a mismatched shape), so the stub's return is the real
+    512x512 canvas the vendored paste assembles from ``input_img`` - the
+    pin's routing assertions are unchanged.
     """
     real_estimate = processor_module.estimate_affines
 
@@ -513,7 +519,7 @@ def test_every_console_write_of_the_facelib_reaches_the_logger(
     # row and the vendored row stack; the print stays (it is the routing probe)
     def canvas_sized_paste(*args, **kwargs):
         print("Warning: Mismatch between restored_faces and inverse_affine_matrices.")
-        return np.zeros((16, 16, 3), dtype=np.uint8)
+        return np.zeros((512, 512, 3), dtype=np.uint8)
 
     face_helper.paste_faces_to_input_image = canvas_sized_paste
     frames = torch.rand((2, 16, 16, 3), dtype=torch.float32)
