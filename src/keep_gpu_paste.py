@@ -19,8 +19,11 @@ This module runs the default branch of that stage on the device:
   warp each face straight into its canvas ROI instead (``F.affine_grid``
   / ``F.grid_sample`` off :func:`_compute_roi_theta`),
 - the blend is one tensor op,
-- the optional background upscaler runs as **one** ``tiled_scale`` call over
-  the batch instead of one call per frame,
+- the optional background upscaler runs as batched ``tiled_scale`` calls
+  over the VRAM-aware frame groups of :func:`bg_chunk_size` instead of one
+  call per frame - 2026-11-01: one call over the whole batch materialised
+  the x4 intermediate of the whole clip (~0.37 GiB a 720p frame) and OOMed
+  a 16 GB card on the owner's 48-frame clip before the first paste,
 - the **gray flags** of the frames run on the device as well - the float64
   variances of the three channel differences, with the numpy computation as
   the fallback of the borderline frames (the paste-stage CPU optimization
@@ -114,6 +117,17 @@ GRAY_CHUNK_PIXELS = 4 << 20
 #: background (12), the float32 warped face (12), the float32 warped mask
 #: (4) and the uint8 output (3).
 STAGING_BYTES_PER_PIXEL = 31
+
+#: The bytes per **scaled** pixel the background upscaler's ``tiled_scale``
+#: stage holds at its peak: two float32 stacks of the scaled size - the
+#: ``torch.empty`` output buffer of the installed ``tiled_scale``
+#: (``comfy/utils.py:1203``, no dtype argument) and the out-of-place
+#: clamp / ``* 255.0`` chain of :func:`_tiled_scale_batch` - plus the
+#: uint8 quantized stack (``2 * 12 + 3 = 27``).  The bg frame groups of
+#: :func:`batched_bg_frames` size from this, **not** from
+#: :func:`paste_chunk_size`: its 31 B/px canvas budget would still allow
+#: ~5.9 GiB of x4 intermediate per 720p group (~0.37 GiB a frame here).
+BG_SCALED_PIXEL_BYTES = 27
 
 #: The fixed-point grid of cv2's ``warpAffine`` (``imgwarp.cpp``): the
 #: sampling coordinate is quantised to 1/32 px (``INTER_TAB_SIZE``) and the
@@ -232,6 +246,31 @@ def paste_chunk_size(
     if free > 0:
         budget = min(budget, int(free * STAGING_MEMORY_SHARE))
     return max(1, min(maximum, budget // per_frame))
+
+
+def bg_chunk_size(height: int, width: int, scale: float, device: torch.device) -> int:
+    """The number of frames per background-upscale group (the x4 budget).
+
+    Sized from the **x4 intermediate**, not from the canvas: a 720p frame
+    at the production x4 holds ~0.37 GiB of it (two float32 stacks of the
+    scaled size plus the uint8 one, :data:`BG_SCALED_PIXEL_BYTES`), so
+    :func:`paste_chunk_size`'s 31 B/px canvas budget would still allow
+    ~5.9 GiB of x4 intermediate per group.  The budget is the staging one
+    (:data:`STAGING_BYTES`, the free-VRAM share of
+    :data:`STAGING_MEMORY_SHARE`); a host without ComfyUI falls back to
+    the cap, which keeps the small batches of the pins and the tests in
+    one group - the pre-grouping behaviour.  2026-11-01: the whole-clip
+    ``tiled_scale`` call materialised the x4 intermediate of the entire
+    clip - 17.8 GiB for the owner's 48 720p frames - and OOMed a 16 GB
+    card before the first paste.
+    """
+    scaled_pixels = round(scale * int(height)) * round(scale * int(width))
+    per_frame = BG_SCALED_PIXEL_BYTES * scaled_pixels
+    budget = STAGING_BYTES
+    free = free_memory_bytes(device)
+    if free > 0:
+        budget = min(budget, int(free * STAGING_MEMORY_SHARE))
+    return max(1, budget // per_frame)
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +843,39 @@ def _tiled_scale_batch(
     return quantized[..., [2, 1, 0]].contiguous()
 
 
+def _resize_bg_frames(
+    background: np.ndarray | torch.Tensor,
+    target_hw: tuple[int, int],
+    device: torch.device,
+    return_device: bool,
+) -> np.ndarray | torch.Tensor:
+    """One resize stage of the background (the frame target or the canvas).
+
+    The device Lanczos (:func:`resize_lanczos_u8`) runs when the result
+    stays on the device (a CUDA device, or the ``return_device`` staging -
+    on the CPU it is bit-exact, ``tests/test_image_op_equivalence.py:292-299``);
+    a host background keeps the per-frame cv2 loop (the einsum resample is
+    slower than cv2 there).  The resize is per-frame independent, so the
+    group loop of :func:`batched_bg_frames` is pixel-neutral by
+    construction (the CUDA batch composition stays the design's disclosed
+    owner-gated residual).
+    """
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    on_device = device.type == "cuda"
+    if background.shape[1] == target_h and background.shape[2] == target_w:
+        return background
+    if on_device or return_device:
+        return resize_lanczos_u8(background, (target_w, target_h), device)
+    return np.stack(
+        [
+            cv2.resize(
+                background[index], (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
+            )
+            for index in range(background.shape[0])
+        ]
+    )
+
+
 def batched_bg_frames(
     frames_bgr_u8: np.ndarray,
     upscale_factor: float,
@@ -815,13 +887,19 @@ def batched_bg_frames(
     """The background of the paste, at the target size of the paste.
 
     Without a background model (the production default) the background is
-    the frame itself; with one it is the **one** batched ``tiled_scale``
-    call of :func:`_tiled_scale_batch`, kept on the device.  The resize to
-    the target size runs **on the device** (:func:`resize_lanczos_u8` - the
-    owner-accepted GPU Lanczos, the tolerance-accepted route) when the
-    device is CUDA; a CPU device keeps the per-frame cv2 loop (the einsum
-    resample is slower than cv2 there).  The background is downloaded once,
-    after the last resize.
+    the frame itself; with one it is the batched ``tiled_scale`` calls of
+    :func:`_tiled_scale_batch` over the VRAM-aware frame groups of
+    :func:`bg_chunk_size` - each group is resized to its target **before
+    the next group starts**, so the x4 intermediate dies with its group
+    instead of materialising for the whole clip (2026-11-01: ~0.37 GiB a
+    720p frame - two float32 stacks of the 4x size plus the uint8 one -
+    OOMed a 16 GB card on the owner's 48-frame clip before the first
+    paste; the model work is unchanged, ``tiled_scale`` still processes
+    every image on its own).  The resize to the target size runs **on the
+    device** (:func:`resize_lanczos_u8` - the owner-accepted GPU Lanczos,
+    the tolerance-accepted route) when the device is CUDA; a CPU device
+    keeps the per-frame cv2 loop (the einsum resample is slower than cv2
+    there).  The background is downloaded once, after the last resize.
 
     Args:
         canvas_hw: the ``(height, width)`` of the paste canvas - the size of
@@ -847,42 +925,42 @@ def batched_bg_frames(
             torch.from_numpy(np.ascontiguousarray(frames)).to(device)
             if return_device else frames
         )
+        background = _resize_bg_frames(
+            background, (target_h, target_w), device, return_device
+        )
     else:
-        background = _tiled_scale_batch(bg_upscale_model, frames, device)
-        if not on_device and not return_device:
-            background = background.numpy()
-    if background.shape[1] != target_h or background.shape[2] != target_w:
-        if on_device or return_device:
-            background = resize_lanczos_u8(background, (target_w, target_h), device)
-        else:
-            background = np.stack(
-                [
-                    cv2.resize(
-                        background[index], (target_w, target_h), interpolation=cv2.INTER_LANCZOS4
-                    )
-                    for index in range(background.shape[0])
-                ]
+        # The bg model runs in VRAM-aware frame groups (2026-11-01): one
+        # ``tiled_scale`` call per group instead of one over the whole
+        # batch, every group resized to its target before the next group
+        # starts - the x4 intermediate dies with its group instead of
+        # materialising for the whole clip.  The model work is unchanged
+        # (``tiled_scale`` still processes every image on its own).
+        frame_chunk = bg_chunk_size(height, width, bg_upscale_model.scale, device)
+        groups: list[np.ndarray | torch.Tensor] = []
+        for start in range(0, frames.shape[0], frame_chunk):
+            # The cancel poll (C1) of the grouped loops - a no-op outside
+            # ComfyUI (``src/keep_interrupt.py``).
+            keep_interrupt.check_interrupted()
+            stop = min(start + frame_chunk, frames.shape[0])
+            group = _tiled_scale_batch(bg_upscale_model, frames[start:stop], device)
+            if not on_device and not return_device:
+                group = group.numpy()
+            groups.append(
+                _resize_bg_frames(group, (target_h, target_w), device, return_device)
             )
+        if len(groups) == 1:
+            background = groups[0]
+        elif isinstance(groups[0], torch.Tensor):
+            background = torch.cat(groups, dim=0)
+        else:
+            background = np.concatenate(groups, axis=0)
     if canvas_hw is not None:
         canvas_h, canvas_w = canvas_hw
         canvas_target_h = int(canvas_h * upscale_factor)
         canvas_target_w = int(canvas_w * upscale_factor)
-        if background.shape[1] != canvas_target_h or background.shape[2] != canvas_target_w:
-            if on_device or return_device:
-                background = resize_lanczos_u8(
-                    background, (canvas_target_w, canvas_target_h), device
-                )
-            else:
-                background = np.stack(
-                    [
-                        cv2.resize(
-                            background[index],
-                            (canvas_target_w, canvas_target_h),
-                            interpolation=cv2.INTER_LANCZOS4,
-                        )
-                        for index in range(background.shape[0])
-                    ]
-                )
+        background = _resize_bg_frames(
+            background, (canvas_target_h, canvas_target_w), device, return_device
+        )
     if isinstance(background, torch.Tensor) and not return_device:
         background = background.cpu().numpy()
     return background

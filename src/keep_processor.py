@@ -296,8 +296,10 @@ class KEEPFaceProcessor:
 
         # The inverse warps of the paste (the vendored ``get_inverse_affine``:
         # ``cv2.invertAffineTransform(affine) * upscale_factor``) and the
-        # background of the batch - one ``tiled_scale`` call for the whole
-        # group instead of one per frame.
+        # background of the batch - batched ``tiled_scale`` calls over the
+        # VRAM-aware frame groups of :func:`bg_chunk_size` instead of one
+        # per frame (2026-11-01: the whole-clip x4 intermediate OOMed the
+        # card before the first paste).
         inverses = inverse_affines(
             [affine_matrices[i] for i in eligible], upscale_factor=final_upscale_factor)
         # The pass-through gates (round 4, D-R2.3.2): the paste core is

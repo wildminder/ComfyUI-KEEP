@@ -1330,6 +1330,49 @@ def test_the_batched_background_is_pixel_identical_to_the_per_frame_calls(
     assert np.array_equal(batched, np.stack(reference))
 
 
+@pytest.mark.unit
+def test_the_bg_frame_groups_are_pixel_identical_to_the_whole_batch(
+    gpu_paste, processor_module, monkeypatch
+):
+    """The grouped bg upscale is the whole-batch one, pixel for pixel.
+
+    2026-11-01: ``batched_bg_frames`` runs the ``tiled_scale`` calls in
+    VRAM-aware frame groups (``bg_chunk_size``) - the model still sees the
+    same B=1 tiles per image and the target resize is per-frame
+    independent, so the group boundaries must not change a pixel.  The
+    group size is forced to 1 here to exercise the group concat path (the
+    host cv2 branch, the ``return_device`` Lanczos branch and the canvas
+    resize after the concat).
+    """
+    frames = smooth_frames_u8(5, (64, 96), seed=53)
+    model = _StubUpscaleModel()
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), _ParseFaceHelper(), bg_upscale_model=model)
+    )
+
+    # the default group size keeps the 5 tiny frames in one group
+    whole_host = gpu_paste.batched_bg_frames(frames, 2.0, model, torch.device("cpu"))
+    whole_device = gpu_paste.batched_bg_frames(
+        frames, 2.0, model, torch.device("cpu"), return_device=True
+    )
+    whole_canvas = gpu_paste.batched_bg_frames(
+        frames, 2.0, model, torch.device("cpu"), canvas_hw=(96, 144)
+    )
+
+    monkeypatch.setattr(gpu_paste, "bg_chunk_size", lambda *_args: 1)
+    grouped_host = gpu_paste.batched_bg_frames(frames, 2.0, model, torch.device("cpu"))
+    grouped_device = gpu_paste.batched_bg_frames(
+        frames, 2.0, model, torch.device("cpu"), return_device=True
+    )
+    grouped_canvas = gpu_paste.batched_bg_frames(
+        frames, 2.0, model, torch.device("cpu"), canvas_hw=(96, 144)
+    )
+
+    assert np.array_equal(grouped_host, whole_host)
+    assert torch.equal(grouped_device, whole_device)
+    assert np.array_equal(grouped_canvas, whole_canvas)
+
+
 # ---------------------------------------------------------------------------
 # The gray flags
 # ---------------------------------------------------------------------------
@@ -1394,6 +1437,38 @@ def test_the_paste_chunk_size_follows_the_free_memory(gpu_paste, monkeypatch):
     # fits 4 frames of a 64x64 canvas (31 bytes per pixel)
     monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 1 << 20)
     assert gpu_paste.paste_chunk_size(64, 64, device) == 4
+
+
+@pytest.mark.unit
+def test_the_bg_chunk_size_follows_the_free_memory(gpu_paste, monkeypatch):
+    """The bg frame groups size from the x4 intermediate, not the canvas.
+
+    2026-11-01: the whole-clip ``tiled_scale`` call materialised the x4
+    intermediate of the entire clip (~0.37 GiB a 720p frame - two float32
+    stacks of the scaled size plus the uint8 one,
+    :data:`BG_SCALED_PIXEL_BYTES` = 27 B per scaled pixel) and OOMed a
+    16 GB card on the owner's 48-frame 720p clip before the first paste.
+    The group is the staging budget over those bytes; a host without
+    ComfyUI falls back to the cap, which keeps the small batches of the
+    other pins in one group (the pre-grouping behaviour).
+    """
+    device = torch.device("cpu")
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 0)
+    # the staging cap over the x4 bytes of a 720p frame (27 * 2880 * 5120)
+    assert gpu_paste.bg_chunk_size(720, 1280, 4.0, device) == 5
+
+    # 1 GiB of free memory - the 50% share leaves 512 MiB, which fits one
+    # 720p x4 frame (~0.37 GiB) but not two
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 1 << 30)
+    assert gpu_paste.bg_chunk_size(720, 1280, 4.0, device) == 1
+
+    # the pin stub's scale of 2 - the intermediate is priced at the scaled
+    # shape (round(scale * h) * round(scale * w)), not the source shape
+    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 0)
+    assert (
+        gpu_paste.bg_chunk_size(64, 96, 2.0, device)
+        == gpu_paste.STAGING_BYTES // (27 * 128 * 192)
+    )
 
 
 # ---------------------------------------------------------------------------
