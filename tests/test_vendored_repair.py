@@ -357,12 +357,25 @@ def test_the_closure_equals_the_pruned_file_set():
 
     Missing-free (every file of the closure exists) and orphan-free (every
     file of the vendored tree is part of the closure).
+
+    2026-11-03, keep-fix5-implement1 Phase 4.1: two folders stay on disk
+    (byte identical, the plan does not list them for deletion) while the
+    regenerated ``basicsr/__init__.py`` no longer imports them - and their
+    remaining files import deleted utils (``metrics/``) or were only ever
+    imported by the deleted ``stylegan2_arch`` (``ops/``).  They are
+    excluded from **both** sides of the equality (and must not be in the
+    closure).
     """
     report = _scan_report()
     closure = {
         rel for rel in report["closure_files"] if rel.startswith("modules/deps/")
     }
-    tree = {path.relative_to(REPO_ROOT).as_posix() for path in DEPS_DIR.rglob("*.py")}
+    tree = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in DEPS_DIR.rglob("*.py")
+        if "/basicsr/metrics/" not in path.as_posix()
+        and "/basicsr/ops/" not in path.as_posix()
+    }
     assert closure, "the runtime closure is empty"
     assert closure == tree, (
         "the closure and the pruned tree must be identical; "
@@ -392,12 +405,18 @@ def test_import_basicsr_still_succeeds():
 
     Since P2.5 the package is imported relatively (it is part of the node
     package), so it is never a top-level ``basicsr`` module.
+
+    2026-11-03, keep-fix5-implement1 Phase 4.1: ``models``/``data``/
+    ``losses`` are deleted; ``metrics`` and ``ops`` stay on disk but off the
+    import path (the regenerated package init imports only ``archs``,
+    ``utils`` and ``version``), so exactly those two subpackages are
+    asserted.
     """
     import importlib
 
     module = importlib.import_module("ComfyUI_KEEP.modules.deps.basicsr")
     assert module.__name__ == "ComfyUI_KEEP.modules.deps.basicsr"
-    for name in ("archs", "models", "data", "losses", "metrics"):
+    for name in ("archs", "utils"):
         assert importlib.import_module(
             f"ComfyUI_KEEP.modules.deps.basicsr.{name}"
         ) is not None
@@ -439,6 +458,12 @@ import ComfyUI_KEEP.modules.deps as deps
 
 failures = []
 for info in pkgutil.walk_packages(deps.__path__, deps.__name__ + "."):
+    # keep-fix5-implement1 Phase 4.1 (2026-11-03): basicsr.metrics is off the
+    # import path - the package init no longer imports it and its files
+    # import deleted utils (matlab_functions, color_util); the folder stays
+    # on disk, so the walk skips it deliberately.
+    if info.name.startswith("ComfyUI_KEEP.modules.deps.basicsr.metrics"):
+        continue
     try:
         importlib.import_module(info.name)
     except BaseException as exc:
@@ -453,7 +478,13 @@ print("KEEP_WALK_FAILURES:" + json.dumps(failures))
 
 @pytest.mark.unit
 def test_every_vendored_module_imports_without_pip():
-    """P2.5 (a): the ``walk_packages`` import test over ``modules/deps``."""
+    """P2.5 (a): the ``walk_packages`` import test over ``modules/deps``.
+
+    2026-11-03, keep-fix5-implement1 Phase 4.1: ``basicsr.metrics`` is
+    skipped (see the probe comment) - the plan deletes the utils its files
+    import, and the regenerated ``basicsr/__init__.py`` no longer imports
+    the package.
+    """
     result = _run_python(_PIP_BLOCK + _WALK_PROBE, str(REPO_ROOT))
     assert result.returncode == 0, result.stdout + result.stderr
     sentinel = [
@@ -543,13 +574,16 @@ _DISTRIBUTIONS = {
 #: host's requirements.txt that ships the distribution: when the host drops
 #: one, the failing test names the line that disappeared and the fix is a
 #: one-set edit (move the distribution into ``_EXPECTED_REQUIREMENTS``).
+#:
+#: 2026-11-03, keep-fix5-implement1 Phase 4.1: ``scipy`` is gone - only the
+#: ``basicsr.metrics`` files imported it and they are off the import path
+#: now (the folder stays on disk but is not part of the closure).
 _HOST_PROVIDED = {
     "torch": "torch",
     "torchvision": "torchvision",
     "numpy": "numpy>=1.25.0",
     "Pillow": "Pillow>=10.1.0",
     "einops": "einops",
-    "scipy": "scipy",
     "tqdm": "tqdm",
     "pyyaml": "pyyaml",
     "requests": "requests",
@@ -586,12 +620,10 @@ _OPTIONAL_LAZY_IMPORTS = {
     "gdown": (
         "facelib misc.download_pretrained_models - never called by the node"
     ),
-    "mc": (
-        "basicsr MemcachedBackend - only with FileClient(backend='memcached'); "
-        "the node reads from the disk backend"
-    ),
     "wandb": (
-        "basicsr logger.init_wandb_logger - training only (basicsr/train.py)"
+        "basicsr logger.init_wandb_logger - never called by the node "
+        "(the training entry point basicsr/train.py is deleted in "
+        "keep-fix5-implement1 Phase 4.1)"
     ),
 }
 

@@ -1,36 +1,15 @@
 # https://github.com/xinntao/BasicSR
 # flake8: noqa
+# 2026-11-03 keep-fix5-implement1 Phase 4.1: the explicit import list is
+# reduced to the four architectures the pack uses.
 from copy import deepcopy
-
 from ..utils import get_root_logger
 from ..utils.registry import ARCH_REGISTRY
 
-# P2.4 - explicit import list; the eager folder scan is gone
 from . import (
-    arcface_arch,
-    basicvsr_arch,
-    basicvsrpp_arch,
-    dfdnet_arch,
-    discriminator_arch,
-    duf_arch,
-    ecbsr_arch,
-    edsr_arch,
-    edvr_arch,
     gmflow_arch,
-    hifacegan_arch,
     keep_arch,
-    rcan_arch,
-    ridnet_arch,
-    rrdbnet_arch,
     spectral_norm_arch,
-    spynet_arch,
-    srresnet_arch,
-    srvgg_arch,
-    stylegan2_arch,
-    stylegan2_bilinear_arch,
-    swinir_arch,
-    tof_arch,
-    vgg_arch,
     vqgan_arch,
 )
 

@@ -271,6 +271,51 @@ def test_the_parse_forward_is_batch_invariant(gpu_paste):
     assert torch.equal(per_frame, whole)
 
 
+@pytest.mark.unit
+def test_the_face_upscaler_rides_the_batched_core(gpu_paste):
+    """The face upscaler (keep-fix5, 2026-11-03): B=1, per-face, bit-exact.
+
+    The pin of :func:`upscale_faces_batch_gpu` against the per-face
+    reference re-derived below - the BGR -> RGB flip, the /255, the model
+    call, the clamp, the round quantize and the BGR flip back.  The
+    per-face loop of the production form means the batched result is the
+    per-face one, byte for byte; a ``None`` model returns the input
+    object.
+    """
+    class _SpatialUpscaleStub:
+        """A face upscaler whose output really is ``scale`` x the input."""
+
+        scale = 2.0
+
+        def model(self, samples):
+            return F.interpolate(
+                samples, scale_factor=self.scale, mode="nearest"
+            )
+
+    rng = np.random.default_rng(17)
+    faces = torch.from_numpy(
+        rng.integers(0, 256, size=(3, 8, 12, 3), dtype=np.uint8)
+    ).permute(0, 3, 1, 2)
+    model = _SpatialUpscaleStub()
+
+    upscaled = gpu_paste.upscale_faces_batch_gpu(faces, model, torch.device("cpu"))
+    assert tuple(upscaled.shape) == (3, 3, 16, 24), upscaled.shape
+
+    for index in range(3):
+        face_rgb = faces[index : index + 1, [2, 1, 0]].to(torch.float32).div_(255.0)
+        scaled = model.model(face_rgb)
+        reference = (
+            scaled.float()[:, [2, 1, 0]]
+            .clamp_(0.0, 1.0)
+            .mul_(255.0)
+            .round_()
+            .to(torch.uint8)
+        )
+        assert torch.equal(upscaled[index : index + 1], reference)
+
+    assert gpu_paste.upscale_faces_batch_gpu(faces, None, torch.device("cpu")) is faces
+
+
 # ---------------------------------------------------------------------------
 # The batched paste (design section 7.7, steps 2-5)
 # ---------------------------------------------------------------------------
@@ -1302,75 +1347,101 @@ class _StubUpscaleModel:
 def test_the_batched_background_is_pixel_identical_to_the_per_frame_calls(
     gpu_paste, processor_module
 ):
-    """One ``tiled_scale`` call over the batch == N per-frame calls.
+    """The model branch of ``batched_bg_frames`` == N per-frame upscales.
 
-    ``comfy.utils.tiled_scale`` loops over the images of the batch
-    (``comfy/utils.py:1205-1206``) and processes every image on its own,
-    so the batched call produces the same pixels - with one call instead
-    of N.  The reference is the **per-frame path of the processor**
-    (``_run_upscaler`` + the LANCZOS4 resize to the target size).
+    Re-authored for keep-fix5-implement1 (Phase 1, step 1.1.2, 2026-11-03):
+    the model branch runs ``_tiled_scale_and_resize_batch`` - one frame per
+    ``tiled_scale`` call in FP16 autocast on CUDA (the CPU gate runs FP32),
+    the canvas resize happens **on the float32 scaled output**
+    (``F.interpolate`` bicubic antialias, the plan's kernel - the Lanczos
+    reference of the former pin is superseded) and the quantization rounds
+    (the truncating cast of the former ``_tiled_scale_batch`` is
+    superseded).  The reference is the per-frame chain re-derived
+    independently below - the same model work, the same resize, the same
+    round quantize - so the pin stays **bit-exact** and now covers the
+    canvas resize (a target off the model's own scale) as well.
+
+    The former pin compared against ``_run_upscaler`` + LANCZOS4 on the
+    identity-size case; that reference encodes the superseded kernel and
+    quantization, so it is replaced, not loosened: the bound stays
+    ``np.array_equal``.
     """
+    from comfy.utils import tiled_scale  # the conftest mock passthrough
+
     frames = smooth_frames_u8(3, (64, 96), seed=53)
     model = _StubUpscaleModel()
-    processor = processor_module.KEEPFaceProcessor(
-        _make_pack(_StubKeepNet(), _ParseFaceHelper(), bg_upscale_model=model)
+
+    # the upscale factor of 2 makes the target size the double one; the
+    # canvas_hw variant gives the target a size the model's own scale does
+    # not produce, so the float32 bicubic resize runs
+    batched = gpu_paste.batched_bg_frames(frames, 2.0, model, torch.device("cpu"))
+    batched_canvas = gpu_paste.batched_bg_frames(
+        frames, 2.0, model, torch.device("cpu"), canvas_hw=(96, 144)
+    )
+    batched_device = gpu_paste.batched_bg_frames(
+        frames, 2.0, model, torch.device("cpu"), return_device=True
     )
 
-    # the upscale factor of 2 makes the target size the double one
-    batched = gpu_paste.batched_bg_frames(frames, 2.0, model, torch.device("cpu"))
-
-    reference = []
-    for frame in frames:
-        upscaled = processor._run_upscaler(model, frame)
-        reference.append(
-            cv2.resize(upscaled, (192, 128), interpolation=cv2.INTER_LANCZOS4)
-        )
+    def reference_for(target_hw):
+        target_h, target_w = (int(value) for value in target_hw)
+        output = []
+        for frame in frames:
+            sample = (
+                torch.from_numpy(frame[..., [2, 1, 0]])
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(torch.float32)
+                .div_(255.0)
+            )
+            scaled = tiled_scale(
+                sample,
+                lambda a: model.model(a),
+                tile_x=512,
+                tile_y=512,
+                overlap=64,
+                upscale_amount=model.scale,
+                output_device=torch.device("cpu"),
+            )
+            scaled = scaled.float()
+            if scaled.shape[-2] != target_h or scaled.shape[-1] != target_w:
+                scaled = F.interpolate(
+                    scaled,
+                    size=(target_h, target_w),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            output.append(
+                scaled.squeeze(0)
+                .clamp_(0.0, 1.0)
+                .mul_(255.0)
+                .round_()
+                .to(torch.uint8)
+                .permute(1, 2, 0)[..., [2, 1, 0]]
+                .numpy()
+            )
+        return np.stack(output)
 
     assert batched.shape == (3, 128, 192, 3), batched.shape
-    assert np.array_equal(batched, np.stack(reference))
-
-
-@pytest.mark.unit
-def test_the_bg_frame_groups_are_pixel_identical_to_the_whole_batch(
-    gpu_paste, processor_module, monkeypatch
-):
-    """The grouped bg upscale is the whole-batch one, pixel for pixel.
-
-    2026-11-01: ``batched_bg_frames`` runs the ``tiled_scale`` calls in
-    VRAM-aware frame groups (``bg_chunk_size``) - the model still sees the
-    same B=1 tiles per image and the target resize is per-frame
-    independent, so the group boundaries must not change a pixel.  The
-    group size is forced to 1 here to exercise the group concat path (the
-    host cv2 branch, the ``return_device`` Lanczos branch and the canvas
-    resize after the concat).
-    """
-    frames = smooth_frames_u8(5, (64, 96), seed=53)
-    model = _StubUpscaleModel()
-    processor = processor_module.KEEPFaceProcessor(
-        _make_pack(_StubKeepNet(), _ParseFaceHelper(), bg_upscale_model=model)
+    assert np.array_equal(batched, reference_for((128, 192)))
+    # the canvas target is (192, 288) - the model's own 2x output (128, 192)
+    # is smaller, so the float32 bicubic resize actually runs
+    assert batched_canvas.shape == (3, 192, 288, 3), batched_canvas.shape
+    assert np.array_equal(batched_canvas, reference_for((192, 288)))
+    assert batched_device.dtype == torch.uint8
+    assert torch.equal(
+        batched_device,
+        torch.from_numpy(np.ascontiguousarray(reference_for((128, 192)))),
     )
 
-    # the default group size keeps the 5 tiny frames in one group
-    whole_host = gpu_paste.batched_bg_frames(frames, 2.0, model, torch.device("cpu"))
-    whole_device = gpu_paste.batched_bg_frames(
-        frames, 2.0, model, torch.device("cpu"), return_device=True
-    )
-    whole_canvas = gpu_paste.batched_bg_frames(
-        frames, 2.0, model, torch.device("cpu"), canvas_hw=(96, 144)
-    )
 
-    monkeypatch.setattr(gpu_paste, "bg_chunk_size", lambda *_args: 1)
-    grouped_host = gpu_paste.batched_bg_frames(frames, 2.0, model, torch.device("cpu"))
-    grouped_device = gpu_paste.batched_bg_frames(
-        frames, 2.0, model, torch.device("cpu"), return_device=True
-    )
-    grouped_canvas = gpu_paste.batched_bg_frames(
-        frames, 2.0, model, torch.device("cpu"), canvas_hw=(96, 144)
-    )
-
-    assert np.array_equal(grouped_host, whole_host)
-    assert torch.equal(grouped_device, whole_device)
-    assert np.array_equal(grouped_canvas, whole_canvas)
+# ---------------------------------------------------------------------------
+# The bg-upscale frame groups of the former round 12 were removed with
+# keep-fix5 (2026-11-03): ``bg_chunk_size`` lost its production caller to
+# ``_tiled_scale_and_resize_batch`` (a B=1 loop, no groups to pin), so the
+# group-equality pin and the ``bg_chunk_size`` free-memory pin went with
+# the dead machinery - a removal, not a loosening.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1406,6 +1477,12 @@ def test_is_gray_batch_agrees_with_the_vendored_is_gray(gpu_paste, misc_module):
 # ---------------------------------------------------------------------------
 
 
+# The ``bg_chunk_size`` pin that followed here (the x4-intermediate group
+# budget) went with the function - keep-fix5 (2026-11-03) replaced the
+# bg frame groups with the per-frame loop, the budget machinery is dead.
+# The parse / paste chunk pins below keep the free-VRAM sizing pinned.
+
+
 @pytest.mark.unit
 def test_the_parse_chunk_size_follows_the_free_memory(gpu_paste, monkeypatch):
     """The chunk cap is the free VRAM, bounded by the measured sweet spot."""
@@ -1437,38 +1514,6 @@ def test_the_paste_chunk_size_follows_the_free_memory(gpu_paste, monkeypatch):
     # fits 4 frames of a 64x64 canvas (31 bytes per pixel)
     monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 1 << 20)
     assert gpu_paste.paste_chunk_size(64, 64, device) == 4
-
-
-@pytest.mark.unit
-def test_the_bg_chunk_size_follows_the_free_memory(gpu_paste, monkeypatch):
-    """The bg frame groups size from the x4 intermediate, not the canvas.
-
-    2026-11-01: the whole-clip ``tiled_scale`` call materialised the x4
-    intermediate of the entire clip (~0.37 GiB a 720p frame - two float32
-    stacks of the scaled size plus the uint8 one,
-    :data:`BG_SCALED_PIXEL_BYTES` = 27 B per scaled pixel) and OOMed a
-    16 GB card on the owner's 48-frame 720p clip before the first paste.
-    The group is the staging budget over those bytes; a host without
-    ComfyUI falls back to the cap, which keeps the small batches of the
-    other pins in one group (the pre-grouping behaviour).
-    """
-    device = torch.device("cpu")
-    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 0)
-    # the staging cap over the x4 bytes of a 720p frame (27 * 2880 * 5120)
-    assert gpu_paste.bg_chunk_size(720, 1280, 4.0, device) == 5
-
-    # 1 GiB of free memory - the 50% share leaves 512 MiB, which fits one
-    # 720p x4 frame (~0.37 GiB) but not two
-    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 1 << 30)
-    assert gpu_paste.bg_chunk_size(720, 1280, 4.0, device) == 1
-
-    # the pin stub's scale of 2 - the intermediate is priced at the scaled
-    # shape (round(scale * h) * round(scale * w)), not the source shape
-    monkeypatch.setattr(gpu_paste, "free_memory_bytes", lambda _device: 0)
-    assert (
-        gpu_paste.bg_chunk_size(64, 96, 2.0, device)
-        == gpu_paste.STAGING_BYTES // (27 * 128 * 192)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1511,7 +1556,9 @@ class _ParseFaceHelper:
         self.cropped_faces = []
         self.restored_faces = []
 
-    def read_image(self, image):
+    # keep-fix5-implement1 (2026-11-03): the vendored ``read_image`` gained
+    # the ``check_gray`` flag (plan 2.2) - the sequence sites pass it.
+    def read_image(self, image, check_gray: bool = True):
         self.calls.append("read_image")
         self.input_img = image
 

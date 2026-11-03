@@ -19,18 +19,26 @@ This module runs the default branch of that stage on the device:
   warp each face straight into its canvas ROI instead (``F.affine_grid``
   / ``F.grid_sample`` off :func:`_compute_roi_theta`),
 - the blend is one tensor op,
-- the optional background upscaler runs as batched ``tiled_scale`` calls
-  over the VRAM-aware frame groups of :func:`bg_chunk_size` instead of one
-  call per frame - 2026-11-01: one call over the whole batch materialised
-  the x4 intermediate of the whole clip (~0.37 GiB a 720p frame) and OOMed
-  a 16 GB card on the owner's 48-frame clip before the first paste,
+- the optional background upscaler runs **one frame at a time** (B=1, FP16
+  autocast on CUDA) and resizes each frame straight to the paste canvas on
+  the device while the scaled output is still float32
+  (:func:`_tiled_scale_and_resize_batch`; keep-fix5, 2026-11-03) - the
+  former round-12 grouping (:func:`bg_chunk_size`) fed whole frame groups
+  of float32 into the model and materialised the x4 intermediate of every
+  group; 2026-11-01: one call over the whole batch materialised the x4
+  intermediate of the whole clip (~0.37 GiB a 720p frame) and OOMed a
+  16 GB card on the owner's 48-frame clip before the first paste,
 - the **gray flags** of the frames run on the device as well - the float64
   variances of the three channel differences, with the numpy computation as
   the fallback of the borderline frames (the paste-stage CPU optimization
   round, section 4.2).
 
 The **non-default branches stay with the vendored paste** (design section
-7.7, step 6): a face upsampler and a face helper without a parse net.
+7.7, step 6): a face helper without a parse net.  The face upsampler left
+that list with keep-fix5 (2026-11-03): the restored 512 faces are
+upscaled on the device (:func:`upscale_faces_batch_gpu`) and the ROI
+warp samples the upscaled face - the abort that sent every frame of an
+upscaled run to the vendored paste is gone from the processor.
 The vendored call path is not deleted - it is the fallback of the
 processor.  Since the owner's fix 1.2 (2026-10-30) the grayscale frames
 ride the batched core, and since the owner's fix 4 (2026-10-31)
@@ -117,17 +125,6 @@ GRAY_CHUNK_PIXELS = 4 << 20
 #: background (12), the float32 warped face (12), the float32 warped mask
 #: (4) and the uint8 output (3).
 STAGING_BYTES_PER_PIXEL = 31
-
-#: The bytes per **scaled** pixel the background upscaler's ``tiled_scale``
-#: stage holds at its peak: two float32 stacks of the scaled size - the
-#: ``torch.empty`` output buffer of the installed ``tiled_scale``
-#: (``comfy/utils.py:1203``, no dtype argument) and the out-of-place
-#: clamp / ``* 255.0`` chain of :func:`_tiled_scale_batch` - plus the
-#: uint8 quantized stack (``2 * 12 + 3 = 27``).  The bg frame groups of
-#: :func:`batched_bg_frames` size from this, **not** from
-#: :func:`paste_chunk_size`: its 31 B/px canvas budget would still allow
-#: ~5.9 GiB of x4 intermediate per 720p group (~0.37 GiB a frame here).
-BG_SCALED_PIXEL_BYTES = 27
 
 #: The fixed-point grid of cv2's ``warpAffine`` (``imgwarp.cpp``): the
 #: sampling coordinate is quantised to 1/32 px (``INTER_TAB_SIZE``) and the
@@ -246,31 +243,6 @@ def paste_chunk_size(
     if free > 0:
         budget = min(budget, int(free * STAGING_MEMORY_SHARE))
     return max(1, min(maximum, budget // per_frame))
-
-
-def bg_chunk_size(height: int, width: int, scale: float, device: torch.device) -> int:
-    """The number of frames per background-upscale group (the x4 budget).
-
-    Sized from the **x4 intermediate**, not from the canvas: a 720p frame
-    at the production x4 holds ~0.37 GiB of it (two float32 stacks of the
-    scaled size plus the uint8 one, :data:`BG_SCALED_PIXEL_BYTES`), so
-    :func:`paste_chunk_size`'s 31 B/px canvas budget would still allow
-    ~5.9 GiB of x4 intermediate per group.  The budget is the staging one
-    (:data:`STAGING_BYTES`, the free-VRAM share of
-    :data:`STAGING_MEMORY_SHARE`); a host without ComfyUI falls back to
-    the cap, which keeps the small batches of the pins and the tests in
-    one group - the pre-grouping behaviour.  2026-11-01: the whole-clip
-    ``tiled_scale`` call materialised the x4 intermediate of the entire
-    clip - 17.8 GiB for the owner's 48 720p frames - and OOMed a 16 GB
-    card before the first paste.
-    """
-    scaled_pixels = round(scale * int(height)) * round(scale * int(width))
-    per_frame = BG_SCALED_PIXEL_BYTES * scaled_pixels
-    budget = STAGING_BYTES
-    free = free_memory_bytes(device)
-    if free > 0:
-        budget = min(budget, int(free * STAGING_MEMORY_SHARE))
-    return max(1, budget // per_frame)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +405,7 @@ def paste_faces_batch_chunked(
     face_frame: Sequence[int] | None = None,
     num_frames: int | None = None,
     stage_bar=None,
+    face_upscale_model=None,
 ) -> torch.Tensor:
     """The device-output paste of the whole eligible batch, in frame groups.
 
@@ -443,7 +416,7 @@ def paste_faces_batch_chunked(
     and defeat the chunking) and the per-group convert-out
     (:func:`comfy_convert_out`) downloaded into one preallocated host
     float32 buffer.  The device footprint is one group's (raw upload +
-    Lanczos out + canvas + the convert transient <= the budget),
+    background out + canvas + the convert transient <= the budget),
     independent of the clip length - the point: the full mode's
     ``N * H * W * 3`` canvas disengages past the budget and revives the
     host assembly at 16x pixels.
@@ -451,12 +424,11 @@ def paste_faces_batch_chunked(
     The group size defaults to :func:`paste_chunk_size` of the canvas -
     the same value the full mode derives internally, so the full mode's
     internal chunk boundaries and the groups coincide and both modes run
-    the same batch compositions.  On CPU every op is measured
-    batch-invariant (the design's D3), so the modes are bit-identical for
-    any group size; on CUDA the boundary alignment is the structural
-    guarantee, with the Lanczos background resize's batch sensitivity
-    owner-gated - the one op that still sees the whole batch in the full
-    mode and groups in this one.
+    the same batch compositions.  With a background model the default is
+    capped at 2 (keep-fix5, 2026-11-03 - see the loop below), so the
+    boundary alignment holds only for the no-model default; on CPU every
+    op is measured batch-invariant (the design's D3), so the modes are
+    bit-identical for any group size either way.
 
     The vendored-fallback frames are not this function's business: only
     the eligible rows are converted; the processor writes the fallback
@@ -481,7 +453,8 @@ def paste_faces_batch_chunked(
             target.
         parse_net: the vendored ParseNet.
         frame_chunk: the frames per group (``None`` sizes it from the
-            free VRAM - :func:`paste_chunk_size` of the canvas).
+            free VRAM - :func:`paste_chunk_size` of the canvas, capped at
+            2 while a background model is active).
         parse_chunk: the frames per ParseNet forward (``None`` sizes it
             from the free VRAM).
         face_frame: the canvas row each face composites into - ``None``
@@ -501,6 +474,12 @@ def paste_faces_batch_chunked(
             the tick to the multi-face groups - the multiface stage's
             loop ticks only its fallback rows, so the batched rows tick
             here).  ``None`` (the default) ticks nothing.
+        face_upscale_model: the optional face upscaler (keep-fix5,
+            2026-11-03) - the chunk's 512 faces are upscaled on the device
+            (:func:`upscale_faces_batch_gpu`) before the ROI warp samples
+            them; the parse masks stay computed on the 512 faces (the
+            vendored ParseNet input).  ``None`` (the production default)
+            pastes the 512 faces.
 
     Returns:
         The ``(N, canvas_h, canvas_w, 3)`` float32 **CPU** tensor - the
@@ -557,6 +536,13 @@ def paste_faces_batch_chunked(
     )
     if frame_chunk is None:
         frame_chunk = paste_chunk_size(canvas_h, canvas_w, device)
+        if bg_upscale_model is not None:
+            # keep-fix5 (2026-11-03): the model branch upscales one frame
+            # at a time - a group of 16 frames of x4 model output between
+            # two bar ticks freezes the bar for seconds; the cap keeps the
+            # progress at every 1-2 frames and the peak VRAM at the
+            # group's canvas + one scaled frame.
+            frame_chunk = min(frame_chunk, 2)
     frame_chunk = max(1, int(frame_chunk))
     budget = device_canvas_budget(device)
     out = torch.empty((num_rows, canvas_h, canvas_w, 3), dtype=torch.float32)
@@ -581,6 +567,7 @@ def paste_faces_batch_chunked(
                 parse_chunk=parse_chunk,
                 frame_chunk=frame_chunk,
                 device_output=True,
+                face_upscale_model=face_upscale_model,
             )
             # the group's paste call resets the counters - the chunked run
             # sums the additive ones; ``frames`` and ``canvas_bytes`` are
@@ -624,6 +611,7 @@ def paste_faces_batch_chunked(
                 frame_chunk=frame_chunk,
                 device_output=True,
                 face_frame=[rows[index] - start for index in face_indices],
+                face_upscale_model=face_upscale_model,
             )
             for key, value in PASTE_TRANSFER_STATS.items():
                 if key not in ("frames", "canvas_bytes"):
@@ -807,40 +795,86 @@ def is_gray_batch(
 # The background of the paste (design section 7.7, step 1)
 # ---------------------------------------------------------------------------
 
-def _tiled_scale_batch(
-    model, frames_bgr_u8: np.ndarray, device: torch.device
-) -> torch.Tensor:
-    """The batched ``tiled_scale`` of the background frames.
+def _tiled_scale_and_resize_batch(
+    model,
+    frames_bgr_u8: np.ndarray,
+    target_hw: tuple[int, int],
+    device: torch.device,
+    return_device: bool,
+) -> np.ndarray | torch.Tensor:
+    """Upscale backgrounds B=1 at a time with FP16 autocast and resize on GPU immediately.
 
-    ``comfy.utils.tiled_scale`` loops over the images of the batch
-    (``comfy/utils.py:1205-1206``) and processes every image on its own, so
-    a batched call is **pixel-identical** to N per-frame calls (the model
-    still sees B=1 tiles - the win is the removed per-frame round trips).
-    ``output_device`` keeps the result on the compute device.
+    The keep-fix5 (2026-11-03) replacement of the former grouped
+    ``tiled_scale`` route: the model sees exactly one frame per call, in
+    FP16 autocast on a CUDA device, and the resize to the paste canvas
+    runs **on the device while the scaled output is still float32** - the
+    x4 intermediate of one frame dies before the next frame starts (the
+    2026-11-01 whole-batch call materialised the x4 intermediate of the
+    entire clip).  The resize kernel is
+    ``F.interpolate(mode="bicubic", antialias=True)`` on the float32
+    scaled output (the plan's snippet; the Lanczos routes of the no-model
+    branch do not apply here - the scaled float is not uint8 yet).  The
+    quantization rounds to the uint8 grid (the truncating cast of the
+    former ``_tiled_scale_batch`` is superseded).
 
-    The value scale is the one of the per-frame ``_run_upscaler``: the RGB
-    float in 0..1 in, the clamped float out, quantized with the
-    **truncating** uint8 cast of ``comfy_image_to_cv2`` and flipped back to
-    BGR.  The result stays **on the device** - the resize of
-    :func:`batched_bg_frames` (and with it the only download of the
-    background) happens after it.
+    Returns:
+        ``(N, target_h, target_w, 3)`` uint8 BGR - on the host, or on the
+        device when ``return_device`` is set.
     """
     from comfy.utils import tiled_scale  # lazy: the pack imports without ComfyUI
 
-    rgb = frames_bgr_u8[..., [2, 1, 0]].astype(np.float32) / 255.0
-    samples = torch.from_numpy(np.ascontiguousarray(rgb)).permute(0, 3, 1, 2).to(device)
-    scaled = tiled_scale(
-        samples,
-        lambda a: model.model(a),
-        tile_x=512,
-        tile_y=512,
-        overlap=64,
-        upscale_amount=model.scale,
-        output_device=device,
-    )
-    scaled = torch.clamp(scaled, min=0, max=1.0)
-    quantized = (scaled * 255.0).to(torch.uint8).permute(0, 2, 3, 1)
-    return quantized[..., [2, 1, 0]].contiguous()
+    num_frames = int(frames_bgr_u8.shape[0])
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    on_device = device.type == "cuda" or return_device
+    out_device = device if on_device else torch.device("cpu")
+    out = torch.empty((num_frames, target_h, target_w, 3), dtype=torch.uint8, device=out_device)
+
+    use_autocast = device.type == "cuda"
+    for i in range(num_frames):
+        # The cancel poll (C1) of the per-frame loop - a no-op outside
+        # ComfyUI (``src/keep_interrupt.py``).
+        keep_interrupt.check_interrupted()
+        # Upload 1 frame (H, W, 3) BGR uint8 -> (1, 3, H, W) RGB float32 [0, 1]
+        frame_t = torch.from_numpy(np.ascontiguousarray(frames_bgr_u8[i])).to(device)
+        sample = frame_t[..., [2, 1, 0]].permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
+        del frame_t
+
+        with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+            scaled = tiled_scale(
+                sample,
+                lambda a: model.model(a),
+                tile_x=512,
+                tile_y=512,
+                overlap=64,
+                upscale_amount=model.scale,
+                output_device=device,
+            )
+        del sample
+
+        # Resize to target canvas size on GPU while still float32, before stacking
+        scaled = scaled.float()
+        if scaled.shape[-2] != target_h or scaled.shape[-1] != target_w:
+            scaled = F.interpolate(
+                scaled,
+                size=(target_h, target_w),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+
+        # RGB float [0, 1] -> BGR uint8 [0, 255]
+        quantized_bgr = (
+            scaled.squeeze(0)
+            .clamp_(0.0, 1.0)
+            .mul_(255.0)
+            .round_()
+            .to(torch.uint8)
+            .permute(1, 2, 0)[..., [2, 1, 0]]
+        )
+        del scaled
+        out[i] = quantized_bgr.to(out_device)
+
+    return out if return_device else out.cpu().numpy()
 
 
 def _resize_bg_frames(
@@ -849,16 +883,18 @@ def _resize_bg_frames(
     device: torch.device,
     return_device: bool,
 ) -> np.ndarray | torch.Tensor:
-    """One resize stage of the background (the frame target or the canvas).
+    """One resize stage of the background (the no-model branch only).
 
     The device Lanczos (:func:`resize_lanczos_u8`) runs when the result
     stays on the device (a CUDA device, or the ``return_device`` staging -
     on the CPU it is bit-exact, ``tests/test_image_op_equivalence.py:292-299``);
     a host background keeps the per-frame cv2 loop (the einsum resample is
     slower than cv2 there).  The resize is per-frame independent, so the
-    group loop of :func:`batched_bg_frames` is pixel-neutral by
-    construction (the CUDA batch composition stays the design's disclosed
-    owner-gated residual).
+    result is pixel-neutral to the batch composition.  The model branch of
+    :func:`batched_bg_frames` no longer runs this - its float32 scaled
+    output is resized in place (:func:`_tiled_scale_and_resize_batch`,
+    keep-fix5 2026-11-03) instead of quantizing first and resizing the
+    uint8 second.
     """
     target_h, target_w = int(target_hw[0]), int(target_hw[1])
     on_device = device.type == "cuda"
@@ -887,19 +923,14 @@ def batched_bg_frames(
     """The background of the paste, at the target size of the paste.
 
     Without a background model (the production default) the background is
-    the frame itself; with one it is the batched ``tiled_scale`` calls of
-    :func:`_tiled_scale_batch` over the VRAM-aware frame groups of
-    :func:`bg_chunk_size` - each group is resized to its target **before
-    the next group starts**, so the x4 intermediate dies with its group
-    instead of materialising for the whole clip (2026-11-01: ~0.37 GiB a
-    720p frame - two float32 stacks of the 4x size plus the uint8 one -
-    OOMed a 16 GB card on the owner's 48-frame clip before the first
-    paste; the model work is unchanged, ``tiled_scale`` still processes
-    every image on its own).  The resize to the target size runs **on the
-    device** (:func:`resize_lanczos_u8` - the owner-accepted GPU Lanczos,
-    the tolerance-accepted route) when the device is CUDA; a CPU device
-    keeps the per-frame cv2 loop (the einsum resample is slower than cv2
-    there).  The background is downloaded once, after the last resize.
+    the frame itself, resized once to the final paste canvas
+    (:func:`paste_canvas_hw`) - the double resize of the former body (the
+    frame target, then the canvas target) is gone with keep-fix5
+    (2026-11-03; the plan's snippet computes the one final target from
+    :func:`paste_canvas_hw` at the top).  With a model the background is
+    the per-frame FP16 upscale of :func:`_tiled_scale_and_resize_batch` -
+    one frame at a time, resized straight to the canvas while the scaled
+    output is float32.
 
     Args:
         canvas_hw: the ``(height, width)`` of the paste canvas - the size of
@@ -913,57 +944,25 @@ def batched_bg_frames(
     Returns:
         ``(N, h_up, w_up, 3)`` uint8 BGR - on the host, or on the device
         when ``return_device`` is set (the numpy frames are uploaded once;
-        with a background model the batched ``tiled_scale`` result is
+        with a background model the per-frame ``tiled_scale`` result is
         already on the device).
     """
     frames = np.asarray(frames_bgr_u8)
-    height, width = frames.shape[1:3]
-    target_h, target_w = int(height * upscale_factor), int(width * upscale_factor)
-    on_device = device.type == "cuda"
+    final_target_hw = paste_canvas_hw(frames.shape[1:3], upscale_factor, canvas_hw)
+
     if bg_upscale_model is None:
         background: np.ndarray | torch.Tensor = (
             torch.from_numpy(np.ascontiguousarray(frames)).to(device)
             if return_device else frames
         )
-        background = _resize_bg_frames(
-            background, (target_h, target_w), device, return_device
-        )
-    else:
-        # The bg model runs in VRAM-aware frame groups (2026-11-01): one
-        # ``tiled_scale`` call per group instead of one over the whole
-        # batch, every group resized to its target before the next group
-        # starts - the x4 intermediate dies with its group instead of
-        # materialising for the whole clip.  The model work is unchanged
-        # (``tiled_scale`` still processes every image on its own).
-        frame_chunk = bg_chunk_size(height, width, bg_upscale_model.scale, device)
-        groups: list[np.ndarray | torch.Tensor] = []
-        for start in range(0, frames.shape[0], frame_chunk):
-            # The cancel poll (C1) of the grouped loops - a no-op outside
-            # ComfyUI (``src/keep_interrupt.py``).
-            keep_interrupt.check_interrupted()
-            stop = min(start + frame_chunk, frames.shape[0])
-            group = _tiled_scale_batch(bg_upscale_model, frames[start:stop], device)
-            if not on_device and not return_device:
-                group = group.numpy()
-            groups.append(
-                _resize_bg_frames(group, (target_h, target_w), device, return_device)
-            )
-        if len(groups) == 1:
-            background = groups[0]
-        elif isinstance(groups[0], torch.Tensor):
-            background = torch.cat(groups, dim=0)
-        else:
-            background = np.concatenate(groups, axis=0)
-    if canvas_hw is not None:
-        canvas_h, canvas_w = canvas_hw
-        canvas_target_h = int(canvas_h * upscale_factor)
-        canvas_target_w = int(canvas_w * upscale_factor)
-        background = _resize_bg_frames(
-            background, (canvas_target_h, canvas_target_w), device, return_device
-        )
-    if isinstance(background, torch.Tensor) and not return_device:
-        background = background.cpu().numpy()
-    return background
+        background = _resize_bg_frames(background, final_target_hw, device, return_device)
+        if isinstance(background, torch.Tensor) and not return_device:
+            background = background.cpu().numpy()
+        return background
+
+    return _tiled_scale_and_resize_batch(
+        bg_upscale_model, frames, final_target_hw, device, return_device
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +982,9 @@ def parse_soft_masks_batched(
     512x512, the ``img2tensor`` BGR -> RGB flip, the float32 ``/255`` and
     the ``(t - 0.5) / 0.5`` normalize.  The postprocess is the batched
     :func:`~.keep_gpu_ops.parse_soft_masks` (the colormap assignment, the
-    two Gaussian blurs, the border zeroing and the ``/255``).
+    two Gaussian blurs, the border zeroing and the ``/255``).  The forward
+    itself runs in FP16 autocast on a CUDA device (keep-fix5, 2026-11-03);
+    a CPU device keeps the float32 path of the pins.
 
     Args:
         parse_net: the vendored ParseNet - its forward returns the
@@ -1005,6 +1006,7 @@ def parse_soft_masks_batched(
         chunk_size = parse_chunk_size(device)
     chunk_size = max(1, int(chunk_size))
     masks = []
+    use_autocast = device.type == "cuda"
     for start in range(0, num_frames, chunk_size):
         stop = min(start + chunk_size, num_frames)
         # the vendored input chain: the float32 /255, the BGR -> RGB flip
@@ -1012,9 +1014,12 @@ def parse_soft_masks_batched(
         chunk = faces_bchw[start:stop].to(torch.float32).div(255.0)
         chunk = chunk[:, [2, 1, 0]]
         chunk = chunk.sub_(0.5).div_(0.5)
-        with torch.no_grad():
+        # keep-fix5 (2026-11-03): the ParseNet forward runs in FP16
+        # autocast on a CUDA device - the CPU gate runs the FP32 path
+        # (``enabled=False``); the postprocess below stays float32.
+        with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
             logits = parse_net(chunk)[0]
-        masks.append(parse_soft_masks(logits))
+        masks.append(parse_soft_masks(logits.float()))
     if not masks:
         return torch.zeros(
             (0, 1, faces_bchw.shape[2], faces_bchw.shape[3]),
@@ -1022,6 +1027,56 @@ def parse_soft_masks_batched(
             device=faces_bchw.device,
         )
     return torch.cat(masks, dim=0)
+
+
+def upscale_faces_batch_gpu(
+    faces_bchw_u8: torch.Tensor,
+    face_upscale_model,
+    device: torch.device,
+) -> torch.Tensor:
+    """Upscale (N, 3, 512, 512) BGR uint8 faces on GPU with B=1 and FP16 autocast.
+
+    keep-fix5 (2026-11-03): the face upscaler joins the batched paste core.
+    The faces run one at a time (the VRAM discipline of the background
+    branch: a batched x4 stack of 16 faces is ~50 MiB of float32, a 2048
+    uint8 stack per frame group), in FP16 autocast on a CUDA device - the
+    CPU gate runs the FP32 path (``enabled=False``).  The parse masks stay
+    computed on the 512 faces (the vendored ParseNet input); only the ROI
+    warp samples the upscaled face, so the canvas keeps the face's paste
+    geometry and gains the model's sub-pixel detail.
+
+    Returns:
+        ``(N, 3, round(h * scale), round(w * scale))`` BGR uint8 on
+        ``device`` - the input untouched when ``face_upscale_model`` is
+        ``None``.
+    """
+    if face_upscale_model is None:
+        return faces_bchw_u8
+
+    scale = float(getattr(face_upscale_model, "scale", 1))
+    n, c, h, w = faces_bchw_u8.shape
+    out_h, out_w = round(h * scale), round(w * scale)
+    out = torch.empty((n, c, out_h, out_w), dtype=torch.uint8, device=device)
+
+    use_autocast = device.type == "cuda"
+    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+        for i in range(n):
+            # The cancel poll (C1) of the per-face loop - a no-op outside
+            # ComfyUI (``src/keep_interrupt.py``).
+            keep_interrupt.check_interrupted()
+            # BGR uint8 -> RGB float32 [0, 1]
+            face_rgb = faces_bchw_u8[i : i + 1, [2, 1, 0]].to(torch.float32).div_(255.0)
+            upscaled_rgb = face_upscale_model.model(face_rgb)
+            # RGB float [0, 1] -> BGR uint8 [0, 255]
+            upscaled_bgr = (
+                upscaled_rgb.float()[:, [2, 1, 0]]
+                .clamp_(0.0, 1.0)
+                .mul_(255.0)
+                .round_()
+                .to(torch.uint8)
+            )
+            out[i : i + 1] = upscaled_bgr
+    return out
 
 
 def _quantize_and_clip(
@@ -1062,6 +1117,7 @@ def paste_faces_batch(
     device: torch.device,
     parse_net,
     parse_chunk: int | None = None,
+    face_upscale_model=None,
     frame_chunk: int | None = None,
     use_roi: bool = True,
     device_output: bool = False,
@@ -1092,6 +1148,13 @@ def paste_faces_batch(
         parse_net: the vendored ParseNet.
         parse_chunk: the frames per ParseNet forward (``None`` sizes it
             from the free VRAM).
+        face_upscale_model: the optional face upscaler (keep-fix5,
+            2026-11-03) - the 512 faces are upscaled on the device
+            (:func:`upscale_faces_batch_gpu`) before the ROI warp samples
+            them; the parse masks stay computed on the 512 faces.  The
+            non-ROI legacy chunk (:func:`_paste_chunk`) is not listed by
+            the plan and keeps the raw faces.  ``None`` (the production
+            default) pastes the 512 faces.
         frame_chunk: the frames per paste chunk (``None`` sizes it from the
             free VRAM).
         device_output: keep the output stack on the device - return the
@@ -1224,6 +1287,7 @@ def paste_faces_batch(
                     parse_net,
                     out_size,
                     parse_chunk,
+                    face_upscale_model=face_upscale_model,
                     canvas=canvas,
                     frame_offset=start,
                 )
@@ -1237,6 +1301,7 @@ def paste_faces_batch(
                         parse_net,
                         out_size,
                         parse_chunk,
+                        face_upscale_model=face_upscale_model,
                     )
                 )
             # the paste bar (the spec's fix-1.2 threading, 2026-10-30): the
@@ -1272,6 +1337,7 @@ def paste_faces_batch(
                 parse_net,
                 out_size,
                 parse_chunk,
+                face_upscale_model=face_upscale_model,
                 canvas=canvas,
                 frame_offset=start,
             )
@@ -1286,6 +1352,7 @@ def paste_faces_batch(
                     parse_net,
                     out_size,
                     parse_chunk,
+                    face_upscale_model=face_upscale_model,
                 )
             )
         # the paste bar (fix 2.3, extended to the multi-face loop by the
@@ -1305,8 +1372,18 @@ def _paste_chunk(
     parse_net,
     out_size: tuple[int, int],
     parse_chunk: int | None,
+    face_upscale_model=None,
 ) -> list[np.ndarray]:
-    """One chunk of the batched paste (the steps of :func:`paste_faces_batch`)."""
+    """One chunk of the batched paste (the steps of :func:`paste_faces_batch`).
+
+    ``face_upscale_model`` is accepted for the uniform dispatch of
+    :func:`paste_faces_batch` and **ignored**: the legacy full-canvas
+    chunk warps the 512 face with ``cv2.warpAffine`` off the same paste
+    affine - an upscaled face would need a rescaled affine the plan does
+    not define (the keep-fix5 ROI chunks sample the upscaled face through
+    the ``[-1, 1]`` grid instead).  The dispatch never passes a model to
+    it in production (``use_roi`` defaults to set).
+    """
     faces_u8 = torch.from_numpy(np.ascontiguousarray(faces)).to(device)
     faces_bchw = faces_u8.permute(0, 3, 1, 2)  # (N, 3, 512, 512) BGR
 
@@ -1662,6 +1739,7 @@ def _paste_chunk_roi(
     parse_net,
     out_size: tuple[int, int],
     parse_chunk: int | None,
+    face_upscale_model=None,
     canvas: torch.Tensor | None = None,
     frame_offset: int = 0,
 ) -> list[np.ndarray] | None:
@@ -1700,8 +1778,16 @@ def _paste_chunk_roi(
     PASTE_TRANSFER_STATS["face_h2d_bytes"] += faces_u8.numel() * faces_u8.element_size()
     faces_bchw = faces_u8.permute(0, 3, 1, 2)  # (N, 3, 512, 512) BGR
 
-    # 1. the parse mask of the faces
+    # 1. the parse mask of the 512x512 faces
     masks = parse_soft_masks_batched(parse_net, faces_bchw, device, parse_chunk)
+    # 1b. upscale faces on GPU if face_upscale_model is provided (keep-fix5,
+    # 2026-11-03): the ROI warp samples the upscaled face - the parse masks
+    # stay computed on the 512 faces (the vendored ParseNet input).
+    faces_for_warp = (
+        upscale_faces_batch_gpu(faces_bchw, face_upscale_model, device)
+        if face_upscale_model is not None
+        else faces_bchw
+    )
 
     out_w, out_h = out_size
     if canvas is not None:
@@ -1729,7 +1815,7 @@ def _paste_chunk_roi(
         theta = _compute_roi_theta(inv_aff, (x0, y0, x1, y1), (512, 512), device)
         grid = F.affine_grid(theta, (1, 3, roi_h, roi_w), align_corners=False)
 
-        face_roi = F.grid_sample(faces_bchw[index : index + 1].float(), grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        face_roi = F.grid_sample(faces_for_warp[index : index + 1].float(), grid, mode="bilinear", padding_mode="zeros", align_corners=False)
         mask_roi = F.grid_sample(masks[index : index + 1], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
         frame_idx = canvas_offset + index
@@ -1752,6 +1838,7 @@ def _paste_chunk_faces(
     parse_net,
     out_size: tuple[int, int],
     parse_chunk: int | None,
+    face_upscale_model=None,
     canvas: torch.Tensor | None = None,
     frame_offset: int = 0,
 ) -> list[np.ndarray]:
@@ -1807,8 +1894,16 @@ def _paste_chunk_faces(
     PASTE_TRANSFER_STATS["face_h2d_bytes"] += faces_u8.numel() * faces_u8.element_size()
     faces_bchw = faces_u8.permute(0, 3, 1, 2)  # (F, 3, 512, 512) BGR
 
-    # 1. the parse mask of the faces
+    # 1. the parse mask of the 512x512 faces
     masks = parse_soft_masks_batched(parse_net, faces_bchw, device, parse_chunk)
+    # 1b. upscale faces on GPU if face_upscale_model is provided (keep-fix5,
+    # 2026-11-03): the ROI warp samples the upscaled face - the parse masks
+    # stay computed on the 512 faces (the vendored ParseNet input).
+    faces_for_warp = (
+        upscale_faces_batch_gpu(faces_bchw, face_upscale_model, device)
+        if face_upscale_model is not None
+        else faces_bchw
+    )
 
     out_w, out_h = out_size
     if canvas is not None:
@@ -1836,7 +1931,7 @@ def _paste_chunk_faces(
         theta = _compute_roi_theta(inv_aff, (x0, y0, x1, y1), (512, 512), device)
         grid = F.affine_grid(theta, (1, 3, roi_h, roi_w), align_corners=False)
 
-        face_roi = F.grid_sample(faces_bchw[face_idx : face_idx + 1].float(), grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        face_roi = F.grid_sample(faces_for_warp[face_idx : face_idx + 1].float(), grid, mode="bilinear", padding_mode="zeros", align_corners=False)
         mask_roi = F.grid_sample(masks[face_idx : face_idx + 1], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
         frame_idx = canvas_offset + int(row)

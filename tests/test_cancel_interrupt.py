@@ -132,7 +132,9 @@ class _ParseFaceHelper:
         self.cropped_faces = []
         self.restored_faces = []
 
-    def read_image(self, image):
+    # keep-fix5-implement1 (2026-11-03): the vendored ``read_image`` gained
+    # the ``check_gray`` flag (plan Step 2.2) - the sequence sites pass it.
+    def read_image(self, image, check_gray: bool = True):
         self.calls.append("read_image")
         self.input_img = image
 

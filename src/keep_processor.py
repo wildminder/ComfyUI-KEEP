@@ -167,7 +167,13 @@ class KEEPFaceProcessor:
         self.model_type_str = model_pack.model_type_str
 
     def _run_upscaler(self, model, cv2_image):
-        """Helper to run a comfy-native upscaler on a cv2 image."""
+        """Helper to run a comfy-native upscaler on a cv2 image.
+
+        keep-fix5 (2026-11-03): the forward runs in FP16 autocast on a CUDA
+        device (the CPU gate exercises the FP32 path), and ``output_device``
+        keeps the scaled float on the compute device - the former body
+        downloaded the scaled intermediate to the host before the clamp.
+        """
         from comfy.utils import tiled_scale  # lazy: the pack imports without ComfyUI
 
         if model is None:
@@ -175,7 +181,19 @@ class KEEPFaceProcessor:
 
         img_tensor = cv2_to_comfy_image(cv2_image).to(self.device)
         img_tensor_bchw = img_tensor.movedim(-1, -3)
-        s = tiled_scale(img_tensor_bchw, lambda a: model.model(a), tile_x=512, tile_y=512, overlap=64, upscale_amount=model.scale)
+        # keep-fix5 (2026-11-03): FP16 autocast on CUDA (the CPU gate runs
+        # FP32), and the scaled float stays on the compute device.
+        use_autocast = self.device.type == "cuda"
+        with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_autocast):
+            s = tiled_scale(
+                img_tensor_bchw,
+                lambda a: model.model(a),
+                tile_x=512,
+                tile_y=512,
+                overlap=64,
+                upscale_amount=model.scale,
+                output_device=self.device,
+            )
         s = torch.clamp(s.movedim(-3, -1), min=0, max=1.0)
         return comfy_image_to_cv2(s)
 
@@ -239,13 +257,16 @@ class KEEPFaceProcessor:
         """The batched paste of the default branch (design section 7.7).
 
         The frames the batched paste can handle - a valid affine, a
-        restored face of the ParseNet size, no face upsampler and an
-        available parse net - are pasted on the device: the chunked
-        ParseNet forward, the batched parse mask, the batched inverse warp
-        and the batched blend.  Since the owner's fix 1.2 (2026-10-30) a
-        grayscale frame is batch-eligible - the device blend handles it
-        with the same tensor logic (``gray_flags`` stays a parameter; the
-        fallback loop still reads it, the eligibility no longer does).
+        restored face of the ParseNet size and an available parse net -
+        are pasted on the device: the chunked ParseNet forward, the
+        batched parse mask, the batched inverse warp and the batched
+        blend.  Since the owner's fix 1.2 (2026-10-30) a grayscale frame
+        is batch-eligible - the device blend handles it with the same
+        tensor logic (``gray_flags`` stays a parameter; the fallback loop
+        still reads it, the eligibility no longer does).  Since keep-fix5
+        (2026-11-03) a configured face upsampler is batch-eligible too -
+        the ``return {}`` abort is deleted; the upscaled faces ride the
+        ROI chunks (:func:`upscale_faces_batch_gpu`).
 
         Since the owner's fix 4 (2026-10-31) ``draw_box`` no longer
         disqualifies the batch: in the device-output modes the boxes are
@@ -277,8 +298,6 @@ class KEEPFaceProcessor:
         parse_net = getattr(self.face_helper, "face_parse", None)
         if parse_net is None or not getattr(self.face_helper, "use_parse", False):
             return {}
-        if self.face_upscale_model is not None:
-            return {}
         if avg_landmarks_sequence is None:
             return {}
 
@@ -296,10 +315,10 @@ class KEEPFaceProcessor:
 
         # The inverse warps of the paste (the vendored ``get_inverse_affine``:
         # ``cv2.invertAffineTransform(affine) * upscale_factor``) and the
-        # background of the batch - batched ``tiled_scale`` calls over the
-        # VRAM-aware frame groups of :func:`bg_chunk_size` instead of one
-        # per frame (2026-11-01: the whole-clip x4 intermediate OOMed the
-        # card before the first paste).
+        # background of the batch - with a bg model the background runs one
+        # frame at a time (:func:`_tiled_scale_and_resize_batch`, keep-fix5
+        # 2026-11-03; the whole-clip x4 intermediate of 2026-11-01 OOMed
+        # the card before the first paste).
         inverses = inverse_affines(
             [affine_matrices[i] for i in eligible], upscale_factor=final_upscale_factor)
         # The pass-through gates (round 4, D-R2.3.2): the paste core is
@@ -322,6 +341,11 @@ class KEEPFaceProcessor:
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
             background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
         mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
+        # keep-fix5 (2026-11-03): a background model never takes the full
+        # mode - the whole-video device canvas would block before the
+        # first model frame; the chunked groups keep the progress alive.
+        if self.bg_upscale_model is not None and mode == "full":
+            mode = "chunked"
 
         if mode == "full":
             background = batched_bg_frames(
@@ -333,6 +357,7 @@ class KEEPFaceProcessor:
                 background_bgr=background,
                 device=self.device,
                 parse_net=parse_net,
+                face_upscale_model=self.face_upscale_model,
                 device_output=True,
                 stage_bar=stage_bar)
             if draw_box:
@@ -349,7 +374,8 @@ class KEEPFaceProcessor:
                 device=self.device,
                 canvas_hw=canvas_hw,
                 parse_net=parse_net,
-                stage_bar=stage_bar)
+                stage_bar=stage_bar,
+                face_upscale_model=self.face_upscale_model)
             if draw_box:
                 self._draw_boxes_on_canvas(chunks, inverses, (canvas_h, canvas_w))
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
@@ -363,6 +389,7 @@ class KEEPFaceProcessor:
             background_bgr=background,
             device=self.device,
             parse_net=parse_net,
+            face_upscale_model=self.face_upscale_model,
             stage_bar=stage_bar)
         return dict(zip(eligible, pasted))
 
@@ -422,11 +449,14 @@ class KEEPFaceProcessor:
             chunk buffer are allocated over the eligible **frame** count
             (``device_output_mode`` counts canvas rows), the faces ride the
             map.
+
+            Since keep-fix5 (2026-11-03) a configured face upsampler is
+            batch-eligible here too - the ``return {}`` abort is deleted,
+            the upscaled faces ride the ROI chunks
+            (:func:`upscale_faces_batch_gpu`).
         """
         parse_net = getattr(self.face_helper, "face_parse", None)
         if parse_net is None or not getattr(self.face_helper, "use_parse", False):
-            return {}
-        if self.face_upscale_model is not None:
             return {}
 
         # The faces of every frame, in detection order (design section 3.2:
@@ -481,6 +511,11 @@ class KEEPFaceProcessor:
         # the canvas budget counts canvas rows - the eligible **frame**
         # count, not the face count (design section 3.4)
         mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
+        # keep-fix5 (2026-11-03): a background model never takes the full
+        # mode - the whole-video device canvas would block before the
+        # first model frame; the chunked groups keep the progress alive.
+        if self.bg_upscale_model is not None and mode == "full":
+            mode = "chunked"
 
         if mode == "full":
             background = batched_bg_frames(
@@ -492,6 +527,7 @@ class KEEPFaceProcessor:
                 background_bgr=background,
                 device=self.device,
                 parse_net=parse_net,
+                face_upscale_model=self.face_upscale_model,
                 device_output=True,
                 face_frame=face_frame,
                 num_frames=len(eligible),
@@ -512,7 +548,8 @@ class KEEPFaceProcessor:
                 parse_net=parse_net,
                 face_frame=face_frame,
                 num_frames=len(eligible),
-                stage_bar=stage_bar)
+                stage_bar=stage_bar,
+                face_upscale_model=self.face_upscale_model)
             if draw_box:
                 self._draw_boxes_on_canvas(chunks, inverses, (canvas_h, canvas_w), face_rows=face_frame)
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
@@ -526,6 +563,7 @@ class KEEPFaceProcessor:
             background_bgr=background,
             device=self.device,
             parse_net=parse_net,
+            face_upscale_model=self.face_upscale_model,
             face_frame=face_frame,
             num_frames=len(eligible),
             stage_bar=stage_bar)
@@ -929,7 +967,11 @@ class KEEPFaceProcessor:
             if needs_upscale[index]:
                 # the same vendored re-derivation the per-row form runs -
                 # the one ``read_image`` call site of the sequence path.
-                self.face_helper.read_image(row)
+                # keep-fix5-implement1 (2026-11-03): ``check_gray=False``
+                # skips the per-frame PIL ``is_gray`` - Stage 4 computes the
+                # gray flags on the device (``is_gray_batch``) and the paste
+                # fallback re-sets ``is_gray`` from them.
+                self.face_helper.read_image(row, check_gray=False)
                 frames[index] = self.face_helper.input_img
             else:
                 frames[index] = row
@@ -1025,7 +1067,12 @@ class KEEPFaceProcessor:
                             keep_interrupt.check_interrupted()
                             img = bgr_group[i - group_start]
                             self.face_helper.clean_all()
-                            self.face_helper.read_image(img)
+                            # keep-fix5-implement1 (2026-11-03):
+                            # ``check_gray=False`` skips the per-frame PIL
+                            # ``is_gray`` - Stage 4 computes the gray flags
+                            # on the device (``is_gray_batch``) and the paste
+                            # fallback re-sets ``is_gray`` from them.
+                            self.face_helper.read_image(img, check_gray=False)
                             # ``read_image`` replaces the input with an
                             # INTER_LINEAR upscale iff min(h, w) < 512
                             # (``face_restoration_helper.py:182-184``); the
@@ -1182,16 +1229,21 @@ class KEEPFaceProcessor:
                                     del warped_u8
                             del chunk_detection_frames
                     batched_clip_faces = current_clip_faces.unsqueeze(0)
-                    if batched_clip_faces.shape[1] == 1:
-                        current_clip_faces_for_net = torch.cat(
-                            [batched_clip_faces, batched_clip_faces], dim=1)
-                        clip_output_tensor = self.keep_net(
-                            current_clip_faces_for_net, need_upscale=False)
-                        kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
-                    else:
-                        clip_output_tensor = self.keep_net(
-                            batched_clip_faces, need_upscale=False)
-                        kept_clip_tensor = clip_output_tensor
+                    # keep-fix5-implement1 (2026-11-03): the keep_net runs
+                    # under FP16 autocast on CUDA (plan Step 3.4) - the CPU
+                    # gate exercises the FP32 path (enabled=False).
+                    use_autocast = self.device.type == "cuda"
+                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_autocast):
+                        if batched_clip_faces.shape[1] == 1:
+                            current_clip_faces_for_net = torch.cat(
+                                [batched_clip_faces, batched_clip_faces], dim=1)
+                            clip_output_tensor = self.keep_net(
+                                current_clip_faces_for_net, need_upscale=False)
+                            kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
+                        else:
+                            clip_output_tensor = self.keep_net(
+                                batched_clip_faces, need_upscale=False)
+                            kept_clip_tensor = clip_output_tensor
                     restored_u8 = tensor2img_batch(
                         kept_clip_tensor.squeeze(0), min_max=(-1, 1))
                     all_restored_faces_cv2[start_idx:end_idx] = restored_u8
@@ -1560,7 +1612,12 @@ class KEEPFaceProcessor:
                         keep_interrupt.check_interrupted()
                         img = bgr_group[i - group_start]
                         self.face_helper.clean_all()
-                        self.face_helper.read_image(img)
+                        # keep-fix5-implement1 (2026-11-03):
+                        # ``check_gray=False`` skips the per-frame PIL
+                        # ``is_gray`` - Stage 4 computes the gray flags on
+                        # the device (``is_gray_batch``) and the paste
+                        # fallback re-sets ``is_gray`` from them.
+                        self.face_helper.read_image(img, check_gray=False)
                         # ``read_image`` replaces the input with an
                         # INTER_LINEAR upscale iff min(h, w) < 512 - the
                         # identity flags the frames the crop re-derives.
@@ -1698,16 +1755,21 @@ class KEEPFaceProcessor:
                     current_clip_faces = current_clip_faces.unsqueeze(0)
                     # The 1-entry chunk keeps the duplicate-to-2 trick, the
                     # progress counts faces.
-                    if current_clip_faces.shape[1] == 1:
-                        current_clip_faces_for_net = torch.cat(
-                            [current_clip_faces, current_clip_faces], dim=1)
-                        clip_output_tensor = self.keep_net(
-                            current_clip_faces_for_net, need_upscale=False)
-                        kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
-                    else:
-                        clip_output_tensor = self.keep_net(
-                            current_clip_faces, need_upscale=False)
-                        kept_clip_tensor = clip_output_tensor
+                    # keep-fix5-implement1 (2026-11-03): the keep_net runs
+                    # under FP16 autocast on CUDA (plan Step 3.4) - the CPU
+                    # gate exercises the FP32 path (enabled=False).
+                    use_autocast = self.device.type == "cuda"
+                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_autocast):
+                        if current_clip_faces.shape[1] == 1:
+                            current_clip_faces_for_net = torch.cat(
+                                [current_clip_faces, current_clip_faces], dim=1)
+                            clip_output_tensor = self.keep_net(
+                                current_clip_faces_for_net, need_upscale=False)
+                            kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
+                        else:
+                            clip_output_tensor = self.keep_net(
+                                current_clip_faces, need_upscale=False)
+                            kept_clip_tensor = clip_output_tensor
                     restored_u8 = tensor2img_batch(
                         kept_clip_tensor.squeeze(0), min_max=(-1, 1))
                     all_restored_faces_cv2[start_idx:end_idx] = restored_u8

@@ -60,16 +60,13 @@ VENDORED_ROOTS = ("basicsr", "facelib")
 #: ``importlib.import_module``.  Each of those modules is therefore part of the
 #: runtime closure, even though no static import statement mentions it.
 #:
+#: 2026-11-03, keep-fix5-implement1 Phase 4.1: no vendored package init has a
+#: folder scan any more (P2.4 replaced them with explicit import lists, and
+#: Phase 4.1 deleted ``data/``, ``losses/`` and ``models/`` outright) - the
+#: mapping is kept as a safety net so a reintroduced upstream-style scan is
+#: modelled instead of silently understating the closure.
+#:
 #: package folder -> (file suffix, source of the scan in the vendored tree)
-#:
-#: * ``archs``  - ``basicsr/archs/__init__.py:13-15``  (``*_arch.py``)
-#: * ``data``   - ``basicsr/data/__init__.py:20-22``   (``*_dataset.py``)
-#: * ``losses`` - ``basicsr/losses/__init__.py:14-16`` (``*_loss.py``)
-#: * ``models`` - ``basicsr/models/__init__.py:13-15`` (``*_model.py``)
-#:
-#: Omitting one of these scans understates the closure: ``basicsr/__init__.py``
-#: imports every one of those packages, so the whole ``models/`` / ``data/`` /
-#: ``losses/`` folders are loaded by ``import basicsr``.
 EAGER_SCAN_PACKAGES: dict[str, str] = {
     "archs": "_arch.py",
     "data": "_dataset.py",

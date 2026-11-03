@@ -169,7 +169,14 @@ class FaceRestoreHelper(object):
     def set_upscale_factor(self, upscale_factor):
         self.upscale_factor = upscale_factor
 
-    def read_image(self, img):
+    def read_image(self, img, check_gray: bool = True):
+        # keep-fix5-implement1 (2026-11-03): the ``check_gray`` flag skips the
+        # per-frame PIL ``is_gray`` round trip for the sequence paths - Stage
+        # 4 of the pack computes the gray flags on the device
+        # (:func:`~ComfyUI_KEEP.src.keep_gpu_paste.is_gray_batch`), and the
+        # processor re-sets ``self.is_gray`` from them before the only
+        # consumer here (``add_restored_face``).  ``True`` (the default)
+        # keeps the vendored behaviour byte-for-byte.
         if isinstance(img, str):
             img = cv2.imread(img)
         if img is None: raise ValueError("Image not loaded correctly.")
@@ -177,8 +184,11 @@ class FaceRestoreHelper(object):
         if len(img.shape) == 2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif img.shape[2] == 4: img = img[:, :, 0:3]
         self.input_img = img
-        self.is_gray = is_gray(img, threshold=10)
-        if self.is_gray: print('Grayscale input: True')
+        if check_gray:
+            self.is_gray = is_gray(img, threshold=10)
+            if self.is_gray: print('Grayscale input: True')
+        else:
+            self.is_gray = False
         if min(self.input_img.shape[:2]) < 512:
             f = 512.0/min(self.input_img.shape[:2])
             self.input_img = cv2.resize(self.input_img, (0, 0), fx=f, fy=f, interpolation=cv2.INTER_LINEAR)

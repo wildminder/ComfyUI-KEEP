@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+import torchvision  # keep-fix5-implement1 (2026-11-03): GPU-side NMS in detect_faces
 from torchvision.models._utils import IntermediateLayerGetter as IntermediateLayerGetter
 
 from ..align_trans import get_reference_facial_points, warp_and_crop_face
@@ -87,6 +88,10 @@ class RetinaFace(nn.Module):
         self.phase = phase
         self.target_size, self.max_size = 1600, 2150
         self.resize, self.scale, self.scale1 = 1., None, None
+        # keep-fix5-implement1 (2026-11-03): the priors / scale tensors are
+        # pure functions of (height, width, device) - cache them per key so
+        # a video clip rebuilds them once instead of once per frame.
+        self._priors_cache = {}
         # The 'device' variable is now correctly defined at the module level
         self.mean_tensor = torch.tensor(
             [[[[104.]], [[117.]], [[123.]]]]).to(device)
@@ -156,23 +161,30 @@ class RetinaFace(nn.Module):
         return output
 
     def __detect_faces(self, inputs):
-        # get scale
+        # get scale - keep-fix5-implement1 (2026-11-03): cached by
+        # (height, width, device); the tensors are pure functions of the key,
+        # so the cached values are bitwise the rebuilt ones.
         height, width = inputs.shape[2:]
-        self.scale = torch.tensor(
-            [width, height, width, height], dtype=torch.float32).to(device)
-        tmp = [width, height, width, height, width,
-               height, width, height, width, height]
-        self.scale1 = torch.tensor(tmp, dtype=torch.float32).to(device)
+        in_device = inputs.device
+        hw_key = (height, width, in_device)
+        cached = self._priors_cache.get(hw_key)
+        if cached is None:
+            scale = torch.tensor(
+                [width, height, width, height], dtype=torch.float32).to(in_device)
+            tmp = [width, height, width, height, width,
+                   height, width, height, width, height]
+            scale1 = torch.tensor(tmp, dtype=torch.float32).to(in_device)
+            priorbox = PriorBox(self.cfg, image_size=(height, width))
+            priors = priorbox.forward().to(in_device)
+            self._priors_cache[hw_key] = (priors, scale, scale1)
+        else:
+            priors, scale, scale1 = cached
+        self.scale, self.scale1 = scale, scale1
 
         # forawrd
-        inputs = inputs.to(device)
         if self.half_inference:
             inputs = inputs.half()
         loc, conf, landmarks = self(inputs)
-
-        # get priorbox
-        priorbox = PriorBox(self.cfg, image_size=inputs.shape[2:])
-        priors = priorbox.forward().to(device)
 
         return loc, conf, landmarks, priors
 
@@ -224,32 +236,31 @@ class RetinaFace(nn.Module):
 
         loc, conf, landmarks, priors = self.__detect_faces(image)
 
-        boxes = decode(loc.data.squeeze(0), priors.data, self.cfg['variance'])
-        boxes = boxes * self.scale / self.resize
-        boxes = boxes.cpu().numpy()
+        # keep-fix5-implement1 (2026-11-03): filter by confidence and run the
+        # NMS on the device first - the former body decoded and downloaded
+        # all ~16.8k anchors per frame to filter down to 1-2 faces.
+        scores_t = conf.squeeze(0)[:, 1]
+        inds = scores_t > conf_threshold
+        if not inds.any():
+            return np.empty((0, 15), dtype=np.float32)
 
-        scores = conf.squeeze(0).data.cpu().numpy()[:, 1]
+        # Only decode the boxes/landmarks that passed confidence threshold!
+        scores_t = scores_t[inds]
+        loc_filtered = loc.squeeze(0)[inds]
+        landm_filtered = landmarks.squeeze(0)[inds]
+        priors_filtered = priors[inds]
 
-        landmarks = decode_landm(landmarks.squeeze(
-            0), priors, self.cfg['variance'])
-        landmarks = landmarks * self.scale1 / self.resize
-        landmarks = landmarks.cpu().numpy()
+        boxes_t = decode(loc_filtered, priors_filtered, self.cfg['variance']) * self.scale / self.resize
+        landmarks_t = decode_landm(landm_filtered, priors_filtered, self.cfg['variance']) * self.scale1 / self.resize
 
-        # ignore low scores
-        inds = np.where(scores > conf_threshold)[0]
-        boxes, landmarks, scores = boxes[inds], landmarks[inds], scores[inds]
+        # Run NMS directly on GPU
+        keep = torchvision.ops.nms(boxes_t.float(), scores_t.float(), nms_threshold)
+        boxes_t = boxes_t[keep]
+        scores_t = scores_t[keep].unsqueeze(1)
+        landmarks_t = landmarks_t[keep]
 
-        # sort
-        order = scores.argsort()[::-1]
-        boxes, landmarks, scores = boxes[order], landmarks[order], scores[order]
-
-        # do NMS
-        bounding_boxes = np.hstack(
-            (boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
-        keep = py_cpu_nms(bounding_boxes, nms_threshold)
-        bounding_boxes, landmarks = bounding_boxes[keep, :], landmarks[keep]
-
-        return np.concatenate((bounding_boxes, landmarks), axis=1)
+        out_t = torch.cat((boxes_t, scores_t, landmarks_t), dim=1)
+        return out_t.cpu().numpy().astype(np.float32, copy=False)
 
     def __align_multi(self, image, boxes, landmarks, limit=None):
 

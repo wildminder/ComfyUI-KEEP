@@ -183,27 +183,42 @@ def test_closure_contains_the_explicitly_listed_modules(scanner):
     P2.4 replaced the four eager folder scans of the vendored ``basicsr``
     packages with explicit import lists - the same modules are loaded by
     ``import basicsr``, but the closure computation no longer has to model a
-    dynamic scan.
+    dynamic scan.  2026-11-03, keep-fix5-implement1 Phase 4.1: the
+    ``models``/``data``/``losses`` packages are deleted and the ``archs``
+    list is reduced to the four architectures the pack uses - the list below
+    is the regenerated closure manifest.
     """
     report = scanner.scan_repo(REPO_ROOT)
     closure = set(report["closure_files"])
     for expected in (
-        # models/__init__.py - explicit list
-        "modules/deps/basicsr/models/keep_model.py",
-        "modules/deps/basicsr/models/keep_gan_model.py",
-        "modules/deps/basicsr/models/base_model.py",
-        # data/__init__.py - explicit list
-        "modules/deps/basicsr/data/reds_dataset.py",
-        "modules/deps/basicsr/data/single_image_dataset.py",
-        # losses/__init__.py - explicit list
-        "modules/deps/basicsr/losses/basic_loss.py",
+        # archs/__init__.py - explicit list (Phase 4.1)
+        "modules/deps/basicsr/archs/gmflow_arch.py",
+        "modules/deps/basicsr/archs/keep_arch.py",
+        "modules/deps/basicsr/archs/spectral_norm_arch.py",
+        "modules/deps/basicsr/archs/vqgan_arch.py",
+        # utils/__init__.py - explicit list (Phase 4.1)
+        "modules/deps/basicsr/utils/img_util.py",
+        "modules/deps/basicsr/utils/logger.py",
+        "modules/deps/basicsr/utils/misc.py",
         # reached through 'from <package> import <submodule>'
-        "modules/deps/basicsr/models/lr_scheduler.py",
-        "modules/deps/basicsr/utils/flow_util.py",
+        "modules/deps/basicsr/utils/registry.py",
+        "modules/deps/basicsr/version.py",
     ):
         assert expected in closure, (
             f"{expected} is not in the runtime closure - the explicit import "
             "lists of the vendored basicsr are not resolved"
+        )
+    # keep-fix5-implement1 Phase 4.1: the deleted packages are gone from the
+    # closure, and ``metrics/`` stays on disk but off the import path.
+    for absent in (
+        "modules/deps/basicsr/models/keep_model.py",
+        "modules/deps/basicsr/data/reds_dataset.py",
+        "modules/deps/basicsr/losses/basic_loss.py",
+        "modules/deps/basicsr/utils/flow_util.py",
+        "modules/deps/basicsr/metrics/niqe.py",
+    ):
+        assert absent not in closure, (
+            f"{absent} is deleted or off the import path but in the closure"
         )
 
 

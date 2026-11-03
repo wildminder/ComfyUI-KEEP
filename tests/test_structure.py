@@ -329,19 +329,14 @@ def comfy_import_violations(root: Path) -> list[str]:
 #: ``model_management.soft_empty_cache()``.
 EMPTY_CACHE_PATTERN = re.compile(r"torch\.cuda\.empty_cache\s*\(")
 
-#: The known occurrences in the **vendored** BasicSR tree.  They are upstream
-#: code in training-only paths (``SRModel.test`` and the ``cpu_cache`` option
-#: of the BasicVSR++ arch) that the pack never executes - the pack calls the
-#: KEEP arch directly.  The allowlist is **exact** (file *and* count): a file
-#: that gains or loses an occurrence is reported, so the guard cannot go
-#: stale and a new occurrence is never silently tolerated.
-VENDORED_EMPTY_CACHE_ALLOWLIST = {
-    "modules/deps/basicsr/archs/basicvsrpp_arch.py": 4,
-    "modules/deps/basicsr/models/hifacegan_model.py": 1,
-    "modules/deps/basicsr/models/sr_model.py": 1,
-    "modules/deps/basicsr/models/video_base_model.py": 1,
-    "modules/deps/basicsr/models/video_recurrent_model.py": 1,
-}
+#: The known occurrences in the **vendored** BasicSR tree.  2026-11-03,
+#: keep-fix5-implement1 Phase 4.1: the training-only tree (``models/``, the
+#: BasicVSR++ arch, ...) is deleted, so every upstream occurrence is gone
+#: with it and the allowlist is **empty** - any occurrence is a violation.
+#: The mapping is still **exact** (file *and* count): an entry that gains or
+#: loses an occurrence is reported, so the guard cannot go stale and a new
+#: occurrence is never silently tolerated.
+VENDORED_EMPTY_CACHE_ALLOWLIST: dict[str, int] = {}
 
 
 def _code_text(path: Path) -> str:
@@ -714,33 +709,44 @@ def test_self_test_guard_g_detects_an_empty_cache_call_in_the_entry_point(repo_c
 
 @pytest.mark.unit
 def test_self_test_guard_g_detects_a_new_vendored_empty_cache_call(repo_copy):
-    """The guard covers the vendored closure too - not only ``src/``."""
-    vendored = repo_copy / "modules" / "deps" / "basicsr" / "models" / "sr_model.py"
+    """The guard covers the vendored closure too - not only ``src/``.
+
+    2026-11-03, keep-fix5-implement1 Phase 4.1: the probe file moved from
+    the deleted ``models/sr_model.py`` to the surviving ``utils/misc.py``
+    (a runtime-closure member); the allowlist is empty since Phase 4.1, so
+    the injected occurrence must be reported as a violation.
+    """
+    vendored = repo_copy / "modules" / "deps" / "basicsr" / "utils" / "misc.py"
     vendored.write_text(
         vendored.read_text(encoding="utf-8")
         + "\n\ndef _probe():\n    torch.cuda.empty_cache()\n",
         encoding="utf-8",
     )
     violations = empty_cache_violations(repo_copy)
-    assert any("sr_model.py" in violation for violation in violations), (
+    assert any("misc.py" in violation for violation in violations), (
         f"the guard did not catch the new vendored occurrence: {violations}"
     )
 
 
 @pytest.mark.unit
-def test_self_test_guard_g_detects_a_stale_allowlist_entry(repo_copy):
-    """The allowlist is exact: a **removed** occurrence is reported, too."""
-    vendored = (
-        repo_copy / "modules" / "deps" / "basicsr" / "archs" / "basicvsrpp_arch.py"
-    )
-    vendored.write_text(
-        vendored.read_text(encoding="utf-8").replace(
-            "torch.cuda.empty_cache()", "pass", 1
-        ),
-        encoding="utf-8",
+def test_self_test_guard_g_detects_a_stale_allowlist_entry(repo_copy, monkeypatch):
+    """The allowlist is exact: a **removed** occurrence is reported, too.
+
+    2026-11-03, keep-fix5-implement1 Phase 4.1: the allowlist is empty (the
+    allowlisted files are deleted), so the stale-entry branch is exercised
+    with a temporary entry for a surviving closure file that has no
+    occurrence.
+    """
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "VENDORED_EMPTY_CACHE_ALLOWLIST",
+        {"modules/deps/basicsr/utils/misc.py": 1},
     )
     violations = empty_cache_violations(repo_copy)
-    assert any("basicvsrpp_arch.py" in violation for violation in violations), (
+    assert any(
+        "misc.py" in violation and "allowlist expects" in violation
+        for violation in violations
+    ), (
         f"the guard did not catch the stale allowlist entry: {violations}"
     )
 

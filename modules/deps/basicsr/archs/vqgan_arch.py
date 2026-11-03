@@ -216,31 +216,22 @@ class AttnBlock(nn.Module):
             padding=0
         )
 
+    # keep-fix5-implement1 (2026-11-03): the SDPA form of the self-attention
+    # (plan Step 3.2) - the bmm/softmax/bmm chain is replaced wholesale by
+    # ``F.scaled_dot_product_attention`` (same scale, sqrt(c) internally).
     def forward(self, x):
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)
         k = self.k(h_)
         v = self.v(h_)
-
-        # compute attention
         b, c, h, w = q.shape
-        q = q.reshape(b, c, h*w)
-        q = q.permute(0, 2, 1)
-        k = k.reshape(b, c, h*w)
-        w_ = torch.bmm(q, k)
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = F.softmax(w_, dim=2)
-
-        # attend to values
-        v = v.reshape(b, c, h*w)
-        w_ = w_.permute(0, 2, 1)
-        h_ = torch.bmm(v, w_)
-        h_ = h_.reshape(b, c, h, w)
-
+        q = q.view(b, 1, c, h * w).transpose(-2, -1)
+        k = k.view(b, 1, c, h * w).transpose(-2, -1)
+        v = v.view(b, 1, c, h * w).transpose(-2, -1)
+        h_ = F.scaled_dot_product_attention(q, k, v).transpose(-2, -1).reshape(b, c, h, w)
         h_ = self.proj_out(h_)
-
-        return x+h_
+        return x + h_
 
 
 class Encoder(nn.Module):

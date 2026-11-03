@@ -667,9 +667,123 @@ def test_the_widget_options_come_from_the_config_module():
 def test_the_vendored_tree_is_untouched():
     """``modules/deps`` is upstream code - this pack does not patch it.
 
-    The vendored tree is read-only (deviation D7): the console writes of the
-    facelib are routed around it, never edited in it.
+    Re-authored for keep-fix5-implement1 (2026-11-03): plan Steps 2.1 + 2.2
+    authorize exactly two vendored edits -
+    ``modules/deps/facelib/detection/retinaface/retinaface.py`` (the PriorBox
+    cache + the GPU-side confidence filter and NMS of ``detect_faces``) and
+    ``modules/deps/facelib/utils/face_restoration_helper.py`` (the
+    ``read_image`` ``check_gray`` flag) - and plan Phase 3 authorizes three
+    more (Steps 3.1-3.3): ``modules/deps/basicsr/archs/keep_arch.py`` (the
+    SDPA ``CrossAttention._attention``, the float32 ``get_flow``, the
+    ``pos_emb`` dtype cast), ``modules/deps/basicsr/archs/vqgan_arch.py``
+    (the SDPA ``AttnBlock.forward``) and
+    ``modules/deps/basicsr/archs/gmflow/gmflow/transformer.py`` (the SDPA
+    attention forms).  Re-authored again for Phase 4.1 (2026-11-03), which
+    authorizes four more edits (the rewritten ``basicsr/__init__.py`` and
+    ``archs``/``utils`` ``__init__.py`` explicit import lists, and
+    ``archs/arch_util.py`` without the DCNv2Pack block) **and** the deletion
+    of the training-only tree: ``data/``, ``losses/``, ``models/``,
+    ``train.py``/``test.py``, the 23 unused arch modules and the 7 unused
+    utils modules - each deletion below is exactly one file of the plan's
+    Phase 4.1 delete list.  The guard keeps its original rigour: the same
+    ``git status --porcelain`` gate, now asserting the modified set is a
+    subset of exactly those files - ANY other vendored modification still
+    fails the pin.  Once the edits are committed the modified set is empty
+    and the pin holds as before.
     """
+    # keep-fix5-implement1 (2026-11-03): the only vendored files plan Steps
+    # 2.1 + 2.2, Phase 3 and Phase 4.1 are allowed to touch (or delete).
+    authorized_vendored_edits = {
+        "modules/deps/facelib/detection/retinaface/retinaface.py",
+        "modules/deps/facelib/utils/face_restoration_helper.py",
+        "modules/deps/basicsr/archs/keep_arch.py",
+        "modules/deps/basicsr/archs/vqgan_arch.py",
+        "modules/deps/basicsr/archs/gmflow/gmflow/transformer.py",
+        # Phase 4.1 - rewritten
+        "modules/deps/basicsr/__init__.py",
+        "modules/deps/basicsr/archs/__init__.py",
+        "modules/deps/basicsr/archs/arch_util.py",
+        "modules/deps/basicsr/utils/__init__.py",
+        # Phase 4.1 - deleted
+        "modules/deps/basicsr/data/__init__.py",
+        "modules/deps/basicsr/data/data_sampler.py",
+        "modules/deps/basicsr/data/data_util.py",
+        "modules/deps/basicsr/data/degradations.py",
+        "modules/deps/basicsr/data/ffhq_dataset.py",
+        "modules/deps/basicsr/data/meta_info/meta_info_DIV2K800sub_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_REDS4_test_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_REDS_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_REDSofficial4_test_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_REDSval_official_test_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_Vimeo90K_test_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_Vimeo90K_test_fast_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_Vimeo90K_test_medium_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_Vimeo90K_test_slow_GT.txt",
+        "modules/deps/basicsr/data/meta_info/meta_info_Vimeo90K_train_GT.txt",
+        "modules/deps/basicsr/data/paired_image_dataset.py",
+        "modules/deps/basicsr/data/prefetch_dataloader.py",
+        "modules/deps/basicsr/data/realesrgan_dataset.py",
+        "modules/deps/basicsr/data/realesrgan_paired_dataset.py",
+        "modules/deps/basicsr/data/reds_dataset.py",
+        "modules/deps/basicsr/data/single_image_dataset.py",
+        "modules/deps/basicsr/data/transforms.py",
+        "modules/deps/basicsr/data/video_test_dataset.py",
+        "modules/deps/basicsr/data/vimeo90k_dataset.py",
+        "modules/deps/basicsr/losses/__init__.py",
+        "modules/deps/basicsr/losses/basic_loss.py",
+        "modules/deps/basicsr/losses/gan_loss.py",
+        "modules/deps/basicsr/losses/loss_util.py",
+        "modules/deps/basicsr/models/__init__.py",
+        "modules/deps/basicsr/models/base_model.py",
+        "modules/deps/basicsr/models/edvr_model.py",
+        "modules/deps/basicsr/models/esrgan_model.py",
+        "modules/deps/basicsr/models/hifacegan_model.py",
+        "modules/deps/basicsr/models/keep_gan_model.py",
+        "modules/deps/basicsr/models/keep_model.py",
+        "modules/deps/basicsr/models/lr_scheduler.py",
+        "modules/deps/basicsr/models/realesrgan_model.py",
+        "modules/deps/basicsr/models/realesrnet_model.py",
+        "modules/deps/basicsr/models/sr_model.py",
+        "modules/deps/basicsr/models/srgan_model.py",
+        "modules/deps/basicsr/models/stylegan2_model.py",
+        "modules/deps/basicsr/models/swinir_model.py",
+        "modules/deps/basicsr/models/video_base_model.py",
+        "modules/deps/basicsr/models/video_gan_model.py",
+        "modules/deps/basicsr/models/video_recurrent_gan_model.py",
+        "modules/deps/basicsr/models/video_recurrent_model.py",
+        "modules/deps/basicsr/test.py",
+        "modules/deps/basicsr/train.py",
+        "modules/deps/basicsr/archs/arcface_arch.py",
+        "modules/deps/basicsr/archs/basicvsr_arch.py",
+        "modules/deps/basicsr/archs/basicvsrpp_arch.py",
+        "modules/deps/basicsr/archs/dfdnet_arch.py",
+        "modules/deps/basicsr/archs/dfdnet_util.py",
+        "modules/deps/basicsr/archs/discriminator_arch.py",
+        "modules/deps/basicsr/archs/duf_arch.py",
+        "modules/deps/basicsr/archs/ecbsr_arch.py",
+        "modules/deps/basicsr/archs/edsr_arch.py",
+        "modules/deps/basicsr/archs/edvr_arch.py",
+        "modules/deps/basicsr/archs/hifacegan_arch.py",
+        "modules/deps/basicsr/archs/hifacegan_util.py",
+        "modules/deps/basicsr/archs/rcan_arch.py",
+        "modules/deps/basicsr/archs/ridnet_arch.py",
+        "modules/deps/basicsr/archs/rrdbnet_arch.py",
+        "modules/deps/basicsr/archs/spynet_arch.py",
+        "modules/deps/basicsr/archs/srresnet_arch.py",
+        "modules/deps/basicsr/archs/srvgg_arch.py",
+        "modules/deps/basicsr/archs/stylegan2_arch.py",
+        "modules/deps/basicsr/archs/stylegan2_bilinear_arch.py",
+        "modules/deps/basicsr/archs/swinir_arch.py",
+        "modules/deps/basicsr/archs/tof_arch.py",
+        "modules/deps/basicsr/archs/vgg_arch.py",
+        "modules/deps/basicsr/utils/color_util.py",
+        "modules/deps/basicsr/utils/diffjpeg.py",
+        "modules/deps/basicsr/utils/file_client.py",
+        "modules/deps/basicsr/utils/flow_util.py",
+        "modules/deps/basicsr/utils/img_process_util.py",
+        "modules/deps/basicsr/utils/matlab_functions.py",
+        "modules/deps/basicsr/utils/options.py",
+    }
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain", "--", "modules/deps"],
@@ -680,8 +794,15 @@ def test_the_vendored_tree_is_untouched():
         )
     except (OSError, subprocess.CalledProcessError) as exc:  # pragma: no cover
         pytest.skip(f"git is not usable in this checkout: {exc}")
-    assert result.stdout.strip() == "", (
-        "the vendored tree must not be modified:\n" + result.stdout
+    modified = {
+        line[3:].strip().replace("\\", "/")
+        for line in result.stdout.splitlines() if line.strip()
+    }
+    unauthorized = modified - authorized_vendored_edits
+    assert not unauthorized, (
+        "the vendored tree must not be modified beyond the files plan "
+        "Steps 2.1 + 2.2, Phase 3 and Phase 4.1 of keep-fix5-implement1 "
+        "authorize:\n" + "\n".join(sorted(unauthorized))
     )
 
 
@@ -907,7 +1028,9 @@ class _ProgressFaceHelper:
         self.cropped_faces = []
         self.restored_faces = []
 
-    def read_image(self, image):
+    # keep-fix5-implement1 (2026-11-03): the vendored ``read_image`` gained
+    # the ``check_gray`` flag (plan 2.2) - the sequence sites pass it.
+    def read_image(self, image, check_gray: bool = True):
         self.calls.append("read_image")
         self.input_img = image
 

@@ -527,7 +527,9 @@ class _StubFaceHelper:
         self.cropped_faces = []
         self.restored_faces = []
 
-    def read_image(self, image):
+    # keep-fix5-implement1 (2026-11-03): the vendored ``read_image`` gained
+    # the ``check_gray`` flag (plan 2.2) - the sequence sites pass it.
+    def read_image(self, image, check_gray: bool = True):
         self.calls.append("read_image")
         # the vendored helper upscales when min(h, w) < 512
         # (``face_restoration_helper.py:179-184``) - the stub reproduces it
