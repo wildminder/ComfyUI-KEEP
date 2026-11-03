@@ -1,24 +1,24 @@
 import math
-from re import T
 import numpy as np
-import pdb
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from typing import Optional, List
-from torch.profiler import profile, record_function, ProfilerActivity
 from collections import defaultdict
 
 # from gpu_mem_track import MemTracker
 from einops import rearrange, repeat
 
-from basicsr.archs.vqgan_arch import Encoder, VectorQuantizer, GumbelQuantizer, Generator, ResBlock
-from basicsr.archs.arch_util import flow_warp, resize_flow
-from basicsr.archs.gmflow_arch import FlowGenerator
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import ARCH_REGISTRY
+from .vqgan_arch import Encoder, VectorQuantizer, GumbelQuantizer, Generator, ResBlock
+from .arch_util import flow_warp, resize_flow
+from .gmflow_arch import FlowGenerator
+from ..utils import get_root_logger
+from ..utils.registry import ARCH_REGISTRY
 
-from diffusers.models.attention import FeedForward, AdaLayerNorm
+# P2.2 - the two diffusers symbols are vendored (diffusers itself is
+# unusable in this environment: ``diffusers.models.attention`` needs the
+# removed ``huggingface_hub.cached_download``).  See ``_diffusers_compat.py``.
+from ._diffusers_compat import FeedForward, AdaLayerNorm
 
 # gpu_tracker = MemTracker()
 
@@ -197,48 +197,30 @@ class CrossAttention(nn.Module):
         return hidden_states
 
 
+    # keep-fix5-implement1 (2026-11-03): the SDPA form of the full attention
+    # (plan Step 3.1) - the baddbmm/softmax/bmm chain is replaced wholesale by
+    # ``F.scaled_dot_product_attention``; the query/key/value arrive here in
+    # the (b*heads, seq, d) batch-dim layout and go back the same way, and the
+    # internal softmax makes the ``upcast_softmax`` flag moot.
     def _attention(self, query, key, value, attention_mask=None):
         if self.upcast_attention:
             query = query.float()
             key = key.float()
-
-        attention_scores = torch.baddbmm(
-            torch.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device),
-            query,
-            key.transpose(-1, -2),
-            beta=0,
-            alpha=self.scale,
+            value = value.float()
+        b_h, seq_q, d = query.shape
+        b = b_h // self.heads
+        q = query.view(b, self.heads, seq_q, d)
+        k = key.view(b, self.heads, -1, d)
+        v = value.view(b, self.heads, -1, d)
+        attn_mask = (
+            attention_mask.view(b, self.heads, seq_q, -1)
+            if attention_mask is not None
+            else None
         )
-
-        # print('query shape', query.shape)
-        # print('key shape', key.shape)
-        # print('value shape', value.shape)
-
-        if attention_mask is not None:
-            # print('attention_mask', attention_mask.shape)
-            # print('attention_scores', attention_scores.shape)
-            # exit()
-            attention_scores = attention_scores + attention_mask
-
-        if self.upcast_softmax:
-            attention_scores = attention_scores.float()
-
-        attention_probs = attention_scores.softmax(dim=-1)
-        # print(attention_probs.shape)
-
-        # cast back to the original dtype
-        attention_probs = attention_probs.to(value.dtype)
-        # print(attention_probs.shape)
-
-        # compute attention output
-        hidden_states = torch.bmm(attention_probs, value)
-        # print(hidden_states.shape)
-
-        # reshape hidden_states
-        hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
-        # print(hidden_states.shape)
-        # exit()
-        return hidden_states
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, scale=self.scale
+        )
+        return out.permute(0, 2, 1, 3).reshape(b, seq_q, self.heads * d)
 
     def _sliced_attention(self, query, key, value, sequence_length, dim, attention_mask):
         batch_size_attention = query.shape[0]
@@ -817,7 +799,6 @@ class KalmanFilter(nn.Module):
         w_codes = rearrange(
             w_codes, "(b f) c h w -> b f c h w", f=video_length)
 
-        # pdb.set_trace()
         return w_codes
 
 
@@ -979,11 +960,15 @@ class KEEP(nn.Module):
         x_1 = x[:, :-1, :, :, :].reshape(-1, c, h, w)
         x_2 = x[:, 1:, :, :, :].reshape(-1, c, h, w)
 
+        # keep-fix5-implement1 (2026-11-03): the flow net stays in float32
+        # even under an outer autocast (plan Step 3.1) - the enabled=False
+        # autocast pins the flownet to full precision and the flows are
+        # cast back to the caller's dtype.
         # Forward flow
-        with torch.no_grad():
-            flows = self.flownet(x_2, x_1).view(b, t - 1, 2, h, w)
+        with torch.no_grad(), torch.amp.autocast(device_type=x.device.type, enabled=False):
+            flows = self.flownet(x_2.float(), x_1.float()).view(b, t - 1, 2, h, w)
 
-        return flows.detach()
+        return flows.to(x.dtype).detach()
 
     def mask_by_ratio(self, x, mask_ratio=0.):
         if mask_ratio == 0:
@@ -1070,9 +1055,12 @@ class KEEP(nn.Module):
                     z_codes[:, i, ...], z_prime, gains[:, i, ...])
 
             # ################# Transformer ###################
-            pos_emb = self.position_emb.unsqueeze(1).repeat(1, b, 1)
             # BCHW -> BC(HW) -> (HW)BC
             query_emb = self.feat_emb(z_hat.flatten(2).permute(2, 0, 1))
+            # keep-fix5-implement1 (2026-11-03): the fp32 position parameter
+            # is cast to the query dtype (plan Step 3.1) - under autocast the
+            # transformer layers see matching fp16 tensors.
+            pos_emb = self.position_emb.unsqueeze(1).repeat(1, b, 1).to(query_emb.dtype)
             for layer in self.ft_layers:
                 query_emb = layer(query_emb, query_pos=pos_emb)
 
@@ -1103,7 +1091,6 @@ class KEEP(nn.Module):
 
                 if j in cft_list:  # fuse after i-th block
                     f_size = str(x.shape[-1])
-                    # pdb.set_trace()
                     x = self.cft[f_size](
                         enc_feat_dict[f_size][:, i, ...], x, self.cond)
 
@@ -1114,7 +1101,6 @@ class KEEP(nn.Module):
                         cross_prev_feat[f_size] = x
                         # print(f_size)
                     else:
-                        # pdb.set_trace()
                         prev_fea = cross_prev_feat[f_size]
                         x = self.cfa[f_size](
                             x, prev_fea, residual=self.use_residual)

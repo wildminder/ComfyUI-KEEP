@@ -1,9 +1,27 @@
 [project]
 name = "ComfyUI-KEEP"
 description = "Kalman-Inspired Feature Propagation for Video Face Super-Resolution"
-version = "1.1.0"
+version = "2.0.0"
 license = {file = "LICENSE"}
-dependencies = ["addict", "future", "lmdb", "numpy", "opencv-python", "Pillow", "pyyaml", "scikit-image", "scipy", "torch", "torchvision", "tqdm", "yapf", "ffmpeg-python"]
+requires-python = ">=3.10"
+# The declared runtime set (host-guarantee policy): the pack declares only
+# what the ComfyUI host does not already provide.  The host's own
+# requirements.txt ships torch, torchvision, numpy, einops, pyyaml, Pillow,
+# scipy, tqdm and requests, so none of them is repeated here - the pack
+# reports progress through the ComfyUI execution API instead of tqdm, and
+# its single scipy call (gaussian_filter1d) became a torch-native smoothing.
+# OpenCV is the one image dependency the host does not ship, and the
+# vendored architectures plus the LANCZOS4 resizes of the processor still
+# need cv2 - the headless wheel covers the whole closure (no GUI function
+# is called anywhere in the pack or the vendored tree) without dragging
+# the libGL/Qt stack into a server-side install.  Matches requirements.txt.
+dependencies = ["opencv-python-headless"]
+
+# The test-only dependencies.  ``tomli`` is the ``tomllib`` parser of
+# Python 3.10 (the minimum of ``requires-python``) - the metadata test
+# imports it when the standard library has no ``tomllib`` yet.
+[project.optional-dependencies]
+test = ["tomli>=2.0; python_version < '3.11'"]
 
 [project.urls]
 Repository = "https://github.com/wildminder/ComfyUI-KEEP"
@@ -11,5 +29,43 @@ Repository = "https://github.com/wildminder/ComfyUI-KEEP"
 
 [tool.comfy]
 PublisherId = "wildai"
-DisplayName = "ComfyUI-KEEP"
-Icon = ""
+DisplayName = "KEEP"
+# The preview asset of the registry entry.  The file is committed in the
+# repository (``assets/keep-preview.png``); P6.5 may replace the image, but
+# the key must keep pointing at a file that exists.
+Icon = "assets/keep-preview.png"
+requires-comfyui = ">=0.28.0"
+
+# P1.1 - pytest harness configuration.
+# The four markers are the tiers of the modernization plan (section 4):
+#   unit             - pure logic, no ComfyUI dependency
+#   mock_integration - node execute paths against the root conftest mocks
+#   headless         - real ComfyUI source tree on sys.path, no server
+#   gpu_acceptance   - opt-in real-weight run (RUN_KEEP_E2E + KEEP_MODEL_DIR)
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short --import-mode=importlib"
+consider_namespace_packages = true
+pythonpath = ["."]
+markers = [
+    "unit: Pure unit test (no ComfyUI dependency)",
+    "mock_integration: Mock-based integration test (node execute paths against the conftest mocks)",
+    "headless: Requires the real ComfyUI source tree on sys.path (no server)",
+    "gpu_acceptance: Opt-in real-weight run (RUN_KEEP_E2E=1 and KEEP_MODEL_DIR)",
+]
+
+# P1.5 - the lint gate of .github/workflows/tests.yml.
+# Scope decision (same as the reference pack ComfyUI-DyPE): the gate covers the
+# *correctness* rules (pyflakes F + syntax errors E9).  The vendored
+# third-party tree (modules/deps) is excluded - it is upstream code, not ours.
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["modules/deps"]
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+# F401 (unused import) and F541 (f-string without placeholders) are style
+# findings in the *existing* production code; they are cleaned up in the
+# production phases (P4.7), not in the test-infrastructure phase.
+ignore = ["F401", "F541"]

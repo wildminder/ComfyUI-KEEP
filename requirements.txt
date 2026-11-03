@@ -1,14 +1,30 @@
-addict
-future
-lmdb
-numpy
-opencv-python
-Pillow
-pyyaml
-scikit-image
-scipy
-torch
-torchvision
-tqdm
-yapf
-ffmpeg-python
+# ComfyUI-KEEP - declared runtime dependency set (host-guarantee policy)
+#
+# The pack declares only what the ComfyUI host does not already provide:
+# the host's own requirements.txt ships torch, torchvision, numpy, einops,
+# pyyaml, Pillow, scipy, tqdm and requests, so none of them is repeated
+# here and the pack can never pull a version that conflicts with the host
+# environment.  Of the old P2.6 list:
+#
+# torch / torchvision / numpy - host core; the pack's own code uses them,
+#   the host guarantees them
+# Pillow / einops             - only the vendored tree imports them; host-shipped
+# scipy                       - host-shipped, and the pack's single call
+#   (gaussian_filter1d for the video smoothing) became a torch depthwise
+#   conv1d smoothing
+# tqdm                        - the pack reports progress through the ComfyUI
+#   execution API; the vendored tqdm imports are host-shipped
+# pyyaml                      - host-shipped (the YOLOv5 detector config and
+#   the lazy import of keep_paths stay covered)
+# requests                    - host-shipped; a phantom of the vendored
+#   download helper, the pack itself never imports it
+#
+# The one entry the host does not ship:
+#
+# opencv-python-headless - the vendored architectures and the LANCZOS4
+#   resizes of the processor need cv2.  The headless wheel covers the whole
+#   closure: no GUI function (imshow/waitKey/namedWindow) is called
+#   anywhere in the pack or the vendored tree, and a server-side pack
+#   should not pull the libGL/Qt stack of the full wheel.  The CI already
+#   installs the headless wheel (.github/workflows/tests.yml).
+opencv-python-headless

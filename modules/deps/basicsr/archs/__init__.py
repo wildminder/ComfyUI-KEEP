@@ -1,18 +1,19 @@
-import importlib
+# https://github.com/xinntao/BasicSR
+# flake8: noqa
+# 2026-11-03 keep-fix5-implement1 Phase 4.1: the explicit import list is
+# reduced to the four architectures the pack uses.
 from copy import deepcopy
-from os import path as osp
+from ..utils import get_root_logger
+from ..utils.registry import ARCH_REGISTRY
 
-from basicsr.utils import get_root_logger, scandir
-from basicsr.utils.registry import ARCH_REGISTRY
+from . import (
+    gmflow_arch,
+    keep_arch,
+    spectral_norm_arch,
+    vqgan_arch,
+)
 
 __all__ = ['build_network']
-
-# automatically scan and import arch modules for registry
-# scan all the files under the 'archs' folder and collect files ending with '_arch.py'
-arch_folder = osp.dirname(osp.abspath(__file__))
-arch_filenames = [osp.splitext(osp.basename(v))[0] for v in scandir(arch_folder) if v.endswith('_arch.py')]
-# import all the arch modules
-_arch_modules = [importlib.import_module(f'basicsr.archs.{file_name}') for file_name in arch_filenames]
 
 
 def build_network(opt):

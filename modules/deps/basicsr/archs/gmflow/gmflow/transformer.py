@@ -9,11 +9,12 @@ def single_head_full_attention(q, k, v):
     # q, k, v: [B, L, C]
     assert q.dim() == k.dim() == v.dim() == 3
 
-    scores = torch.matmul(q, k.permute(0, 2, 1)) / (q.size(2) ** .5)  # [B, L, L]
-    attn = torch.softmax(scores, dim=2)  # [B, L, L]
-    out = torch.matmul(attn, v)  # [B, L, C]
-
-    return out
+    # keep-fix5-implement1 (2026-11-03): the SDPA form (plan Step 3.3) - the
+    # softmax matmul chain is replaced wholesale by
+    # ``F.scaled_dot_product_attention`` (same scale, sqrt(C) internally).
+    return F.scaled_dot_product_attention(
+        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1)
+    ).squeeze(1)
 
 
 def generate_shift_window_attn_mask(input_resolution, window_size_h, window_size_w,
@@ -68,8 +69,6 @@ def single_head_split_window_attention(q, k, v,
     k = k.view(b, h, w, c)
     v = v.view(b, h, w, c)
 
-    scale_factor = c ** 0.5
-
     if with_shift:
         assert attn_mask is not None  # compute once
         shift_size_h = window_size_h // 2
@@ -83,15 +82,16 @@ def single_head_split_window_attention(q, k, v,
     k = split_feature(k, num_splits=num_splits, channel_last=True)
     v = split_feature(v, num_splits=num_splits, channel_last=True)
 
-    scores = torch.matmul(q.view(b_new, -1, c), k.view(b_new, -1, c).permute(0, 2, 1)
-                          ) / scale_factor  # [B*K*K, H/K*W/K, H/K*W/K]
-
-    if with_shift:
-        scores += attn_mask.repeat(b, 1, 1)
-
-    attn = torch.softmax(scores, dim=-1)
-
-    out = torch.matmul(attn, v.view(b_new, -1, c))  # [B*K*K, H/K*W/K, C]
+    # keep-fix5-implement1 (2026-11-03): the SDPA form (plan Step 3.3) - the
+    # softmax matmul chain is replaced wholesale by
+    # ``F.scaled_dot_product_attention`` (same scale, sqrt(C) internally);
+    # the additive shift mask rides the attn_mask argument.
+    out = F.scaled_dot_product_attention(
+        q.view(b_new, -1, c).unsqueeze(1),
+        k.view(b_new, -1, c).unsqueeze(1),
+        v.view(b_new, -1, c).unsqueeze(1),
+        attn_mask=attn_mask.repeat(b, 1, 1).unsqueeze(1) if with_shift else None,
+    ).squeeze(1)  # [B*K*K, H/K*W/K, C]
 
     out = merge_splits(out.view(b_new, h // num_splits, w // num_splits, c),
                        num_splits=num_splits, channel_last=True)  # [B, H, W, C]

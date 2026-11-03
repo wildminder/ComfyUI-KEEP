@@ -2,16 +2,10 @@ import os
 import torch
 import pathlib
 
-try:
-    from basicsr.utils.download_util import load_file_from_url
-except ImportError:
-    # Minimal fallback if basicsr isn't in path when facelib is directly used (should not happen with our setup)
-    def load_file_from_url(url, model_dir, **kwargs):
-        print(f"Fallback load_file_from_url in facelib.detection for: {url} to {model_dir}")
-        filename = os.path.basename(urlparse(url).path)
-        path = os.path.join(model_dir, filename)
-        if not os.path.exists(path): raise FileNotFoundError(f"{path} not found.")
-        return path
+# P2.7: the swallow-and-stub fallback is gone.  The vendored download utility
+# is imported **relatively** (P2.5), so a broken vendored dependency has to
+# fail loudly instead of silently degrading into a local stub.
+from ...basicsr.utils.download_util import load_file_from_url
 
 # Model URLs (these might be defined elsewhere in original facelib, ensure they are here or imported)
 URLS = {
@@ -62,10 +56,12 @@ def init_detection_model(model_name, half=False, device='cuda', model_rootpath=N
         # This case should ideally be handled by the ComfyUI loader downloading it first.
         # If it still doesn't exist, it means the ComfyUI loader failed or paths are wrong.
         print(f"Warning (init_detection_model): Model file not found at {model_path_final}. Attempting download via facelib's URL.")
-        # This load_file_from_url is from basicsr, which should be in sys.path
-        # It will try to download to a generic 'weights/facelib' if model_dir is relative like this.
+        # This load_file_from_url is the vendored basicsr one (relative import
+        # above) - it will try to download to a generic 'weights/facelib' if
+        # model_dir is relative like this.
         # This is not ideal as it bypasses ComfyUI's model management.
-        # Better to ensure load_file_from_url_comfy in our utils handles all downloads.
+        # Better to ensure the pack's downloader (src/keep_download.py) handles
+        # all downloads.
         model_path_final = load_file_from_url(url=URLS[model_name], model_dir=model_rootpath, file_name=model_file_name)
 
     load_net = torch.load(model_path_final, map_location=lambda storage, loc: storage)

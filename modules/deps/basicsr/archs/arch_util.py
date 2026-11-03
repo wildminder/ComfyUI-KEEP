@@ -3,15 +3,28 @@ import math
 import torch
 import torchvision
 import warnings
-from distutils.version import LooseVersion
 from itertools import repeat
 from torch import nn as nn
 from torch.nn import functional as F
 from torch.nn import init as init
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from basicsr.ops.dcn import ModulatedDeformConvPack, modulated_deform_conv
-from basicsr.utils import get_root_logger
+from ..utils import get_root_logger
+
+
+def _version_tuple(version):
+    """Numeric version tuple of a version string.
+
+    P2.3: replaces the legacy ``LooseVersion`` helper - the standard library
+    module that provided it was removed in Python 3.12 and this package runs
+    on Python 3.13.  Only the numeric components are compared, which is all
+    the original call site needs.
+    """
+    parts = []
+    for chunk in version.split('+')[0].split('.'):
+        digits = ''.join(char for char in chunk if char.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
 
 
 @torch.no_grad()
@@ -200,35 +213,6 @@ def pixel_unshuffle(x, scale):
     w = hw // scale
     x_view = x.view(b, c, h, scale, w, scale)
     return x_view.permute(0, 1, 3, 5, 2, 4).reshape(b, out_channel, h, w)
-
-
-class DCNv2Pack(ModulatedDeformConvPack):
-    """Modulated deformable conv for deformable alignment.
-
-    Different from the official DCNv2Pack, which generates offsets and masks
-    from the preceding features, this DCNv2Pack takes another different
-    features to generate offsets and masks.
-
-    ``Paper: Delving Deep into Deformable Alignment in Video Super-Resolution``
-    """
-
-    def forward(self, x, feat):
-        out = self.conv_offset(feat)
-        o1, o2, mask = torch.chunk(out, 3, dim=1)
-        offset = torch.cat((o1, o2), dim=1)
-        mask = torch.sigmoid(mask)
-
-        offset_absmean = torch.mean(torch.abs(offset))
-        if offset_absmean > 50:
-            logger = get_root_logger()
-            logger.warning(f'Offset abs mean is {offset_absmean}, larger than 50.')
-
-        if LooseVersion(torchvision.__version__) >= LooseVersion('0.9.0'):
-            return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias, self.stride, self.padding,
-                                                 self.dilation, mask)
-        else:
-            return modulated_deform_conv(x, offset, mask, self.weight, self.bias, self.stride, self.padding,
-                                         self.dilation, self.groups, self.deformable_groups)
 
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):

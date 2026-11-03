@@ -1,17 +1,12 @@
 # File: ComfyUI-KEEP/modules/deps/facelib/parsing/__init__.py
 import os
 import torch
-# Assuming load_file_from_url is now globally accessible via sys.path or vendored
-try:
-    from basicsr.utils.download_util import load_file_from_url
-except ImportError:
-    def load_file_from_url(url, model_dir, **kwargs):
-        print(f"Fallback load_file_from_url in facelib.parsing for: {url} to {model_dir}")
-        filename = os.path.basename(urlparse(url).path)
-        path = os.path.join(model_dir, filename)
-        if not os.path.exists(path): raise FileNotFoundError(f"{path} not found.")
-        return path
-        
+
+# P2.7: the swallow-and-stub fallback is gone.  The vendored download utility
+# is imported **relatively** (P2.5), so a broken vendored dependency has to
+# fail loudly instead of silently degrading into a local stub.
+from ...basicsr.utils.download_util import load_file_from_url
+
 URLS = {
     'parsenet': 'https://github.com/jnjaby/KEEP/releases/download/v1.0.0/parsing_parsenet.pth'
 }
