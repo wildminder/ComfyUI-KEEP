@@ -1241,21 +1241,25 @@ class KEEPFaceProcessor:
                                     del warped_u8
                             del chunk_detection_frames
                     batched_clip_faces = current_clip_faces.unsqueeze(0)
-                    # keep-fix5-implement1 (2026-11-03): the keep_net runs
-                    # under FP16 autocast on CUDA (plan Step 3.4) - the CPU
-                    # gate exercises the FP32 path (enabled=False).
-                    use_autocast = self.device.type == "cuda"
-                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_autocast):
-                        if batched_clip_faces.shape[1] == 1:
-                            current_clip_faces_for_net = torch.cat(
-                                [batched_clip_faces, batched_clip_faces], dim=1)
-                            clip_output_tensor = self.keep_net(
-                                current_clip_faces_for_net, need_upscale=False)
-                            kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
-                        else:
-                            clip_output_tensor = self.keep_net(
-                                batched_clip_faces, need_upscale=False)
-                            kept_clip_tensor = clip_output_tensor
+                    # keep-fix5-implement1 (2026-11-03) wrapped this forward
+                    # in FP16 autocast (plan Step 3.4); REGRESSION FIX
+                    # (2026-11-03, owner-measured): on the owner's GPU the
+                    # FP16 forward returned all-NaN - the restored faces came
+                    # out black (KEEP-diag zero_frac=1.0), the parse masks on
+                    # them collapsed to 0, and the video output became the
+                    # raw input.  The FP16-fragile op is not identified, so
+                    # the restore runs FP32 (the pre-round-13 behavior)
+                    # until it is.
+                    if batched_clip_faces.shape[1] == 1:
+                        current_clip_faces_for_net = torch.cat(
+                            [batched_clip_faces, batched_clip_faces], dim=1)
+                        clip_output_tensor = self.keep_net(
+                            current_clip_faces_for_net, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
+                    else:
+                        clip_output_tensor = self.keep_net(
+                            batched_clip_faces, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor
                     restored_u8 = tensor2img_batch(
                         kept_clip_tensor.squeeze(0), min_max=(-1, 1))
                     all_restored_faces_cv2[start_idx:end_idx] = restored_u8
@@ -1767,21 +1771,25 @@ class KEEPFaceProcessor:
                     current_clip_faces = current_clip_faces.unsqueeze(0)
                     # The 1-entry chunk keeps the duplicate-to-2 trick, the
                     # progress counts faces.
-                    # keep-fix5-implement1 (2026-11-03): the keep_net runs
-                    # under FP16 autocast on CUDA (plan Step 3.4) - the CPU
-                    # gate exercises the FP32 path (enabled=False).
-                    use_autocast = self.device.type == "cuda"
-                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_autocast):
-                        if current_clip_faces.shape[1] == 1:
-                            current_clip_faces_for_net = torch.cat(
-                                [current_clip_faces, current_clip_faces], dim=1)
-                            clip_output_tensor = self.keep_net(
-                                current_clip_faces_for_net, need_upscale=False)
-                            kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
-                        else:
-                            clip_output_tensor = self.keep_net(
-                                current_clip_faces, need_upscale=False)
-                            kept_clip_tensor = clip_output_tensor
+                    # keep-fix5-implement1 (2026-11-03) wrapped this forward
+                    # in FP16 autocast (plan Step 3.4); REGRESSION FIX
+                    # (2026-11-03, owner-measured): on the owner's GPU the
+                    # FP16 forward returned all-NaN - the restored faces came
+                    # out black (KEEP-diag zero_frac=1.0), the parse masks on
+                    # them collapsed to 0, and the video output became the
+                    # raw input.  The FP16-fragile op is not identified, so
+                    # the restore runs FP32 (the pre-round-13 behavior)
+                    # until it is.
+                    if current_clip_faces.shape[1] == 1:
+                        current_clip_faces_for_net = torch.cat(
+                            [current_clip_faces, current_clip_faces], dim=1)
+                        clip_output_tensor = self.keep_net(
+                            current_clip_faces_for_net, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor[:, 0:1, ...]
+                    else:
+                        clip_output_tensor = self.keep_net(
+                            current_clip_faces, need_upscale=False)
+                        kept_clip_tensor = clip_output_tensor
                     restored_u8 = tensor2img_batch(
                         kept_clip_tensor.squeeze(0), min_max=(-1, 1))
                     all_restored_faces_cv2[start_idx:end_idx] = restored_u8
