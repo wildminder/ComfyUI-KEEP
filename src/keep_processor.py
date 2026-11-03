@@ -30,6 +30,8 @@ from . import keep_gpu_paste as paste_mod
 from . import keep_interrupt
 from .keep_gpu_paste import (
     PARSE_FACE_SIZE,
+    _call_spandrel,
+    _spandrel_supports_fp16,
     batched_bg_frames,
     is_gray_batch,
     paste_faces_batch,
@@ -173,6 +175,15 @@ class KEEPFaceProcessor:
         device (the CPU gate exercises the FP32 path), and ``output_device``
         keeps the scaled float on the compute device - the former body
         downloaded the scaled intermediate to the host before the clamp.
+
+        keep-fix5-implement2 (2026-11-03): the model call goes through
+        :func:`~.keep_gpu_paste._call_spandrel` (the spandrel descriptor's
+        ``size_requirements`` padding; the plan's Fix 1 diagnosis is
+        ComfyUI-KEEP-wide) and the autocast is gated on
+        :func:`~.keep_gpu_paste._spandrel_supports_fp16` (``supports_half``).
+        No ``_spandrel_on_device`` wrap here - the plan is silent on the
+        single-image leg and the pack loader owns the model's lifecycle
+        (it pre-moves at load and offloads at run end).
         """
         from comfy.utils import tiled_scale  # lazy: the pack imports without ComfyUI
 
@@ -181,13 +192,14 @@ class KEEPFaceProcessor:
 
         img_tensor = cv2_to_comfy_image(cv2_image).to(self.device)
         img_tensor_bchw = img_tensor.movedim(-1, -3)
-        # keep-fix5 (2026-11-03): FP16 autocast on CUDA (the CPU gate runs
-        # FP32), and the scaled float stays on the compute device.
-        use_autocast = self.device.type == "cuda"
+        # keep-fix5-implement2 (2026-11-03): the FP16 autocast is gated on
+        # the descriptor's supports_half (False on a non-CUDA device), and
+        # the scaled float stays on the compute device.
+        use_autocast = _spandrel_supports_fp16(model, self.device)
         with torch.amp.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_autocast):
             s = tiled_scale(
                 img_tensor_bchw,
-                lambda a: model.model(a),
+                lambda a: _call_spandrel(model, a),
                 tile_x=512,
                 tile_y=512,
                 overlap=64,

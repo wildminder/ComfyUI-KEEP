@@ -27,7 +27,14 @@ This module runs the default branch of that stage on the device:
   of float32 into the model and materialised the x4 intermediate of every
   group; 2026-11-01: one call over the whole batch materialised the x4
   intermediate of the whole clip (~0.37 GiB a 720p frame) and OOMed a
-  16 GB card on the owner's 48-frame clip before the first paste,
+  16 GB card on the owner's 48-frame clip before the first paste.
+  keep-fix5-implement2 (2026-11-03) makes the upscaler helpers
+  spandrel-descriptor-aware - the models are called through the descriptor
+  (:func:`_call_spandrel`, the ``size_requirements`` padding), the FP16
+  autocast is gated on ``supports_half`` (:func:`_spandrel_supports_fp16`),
+  the stage-level GPU lifecycle is the re-entrant
+  :func:`_spandrel_on_device` and a ``torch.cuda.OutOfMemoryError`` halves
+  the tile (512 -> 256 -> 128) instead of losing the run.
 - the **gray flags** of the frames run on the device as well - the float64
   variances of the three channel differences, with the numpy computation as
   the fallback of the borderline frames (the paste-stage CPU optimization
@@ -71,6 +78,7 @@ of the background upscaler is lazy.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -548,80 +556,88 @@ def paste_faces_batch_chunked(
     out = torch.empty((num_rows, canvas_h, canvas_w, 3), dtype=torch.float32)
     reset_paste_transfer_stats()
     totals: dict[str, int] = {key: 0 for key in PASTE_TRANSFER_STATS}
-    if rows is None:
-        for start in range(0, num_rows, frame_chunk):
-            # The cancel poll (C1): ComfyUI's Cancel button raises here - a
-            # no-op outside ComfyUI (``src/keep_interrupt.py``).
-            keep_interrupt.check_interrupted()
-            stop = min(start + frame_chunk, num_rows)
-            group_background = batched_bg_frames(
-                background[start:stop], upscale_factor, bg_upscale_model,
-                device, canvas_hw=canvas_hw, return_device=True,
-            )
-            canvas = paste_faces_batch(
-                faces[start:stop],
-                list(inverse_affines[start:stop]),
-                group_background,
-                device,
-                parse_net,
-                parse_chunk=parse_chunk,
-                frame_chunk=frame_chunk,
-                device_output=True,
-                face_upscale_model=face_upscale_model,
-            )
-            # the group's paste call resets the counters - the chunked run
-            # sums the additive ones; ``frames`` and ``canvas_bytes`` are
-            # per-call values the tail sets for the whole helper call.
-            for key, value in PASTE_TRANSFER_STATS.items():
-                if key not in ("frames", "canvas_bytes"):
-                    totals[key] += value
-            comfy_convert_out(canvas, out=out[start:stop], budget=budget)
-            # the paste bar (fix 2.3, 2026-10-30): the group's rows are
-            # done - converted out into the host buffer.  The multi-face
-            # groups below tick the same way (the owner's fix 4,
-            # 2026-10-31): the stage's loop ticks only its fallback rows.
-            if stage_bar is not None:
-                stage_bar.tick(stop - start)
-    else:
-        # The multi-face groups (the cancel + multi-face round, t3):
-        # frame-wise - a group never splits a frame's faces (the t3
-        # contract; the owner's fix 4 composites per face, the grouping
-        # stays).  The rows of the group carry the canvas; the faces ride
-        # the map, re-based to the group's first row.
-        row_faces: list[list[int]] = [[] for _ in range(num_rows)]
-        for face_index, row in enumerate(rows):
-            row_faces[row].append(face_index)
-        for start in range(0, num_rows, frame_chunk):
-            keep_interrupt.check_interrupted()
-            stop = min(start + frame_chunk, num_rows)
-            face_indices = [
-                index for row in range(start, stop) for index in row_faces[row]
-            ]
-            group_background = batched_bg_frames(
-                background[start:stop], upscale_factor, bg_upscale_model,
-                device, canvas_hw=canvas_hw, return_device=True,
-            )
-            canvas = paste_faces_batch(
-                faces[face_indices],
-                [inverse_affines[index] for index in face_indices],
-                group_background,
-                device,
-                parse_net,
-                parse_chunk=parse_chunk,
-                frame_chunk=frame_chunk,
-                device_output=True,
-                face_frame=[rows[index] - start for index in face_indices],
-                face_upscale_model=face_upscale_model,
-            )
-            for key, value in PASTE_TRANSFER_STATS.items():
-                if key not in ("frames", "canvas_bytes"):
-                    totals[key] += value
-            comfy_convert_out(canvas, out=out[start:stop], budget=budget)
-            # the paste bar (fix 2.3, extended to the multi-face groups by
-            # the owner's fix 4, 2026-10-31): the group's rows are done -
-            # converted out into the host buffer.
-            if stage_bar is not None:
-                stage_bar.tick(stop - start)
+    # keep-fix5-implement2 (2026-11-03): the stage-level lifecycle wrap of
+    # the plan - both models move to the device once for the whole batch
+    # and return to their prior devices at the end; the per-group inner
+    # managers (:func:`_tiled_scale_and_resize_batch`,
+    # :func:`upscale_faces_batch_gpu`, this function's own
+    # :func:`paste_faces_batch` wrap) see ``cur_dev == device`` and become
+    # no-ops, so no PCIe transfer happens between the groups.
+    with _spandrel_on_device(device, bg_upscale_model, face_upscale_model):
+        if rows is None:
+            for start in range(0, num_rows, frame_chunk):
+                # The cancel poll (C1): ComfyUI's Cancel button raises here - a
+                # no-op outside ComfyUI (``src/keep_interrupt.py``).
+                keep_interrupt.check_interrupted()
+                stop = min(start + frame_chunk, num_rows)
+                group_background = batched_bg_frames(
+                    background[start:stop], upscale_factor, bg_upscale_model,
+                    device, canvas_hw=canvas_hw, return_device=True,
+                )
+                canvas = paste_faces_batch(
+                    faces[start:stop],
+                    list(inverse_affines[start:stop]),
+                    group_background,
+                    device,
+                    parse_net,
+                    parse_chunk=parse_chunk,
+                    frame_chunk=frame_chunk,
+                    device_output=True,
+                    face_upscale_model=face_upscale_model,
+                )
+                # the group's paste call resets the counters - the chunked run
+                # sums the additive ones; ``frames`` and ``canvas_bytes`` are
+                # per-call values the tail sets for the whole helper call.
+                for key, value in PASTE_TRANSFER_STATS.items():
+                    if key not in ("frames", "canvas_bytes"):
+                        totals[key] += value
+                comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+                # the paste bar (fix 2.3, 2026-10-30): the group's rows are
+                # done - converted out into the host buffer.  The multi-face
+                # groups below tick the same way (the owner's fix 4,
+                # 2026-10-31): the stage's loop ticks only its fallback rows.
+                if stage_bar is not None:
+                    stage_bar.tick(stop - start)
+        else:
+            # The multi-face groups (the cancel + multi-face round, t3):
+            # frame-wise - a group never splits a frame's faces (the t3
+            # contract; the owner's fix 4 composites per face, the grouping
+            # stays).  The rows of the group carry the canvas; the faces ride
+            # the map, re-based to the group's first row.
+            row_faces: list[list[int]] = [[] for _ in range(num_rows)]
+            for face_index, row in enumerate(rows):
+                row_faces[row].append(face_index)
+            for start in range(0, num_rows, frame_chunk):
+                keep_interrupt.check_interrupted()
+                stop = min(start + frame_chunk, num_rows)
+                face_indices = [
+                    index for row in range(start, stop) for index in row_faces[row]
+                ]
+                group_background = batched_bg_frames(
+                    background[start:stop], upscale_factor, bg_upscale_model,
+                    device, canvas_hw=canvas_hw, return_device=True,
+                )
+                canvas = paste_faces_batch(
+                    faces[face_indices],
+                    [inverse_affines[index] for index in face_indices],
+                    group_background,
+                    device,
+                    parse_net,
+                    parse_chunk=parse_chunk,
+                    frame_chunk=frame_chunk,
+                    device_output=True,
+                    face_frame=[rows[index] - start for index in face_indices],
+                    face_upscale_model=face_upscale_model,
+                )
+                for key, value in PASTE_TRANSFER_STATS.items():
+                    if key not in ("frames", "canvas_bytes"):
+                        totals[key] += value
+                comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+                # the paste bar (fix 2.3, extended to the multi-face groups by
+                # the owner's fix 4, 2026-10-31): the group's rows are done -
+                # converted out into the host buffer.
+                if stage_bar is not None:
+                    stage_bar.tick(stop - start)
     totals["frames"] = num_rows
     totals["canvas_bytes"] = canvas_h * canvas_w * 3
     PASTE_TRANSFER_STATS.clear()
@@ -792,6 +808,120 @@ def is_gray_batch(
 
 
 # ---------------------------------------------------------------------------
+# The spandrel descriptor helpers (keep-fix5-implement2, 2026-11-03)
+# ---------------------------------------------------------------------------
+
+def _soft_empty_cache() -> None:
+    """Release the cached VRAM through ComfyUI (the guard-(g) route).
+
+    keep-fix5-implement2 (2026-11-03): the plan's literal
+    ``torch.cuda.empty_cache()`` is substituted with the pack's
+    guard-sanctioned release route (``tests/test_structure.py`` guard (g):
+    the unconditional call fights with the VRAM arbitration of ComfyUI) -
+    a disclosed deviation from the plan's snippet, owner-answered
+    2026-11-03.  The import is lazy (the pack imports without ComfyUI) and
+    the release is a no-op without a GPU.
+    """
+    try:
+        from comfy import model_management  # lazy: the pack imports without ComfyUI
+    except ImportError:
+        return
+    model_management.soft_empty_cache()
+
+
+@contextmanager
+def _spandrel_on_device(device: torch.device, *models):
+    """Re-entrant stage-level GPU lifecycle of the spandrel descriptors.
+
+    keep-fix5-implement2 (2026-11-03): the ``bg_upscale_model`` /
+    ``face_upscale_model`` of the pack are ComfyUI ``spandrel``
+    ``ImageModelDescriptor`` objects whose weights the loader leaves on the
+    offload device - moving them per frame / per chunk transfers 65-100 MB
+    over PCIe dozens of times during a video.  The manager moves every
+    non-``None`` model to ``device`` **once** on entry and restores each to
+    its **prior** device in a ``finally:`` block.
+
+    Re-entrancy: the manager probes the current device of the inner
+    ``.model`` (``next(m.model.parameters()).device`` - a descriptor without
+    parameters counts as ``cpu``) and moves a model only when it is not
+    already there, so the stage-level wrap of
+    :func:`paste_faces_batch` / :func:`paste_faces_batch_chunked` turns the
+    per-helper wraps of :func:`_tiled_scale_and_resize_batch` /
+    :func:`upscale_faces_batch_gpu` into no-ops (``cur_dev == device``), and
+    a standalone (full mode) call still moves + restores correctly.  In
+    production the pack loader pre-moves the inner models at load
+    (``keep_model_loader.py:353-356``) and offloads them at run end, so the
+    manager is a no-op there as well - it exists for the standalone and the
+    interrupted path.
+
+    A restore failure is swallowed (the offload must not mask the body's
+    exception); the CUDA cache is freed only when something was actually
+    moved.
+    """
+    moved: list = []
+    try:
+        for m in models:
+            if m is None:
+                continue
+            inner = getattr(m, "model", m)
+            try:
+                cur_dev = next(inner.parameters()).device
+            except StopIteration:
+                cur_dev = torch.device("cpu")
+            if cur_dev != device:
+                m.to(device)
+                moved.append((m, cur_dev))
+        yield
+    finally:
+        for m, prev_dev in moved:
+            try:
+                m.to(prev_dev)
+            except Exception:
+                pass
+        # keep-fix5-implement2 (2026-11-03): the plan's literal
+        # torch.cuda.empty_cache() is substituted with the guard-sanctioned
+        # _soft_empty_cache (tests/test_structure.py guard (g); a disclosed
+        # deviation, owner-answered 2026-11-03) - only when a model was
+        # actually moved.
+        if moved and device.type == "cuda":
+            _soft_empty_cache()
+
+
+def _spandrel_supports_fp16(model, device: torch.device) -> bool:
+    """Inspect ``spandrel.ImageModelDescriptor.supports_half`` before the FP16 autocast.
+
+    keep-fix5-implement2 (2026-11-03): the RRDBNet / SRVGGNet architectures
+    take the 2x speed and the 50% VRAM of FP16, while several transformer
+    upscalers (SwinIR, HAT, ...) produce NaN / black outputs in FP16 and
+    expose ``supports_half = False``.  The gate keeps ``False`` on a
+    non-CUDA device (the CPU path runs FP32) and defaults to ``True`` when
+    the descriptor carries no flag (duck-typed ``getattr`` - the pack
+    imports without a ``spandrel`` dependency).
+    """
+    if device.type != "cuda":
+        return False
+    return bool(getattr(model, "supports_half", True))
+
+
+def _call_spandrel(model, x: torch.Tensor) -> torch.Tensor:
+    """Call the spandrel descriptor directly so ``size_requirements`` padding applies.
+
+    keep-fix5-implement2 (2026-11-03): ``model.model(a)`` bypasses
+    ``spandrel.ImageModelDescriptor.__call__`` and invokes the raw
+    ``torch.nn.Module`` - transformer upscalers (SwinIR, HAT, DAT, OmniSR)
+    then see tiles that are not a multiple of their ``size_requirements``
+    window (a 512 px tile is not divisible by 12 or 24) and crash or ring.
+    Calling the descriptor itself (what ComfyUI's own
+    ``ImageUpscaleWithModel`` node does) pads the tile, runs the model and
+    crops the output back.  A model that is not callable (the plain
+    ``.model`` wrapper of the tests) keeps the raw call.
+    """
+    if callable(model):
+        return model(x)
+    return model.model(x)
+
+
+# ---------------------------------------------------------------------------
 # The background of the paste (design section 7.7, step 1)
 # ---------------------------------------------------------------------------
 
@@ -817,6 +947,18 @@ def _tiled_scale_and_resize_batch(
     quantization rounds to the uint8 grid (the truncating cast of the
     former ``_tiled_scale_batch`` is superseded).
 
+    keep-fix5-implement2 (2026-11-03): the model call goes through
+    :func:`_call_spandrel` (the descriptor's ``size_requirements``
+    padding), the autocast is gated on
+    :func:`_spandrel_supports_fp16` (``supports_half``), the frame loop
+    runs under the re-entrant :func:`_spandrel_on_device` (a no-op under
+    the stage-level wrap, the move + restore of the full mode here) and a
+    ``torch.cuda.OutOfMemoryError`` halves the tile (512 -> 256 -> 128,
+    matching ComfyUI's own ``ImageUpscaleWithModel``) instead of losing
+    the whole run - the tile size and the overlap are **sticky across
+    frames** (a card that ran out of VRAM at 512 does not retry 512 on
+    the next frame), and a tile that OOMs below 128 re-raises.
+
     Returns:
         ``(N, target_h, target_w, 3)`` uint8 BGR - on the host, or on the
         device when ``return_device`` is set.
@@ -829,50 +971,73 @@ def _tiled_scale_and_resize_batch(
     out_device = device if on_device else torch.device("cpu")
     out = torch.empty((num_frames, target_h, target_w, 3), dtype=torch.uint8, device=out_device)
 
-    use_autocast = device.type == "cuda"
-    for i in range(num_frames):
-        # The cancel poll (C1) of the per-frame loop - a no-op outside
-        # ComfyUI (``src/keep_interrupt.py``).
-        keep_interrupt.check_interrupted()
-        # Upload 1 frame (H, W, 3) BGR uint8 -> (1, 3, H, W) RGB float32 [0, 1]
-        frame_t = torch.from_numpy(np.ascontiguousarray(frames_bgr_u8[i])).to(device)
-        sample = frame_t[..., [2, 1, 0]].permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
-        del frame_t
+    use_autocast = _spandrel_supports_fp16(model, device)
+    # keep-fix5-implement2 (2026-11-03): the tile geometry lives OUTSIDE the
+    # frame loop - once a tile shrinks, the next frame starts at the shrunk
+    # size (sticky across frames), matching ComfyUI's ImageUpscaleWithModel.
+    tile_size = 512
+    overlap = 64
 
-        with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
-            scaled = tiled_scale(
-                sample,
-                lambda a: model.model(a),
-                tile_x=512,
-                tile_y=512,
-                overlap=64,
-                upscale_amount=model.scale,
-                output_device=device,
+    with _spandrel_on_device(device, model):
+        for i in range(num_frames):
+            # The cancel poll (C1) of the per-frame loop - a no-op outside
+            # ComfyUI (``src/keep_interrupt.py``).
+            keep_interrupt.check_interrupted()
+            # Upload 1 frame (H, W, 3) BGR uint8 -> (1, 3, H, W) RGB float32 [0, 1]
+            frame_t = torch.from_numpy(np.ascontiguousarray(frames_bgr_u8[i])).to(device)
+            sample = frame_t[..., [2, 1, 0]].permute(2, 0, 1).unsqueeze(0).to(torch.float32).div_(255.0)
+            del frame_t
+
+            scaled = None
+            while tile_size >= 128:
+                try:
+                    # the autocast wraps INSIDE the retry loop - re-entered
+                    # per attempt (keep-fix5-implement2, 2026-11-03)
+                    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+                        scaled = tiled_scale(
+                            sample,
+                            lambda a: _call_spandrel(model, a),
+                            tile_x=tile_size,
+                            tile_y=tile_size,
+                            overlap=min(overlap, tile_size // 4),
+                            upscale_amount=model.scale,
+                            output_device=device,
+                        )
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    tile_size //= 2
+                    # keep-fix5-implement2 (2026-11-03): the plan's literal
+                    # torch.cuda.empty_cache() is substituted with the
+                    # guard-sanctioned _soft_empty_cache
+                    # (tests/test_structure.py guard (g); a disclosed
+                    # deviation, owner-answered 2026-11-03).
+                    _soft_empty_cache()
+                    if tile_size < 128:
+                        raise
+
+            del sample
+            # Resize to target canvas size on GPU while still float32, before stacking
+            scaled = scaled.float()
+            if scaled.shape[-2] != target_h or scaled.shape[-1] != target_w:
+                scaled = F.interpolate(
+                    scaled,
+                    size=(target_h, target_w),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+
+            # RGB float [0, 1] -> BGR uint8 [0, 255]
+            quantized_bgr = (
+                scaled.squeeze(0)
+                .clamp_(0.0, 1.0)
+                .mul_(255.0)
+                .round_()
+                .to(torch.uint8)
+                .permute(1, 2, 0)[..., [2, 1, 0]]
             )
-        del sample
-
-        # Resize to target canvas size on GPU while still float32, before stacking
-        scaled = scaled.float()
-        if scaled.shape[-2] != target_h or scaled.shape[-1] != target_w:
-            scaled = F.interpolate(
-                scaled,
-                size=(target_h, target_w),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-
-        # RGB float [0, 1] -> BGR uint8 [0, 255]
-        quantized_bgr = (
-            scaled.squeeze(0)
-            .clamp_(0.0, 1.0)
-            .mul_(255.0)
-            .round_()
-            .to(torch.uint8)
-            .permute(1, 2, 0)[..., [2, 1, 0]]
-        )
-        del scaled
-        out[i] = quantized_bgr.to(out_device)
+            del scaled
+            out[i] = quantized_bgr.to(out_device)
 
     return out if return_device else out.cpu().numpy()
 
@@ -1045,6 +1210,13 @@ def upscale_faces_batch_gpu(
     warp samples the upscaled face, so the canvas keeps the face's paste
     geometry and gains the model's sub-pixel detail.
 
+    keep-fix5-implement2 (2026-11-03): the model call goes through
+    :func:`_call_spandrel` (the descriptor's ``size_requirements``
+    padding), the autocast is gated on :func:`_spandrel_supports_fp16`
+    (``supports_half``) and the face loop runs under the re-entrant
+    :func:`_spandrel_on_device` (a no-op under the stage-level wrap of
+    the paste, the move + restore of a standalone call).
+
     Returns:
         ``(N, 3, round(h * scale), round(w * scale))`` BGR uint8 on
         ``device`` - the input untouched when ``face_upscale_model`` is
@@ -1058,24 +1230,25 @@ def upscale_faces_batch_gpu(
     out_h, out_w = round(h * scale), round(w * scale)
     out = torch.empty((n, c, out_h, out_w), dtype=torch.uint8, device=device)
 
-    use_autocast = device.type == "cuda"
-    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
-        for i in range(n):
-            # The cancel poll (C1) of the per-face loop - a no-op outside
-            # ComfyUI (``src/keep_interrupt.py``).
-            keep_interrupt.check_interrupted()
-            # BGR uint8 -> RGB float32 [0, 1]
-            face_rgb = faces_bchw_u8[i : i + 1, [2, 1, 0]].to(torch.float32).div_(255.0)
-            upscaled_rgb = face_upscale_model.model(face_rgb)
-            # RGB float [0, 1] -> BGR uint8 [0, 255]
-            upscaled_bgr = (
-                upscaled_rgb.float()[:, [2, 1, 0]]
-                .clamp_(0.0, 1.0)
-                .mul_(255.0)
-                .round_()
-                .to(torch.uint8)
-            )
-            out[i : i + 1] = upscaled_bgr
+    use_autocast = _spandrel_supports_fp16(face_upscale_model, device)
+    with _spandrel_on_device(device, face_upscale_model):
+        with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+            for i in range(n):
+                # The cancel poll (C1) of the per-face loop - a no-op outside
+                # ComfyUI (``src/keep_interrupt.py``).
+                keep_interrupt.check_interrupted()
+                # BGR uint8 -> RGB float32 [0, 1]
+                face_rgb = faces_bchw_u8[i : i + 1, [2, 1, 0]].to(torch.float32).div_(255.0)
+                upscaled_rgb = _call_spandrel(face_upscale_model, face_rgb)
+                # RGB float [0, 1] -> BGR uint8 [0, 255]
+                upscaled_bgr = (
+                    upscaled_rgb.float()[:, [2, 1, 0]]
+                    .clamp_(0.0, 1.0)
+                    .mul_(255.0)
+                    .round_()
+                    .to(torch.uint8)
+                )
+                out[i : i + 1] = upscaled_bgr
     return out
 
 
@@ -1272,16 +1445,74 @@ def paste_faces_batch(
         device_output = False
         background_device = background
     pasted: list[np.ndarray] = []
-    if rows is None:
+    # keep-fix5-implement2 (2026-11-03): the stage-level lifecycle wrap -
+    # the face upscaler moves to the device once for the whole paste and
+    # returns to its prior device at the end (the re-entrant manager turns
+    # the per-helper wraps of the chunks into no-ops).  ``paste_faces_batch``
+    # has no background model parameter - the bg model's own lifecycle in
+    # the chunked mode lives in this wrap's caller and in the full mode in
+    # :func:`_tiled_scale_and_resize_batch`'s manager.
+    with _spandrel_on_device(device, face_upscale_model):
+        if rows is None:
+            for start in range(0, num_rows, max(1, int(frame_chunk))):
+                keep_interrupt.check_interrupted()
+                stop = min(start + max(1, int(frame_chunk)), num_rows)
+                chunk = _paste_chunk_roi if use_roi else _paste_chunk
+                if device_output:
+                    canvas[start:stop] = background_device[start:stop].to(device)
+                    chunk(
+                        faces[start:stop],
+                        list(inverse_affines[start:stop]),
+                        background_device[start:stop],
+                        device,
+                        parse_net,
+                        out_size,
+                        parse_chunk,
+                        face_upscale_model=face_upscale_model,
+                        canvas=canvas,
+                        frame_offset=start,
+                    )
+                else:
+                    pasted.extend(
+                        chunk(
+                            faces[start:stop],
+                            list(inverse_affines[start:stop]),
+                            background[start:stop],
+                            device,
+                            parse_net,
+                            out_size,
+                            parse_chunk,
+                            face_upscale_model=face_upscale_model,
+                        )
+                    )
+                # the paste bar (the spec's fix-1.2 threading, 2026-10-30): the
+                # chunk's rows are pasted - host rows appended, canvas rows
+                # scattered.  The processor's loop ticks only its fallback rows,
+                # so the eligible rows tick here, per completed chunk.
+                if stage_bar is not None:
+                    stage_bar.tick(stop - start)
+            return canvas if device_output else pasted
+
+        # The multi-face mode (the cancel + multi-face round, t3): frame-wise
+        # groups under the same canvas-byte budget - a group never splits a
+        # frame's faces (the t3 contract; the owner's fix 4 composites per
+        # face, the grouping stays).  The rows of the group carry the canvas;
+        # the faces ride the map, re-based to the group's first row.
+        row_faces: list[list[int]] = [[] for _ in range(num_rows)]
+        for face_index, row in enumerate(rows):
+            row_faces[row].append(face_index)
         for start in range(0, num_rows, max(1, int(frame_chunk))):
             keep_interrupt.check_interrupted()
             stop = min(start + max(1, int(frame_chunk)), num_rows)
-            chunk = _paste_chunk_roi if use_roi else _paste_chunk
+            face_indices = [
+                index for row in range(start, stop) for index in row_faces[row]
+            ]
             if device_output:
                 canvas[start:stop] = background_device[start:stop].to(device)
-                chunk(
-                    faces[start:stop],
-                    list(inverse_affines[start:stop]),
+                _paste_chunk_faces(
+                    faces[face_indices],
+                    [inverse_affines[index] for index in face_indices],
+                    [rows[index] - start for index in face_indices],
                     background_device[start:stop],
                     device,
                     parse_net,
@@ -1293,9 +1524,10 @@ def paste_faces_batch(
                 )
             else:
                 pasted.extend(
-                    chunk(
-                        faces[start:stop],
-                        list(inverse_affines[start:stop]),
+                    _paste_chunk_faces(
+                        faces[face_indices],
+                        [inverse_affines[index] for index in face_indices],
+                        [rows[index] - start for index in face_indices],
                         background[start:stop],
                         device,
                         parse_net,
@@ -1304,64 +1536,13 @@ def paste_faces_batch(
                         face_upscale_model=face_upscale_model,
                     )
                 )
-            # the paste bar (the spec's fix-1.2 threading, 2026-10-30): the
-            # chunk's rows are pasted - host rows appended, canvas rows
-            # scattered.  The processor's loop ticks only its fallback rows,
-            # so the eligible rows tick here, per completed chunk.
+            # the paste bar (fix 2.3, extended to the multi-face loop by the
+            # owner's fix 4, 2026-10-31): the group's rows are pasted - canvas
+            # rows scattered, host rows appended.  The multiface stage's loop
+            # ticks only its fallback rows.
             if stage_bar is not None:
                 stage_bar.tick(stop - start)
         return canvas if device_output else pasted
-
-    # The multi-face mode (the cancel + multi-face round, t3): frame-wise
-    # groups under the same canvas-byte budget - a group never splits a
-    # frame's faces (the t3 contract; the owner's fix 4 composites per
-    # face, the grouping stays).  The rows of the group carry the canvas;
-    # the faces ride the map, re-based to the group's first row.
-    row_faces: list[list[int]] = [[] for _ in range(num_rows)]
-    for face_index, row in enumerate(rows):
-        row_faces[row].append(face_index)
-    for start in range(0, num_rows, max(1, int(frame_chunk))):
-        keep_interrupt.check_interrupted()
-        stop = min(start + max(1, int(frame_chunk)), num_rows)
-        face_indices = [
-            index for row in range(start, stop) for index in row_faces[row]
-        ]
-        if device_output:
-            canvas[start:stop] = background_device[start:stop].to(device)
-            _paste_chunk_faces(
-                faces[face_indices],
-                [inverse_affines[index] for index in face_indices],
-                [rows[index] - start for index in face_indices],
-                background_device[start:stop],
-                device,
-                parse_net,
-                out_size,
-                parse_chunk,
-                face_upscale_model=face_upscale_model,
-                canvas=canvas,
-                frame_offset=start,
-            )
-        else:
-            pasted.extend(
-                _paste_chunk_faces(
-                    faces[face_indices],
-                    [inverse_affines[index] for index in face_indices],
-                    [rows[index] - start for index in face_indices],
-                    background[start:stop],
-                    device,
-                    parse_net,
-                    out_size,
-                    parse_chunk,
-                    face_upscale_model=face_upscale_model,
-                )
-            )
-        # the paste bar (fix 2.3, extended to the multi-face loop by the
-        # owner's fix 4, 2026-10-31): the group's rows are pasted - canvas
-        # rows scattered, host rows appended.  The multiface stage's loop
-        # ticks only its fallback rows.
-        if stage_bar is not None:
-            stage_bar.tick(stop - start)
-    return canvas if device_output else pasted
 
 
 def _paste_chunk(

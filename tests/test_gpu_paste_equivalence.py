@@ -62,6 +62,7 @@ for any chunk boundary.
 from __future__ import annotations
 
 import importlib
+import types
 
 import cv2
 import numpy as np
@@ -282,15 +283,42 @@ def test_the_face_upscaler_rides_the_batched_core(gpu_paste):
     per-face one, byte for byte; a ``None`` model returns the input
     object.
     """
+    class _SpatialUpscaleModule(torch.nn.Module):
+        """The stub's inner ``.model`` - the same nearest x2 as a module.
+
+        keep-fix5-implement2 (2026-11-03): the re-entrant
+        ``_spandrel_on_device`` probes ``next(m.model.parameters()).device``,
+        so the inner model is a real ``nn.Module`` (a bound method has no
+        ``parameters()``); the forward is the nearest x2 the former method
+        body ran - the pin's math is unchanged.
+        """
+
+        def __init__(self, owner) -> None:
+            super().__init__()
+            self.owner = owner
+            self.mark = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, samples):
+            return F.interpolate(
+                samples, scale_factor=self.owner.scale, mode="nearest"
+            )
+
     class _SpatialUpscaleStub:
-        """A face upscaler whose output really is ``scale`` x the input."""
+        """A face upscaler whose output really is ``scale`` x the input.
+
+        The descriptor form (keep-fix5-implement2, 2026-11-03): the
+        ``.to`` the lifecycle manager calls moves the inner module, like
+        spandrel's own descriptor ``.to`` does.
+        """
 
         scale = 2.0
 
-        def model(self, samples):
-            return F.interpolate(
-                samples, scale_factor=self.scale, mode="nearest"
-            )
+        def __init__(self) -> None:
+            self.model = _SpatialUpscaleModule(self)
+
+        def to(self, device, *args, **kwargs):
+            self.model.to(device, *args, **kwargs)
+            return self
 
     rng = np.random.default_rng(17)
     faces = torch.from_numpy(
@@ -1330,17 +1358,43 @@ def test_the_chunked_assembly_is_independent_of_the_group_boundaries(
 # ---------------------------------------------------------------------------
 
 
+class _DoublingUpscaleModule(torch.nn.Module):
+    """The inner ``.model`` of ``_StubUpscaleModel`` - records and doubles.
+
+    keep-fix5-implement2 (2026-11-03): the re-entrant
+    ``_spandrel_on_device`` probes ``next(m.model.parameters()).device``,
+    so the inner model is a real ``nn.Module`` (a bound method has no
+    ``parameters()``); the forward is the same doubling the former method
+    body ran - the pin's math is unchanged.
+    """
+
+    def __init__(self, owner) -> None:
+        super().__init__()
+        self.owner = owner
+        self.mark = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, samples):
+        self.owner.calls.append(tuple(samples.shape))
+        return samples * 2.0
+
+
 class _StubUpscaleModel:
-    """A background upscaler with the ComfyUI model contract."""
+    """A background upscaler with the ComfyUI model contract.
+
+    The descriptor form (keep-fix5-implement2, 2026-11-03): the ``.to``
+    the lifecycle manager calls moves the inner module, like spandrel's
+    own descriptor ``.to`` does.
+    """
 
     scale = 2.0
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.model = _DoublingUpscaleModule(self)
 
-    def model(self, samples):
-        self.calls.append(tuple(samples.shape))
-        return samples * 2.0
+    def to(self, device, *args, **kwargs):
+        self.model.to(device, *args, **kwargs)
+        return self
 
 
 @pytest.mark.unit
@@ -2057,3 +2111,320 @@ def test_the_none_affine_fallback_stays_background_only(
     assert "paste_faces_to_input_image" not in host_helper.calls, host_helper.calls
     assert "add_restored_face" not in host_helper.calls, host_helper.calls
     assert host[1].abs().sum() > 0, "the background-only row must not be zeros"
+
+
+# ---------------------------------------------------------------------------
+# The spandrel-descriptor helpers (keep-fix5-implement2, 2026-11-03)
+# ---------------------------------------------------------------------------
+
+
+class _ReportedParam:
+    """The object the lifecycle manager's device probe reads ``.device`` from."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+
+
+class _InnerDescriptorModel:
+    """The callable, probe-able inner ``.model`` of the descriptor stubs.
+
+    keep-fix5-implement2 (2026-11-03): the re-entrant
+    ``_spandrel_on_device`` probes ``next(m.model.parameters()).device`` -
+    this model reports the device the owner's ``.to`` last recorded (a real
+    descriptor's weights follow its ``.to``), so a nested manager sees the
+    outer one's move exactly like a real descriptor would.
+    """
+
+    def __init__(self, owner) -> None:
+        self.owner = owner
+
+    def parameters(self):
+        return iter((_ReportedParam(self.owner.reported),))
+
+    def __call__(self, samples):
+        self.owner.calls.append(tuple(samples.shape))
+        return self.owner.run(samples)
+
+
+class _DescriptorStub:
+    """A spandrel ``ImageModelDescriptor`` stand-in for the implement2 pins.
+
+    The inner ``.model`` is callable and probe-able (the shape
+    ``_spandrel_on_device`` and ``_call_spandrel`` expect of a real
+    descriptor); the stub itself is **not** callable, so
+    ``_call_spandrel`` takes its ``model.model(x)`` fallback - the same
+    route the plain stubs of the pixel pins ride.  The default weights
+    device ``"meta"`` differs from the CPU tests' device, so a manager
+    wrap shows its moves in ``moves``.
+    """
+
+    scale = 2.0
+
+    def __init__(self, device: str = "meta") -> None:
+        self.calls: list[tuple] = []
+        self.moves: list[torch.device] = []
+        self.reported = torch.device(device)
+        self.model = _InnerDescriptorModel(self)
+
+    def to(self, device, *args, **kwargs):
+        device = torch.device(device)
+        self.moves.append(device)
+        self.reported = device
+        return self
+
+    def run(self, samples):
+        return F.interpolate(samples, scale_factor=self.scale, mode="nearest")
+
+
+class _OomOnceDescriptorStub(_DescriptorStub):
+    """The OOM script of the tile-shrink pin: the first model call OOMs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ooms = 0
+
+    def run(self, samples):
+        if not self.ooms:
+            self.ooms += 1
+            raise torch.cuda.OutOfMemoryError("the scripted first tile")
+        return F.interpolate(samples, scale_factor=self.scale, mode="nearest")
+
+
+class _AlwaysOomDescriptorStub(_DescriptorStub):
+    """The OOM script of the re-raise pin: every model call OOMs."""
+
+    def run(self, samples):
+        raise torch.cuda.OutOfMemoryError("the scripted every-tile OOM")
+
+
+class _BrokenRestoreStub(_DescriptorStub):
+    """The restore script: the offload ``.to`` raises."""
+
+    def to(self, device, *args, **kwargs):
+        device = torch.device(device)
+        if device == torch.device("meta"):
+            raise RuntimeError("the scripted offload failure")
+        return super().to(device, *args, **kwargs)
+
+
+@pytest.mark.unit
+def test_the_spandrel_lifecycle_moves_once_and_restores_the_prior_device(gpu_paste):
+    """The re-entrant manager (keep-fix5-implement2, 2026-11-03): one move per stage.
+
+    The stage-level wrap moves the descriptor to the device **once**,
+    restores its **prior** device on exit, a nested manager sees the
+    weights already on the device and is a no-op (the inner manager of
+    ``_tiled_scale_and_resize_batch`` /
+    ``upscale_faces_batch_gpu`` under the stage wrap), and a model already
+    on the device is never touched.  ``"meta"`` stands in for the offload
+    device the production weights start on.
+    """
+    device = torch.device("cpu")
+    model = _DescriptorStub("meta")
+    with gpu_paste._spandrel_on_device(device, model):
+        assert model.moves == [torch.device("cpu")], model.moves
+        # the nested manager (the per-helper wrap): no second move
+        with gpu_paste._spandrel_on_device(device, model):
+            assert model.moves == [torch.device("cpu")], model.moves
+        assert model.moves == [torch.device("cpu")], model.moves
+    # the exit restored the PRIOR device (the offload device), once
+    assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
+
+    already_there = _DescriptorStub("cpu")
+    with gpu_paste._spandrel_on_device(device, already_there):
+        assert already_there.moves == [], already_there.moves
+    assert already_there.moves == [], already_there.moves
+
+
+@pytest.mark.unit
+def test_the_spandrel_lifecycle_filters_none_models(gpu_paste):
+    """The ``None`` models of an optional stage (no bg model, no face model)
+    are filtered before the device probe - a ``None`` never reaches
+    ``getattr(m, 'model', m)`` and the present model still moves."""
+    model = _DescriptorStub("meta")
+    with gpu_paste._spandrel_on_device(torch.device("cpu"), None, model, None):
+        assert model.moves == [torch.device("cpu")], model.moves
+    assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
+
+
+@pytest.mark.unit
+def test_the_spandrel_lifecycle_swallows_a_restore_failure(gpu_paste):
+    """A failed offload must not mask the body's exception (the plan's
+    ``except Exception: pass``) - the body's ``RuntimeError`` propagates,
+    the restore's ``RuntimeError`` is swallowed."""
+    model = _BrokenRestoreStub("meta")
+    with pytest.raises(RuntimeError, match="the scripted body failure"):
+        with gpu_paste._spandrel_on_device(torch.device("cpu"), model):
+            assert model.moves == [torch.device("cpu")], model.moves
+            raise RuntimeError("the scripted body failure")
+    # the restore ran (and failed) - the move is the only recorded one
+    assert model.moves == [torch.device("cpu")], model.moves
+
+
+@pytest.mark.unit
+def test_the_spandrel_lifecycle_keeps_the_body_exception_when_the_restore_holds(gpu_paste):
+    """The complement of the swallow pin: a clean restore still lets the
+    body's exception out of the ``with``."""
+    model = _DescriptorStub("meta")
+    with pytest.raises(RuntimeError, match="the scripted body failure"):
+        with gpu_paste._spandrel_on_device(torch.device("cpu"), model):
+            raise RuntimeError("the scripted body failure")
+    assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
+
+
+@pytest.mark.unit
+def test_call_spandrel_calls_the_descriptor_and_falls_back_to_the_raw_module(gpu_paste):
+    """``_call_spandrel`` (keep-fix5-implement2, 2026-11-03): a callable model
+    (a spandrel descriptor - its ``__call__`` applies the
+    ``size_requirements`` padding) is called directly; a non-callable
+    ``.model`` wrapper (the plain stubs) keeps the raw ``model.model(x)``
+    route - the fallback the existing pixel pins ride unchanged."""
+    class _CallableDescriptor:
+        def __call__(self, samples):
+            return samples + 1.0
+
+    class _RawModuleWrapper:
+        def model(self, samples):
+            return samples * 2.0
+
+    sample = torch.zeros(1, 3, 4, 4)
+    assert torch.equal(
+        gpu_paste._call_spandrel(_CallableDescriptor(), sample), sample + 1.0
+    )
+    assert torch.equal(
+        gpu_paste._call_spandrel(_RawModuleWrapper(), sample), sample * 2.0
+    )
+
+
+@pytest.mark.unit
+def test_the_fp16_gate_follows_supports_half_and_the_device(gpu_paste):
+    """``_spandrel_supports_fp16`` (keep-fix5-implement2, 2026-11-03):
+    ``False`` on a non-CUDA device whatever the flag says (the CPU path
+    runs FP32), the descriptor's ``supports_half`` on CUDA, and the
+    duck-typed ``getattr`` default ``True`` for a descriptor without the
+    flag."""
+    assert gpu_paste._spandrel_supports_fp16(object(), torch.device("cpu")) is False
+    assert (
+        gpu_paste._spandrel_supports_fp16(
+            types.SimpleNamespace(supports_half=False), torch.device("cpu")
+        )
+        is False
+    )
+    assert (
+        gpu_paste._spandrel_supports_fp16(
+            types.SimpleNamespace(supports_half=True), torch.device("cuda:0")
+        )
+        is True
+    )
+    assert (
+        gpu_paste._spandrel_supports_fp16(
+            types.SimpleNamespace(supports_half=False), torch.device("cuda:0")
+        )
+        is False
+    )
+    # a descriptor without the flag: the duck-typed default is True
+    assert gpu_paste._spandrel_supports_fp16(object(), torch.device("cuda:0")) is True
+
+
+@pytest.mark.unit
+def test_the_tile_shrink_survives_one_oom_and_stays_sticky_across_frames(
+    gpu_paste, monkeypatch
+):
+    """The OOM-resilient tile shrink (keep-fix5-implement2, 2026-11-03).
+
+    A descriptor whose first model call raises
+    ``torch.cuda.OutOfMemoryError``: the 512 tile halves to 256 and the
+    frame completes; the next frame **starts at 256** (the tile geometry
+    is sticky across frames - a card that OOMed at 512 does not retry
+    512); the shrink couples the overlap to the tile
+    (``min(overlap, tile_size // 4)``).  The recorded
+    ``(tile_x, overlap)`` script is the pin.
+    """
+    seen: list[tuple[int, int]] = []
+
+    def recording_tiled_scale(sample, function, tile_x=512, tile_y=512, overlap=64, **kwargs):
+        seen.append((int(tile_x), int(overlap)))
+        return function(sample)
+
+    monkeypatch.setattr("comfy.utils.tiled_scale", recording_tiled_scale)
+
+    frames = smooth_frames_u8(2, (64, 96), seed=61)
+    model = _OomOnceDescriptorStub()
+
+    out = gpu_paste._tiled_scale_and_resize_batch(
+        model, frames, (128, 192), torch.device("cpu"), False
+    )
+
+    assert out.shape == (2, 128, 192, 3), out.shape
+    # frame 0: 512 OOMs -> 256 completes; frame 1: sticky 256, no retry at 512
+    assert seen == [(512, 64), (256, 64), (256, 64)], seen
+    assert model.ooms == 1, model.ooms
+    # the re-entrant manager moved the descriptor (weights started on
+    # 'meta') and restored it - the standalone lifecycle of the full mode
+    assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
+    # three model calls: the failed 512 attempt + one completed call per frame
+    assert len(model.calls) == 3, model.calls
+
+
+@pytest.mark.unit
+def test_the_tile_shrink_re_raises_below_the_128_floor(gpu_paste, monkeypatch):
+    """A tile that OOMs at every size re-raises the
+    ``torch.cuda.OutOfMemoryError`` once the halving passes the 128 floor
+    - the pipeline fails loudly instead of shrinking forever (the
+    ``(tile_x, overlap)`` script also pins the 128 stop: the last tried
+    tile is 128 with ``min(64, 128 // 4) = 32`` overlap)."""
+    seen: list[tuple[int, int]] = []
+
+    def recording_tiled_scale(sample, function, tile_x=512, tile_y=512, overlap=64, **kwargs):
+        seen.append((int(tile_x), int(overlap)))
+        return function(sample)
+
+    monkeypatch.setattr("comfy.utils.tiled_scale", recording_tiled_scale)
+
+    frames = smooth_frames_u8(1, (64, 96), seed=62)
+    model = _AlwaysOomDescriptorStub()
+
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        gpu_paste._tiled_scale_and_resize_batch(
+            model, frames, (128, 192), torch.device("cpu"), False
+        )
+    assert seen == [(512, 64), (256, 64), (128, 32)], seen
+    # the failed frame still restored the descriptor
+    assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
+
+
+@pytest.mark.unit
+def test_the_paste_wrap_moves_the_face_upscaler_to_the_device_and_back(
+    gpu_paste, gpu_ops, face_helper
+):
+    """The stage-level wrap of ``paste_faces_batch`` (keep-fix5-implement2,
+    2026-11-03): a host-output paste with a face upscaler whose weights
+    start on the offload device ('meta' here) records the ``.to`` move to
+    the compute device and the restore back - one move per paste, not per
+    face - and the upscaled ROI paste still runs (the model saw the
+    512 face)."""
+    frames = smooth_frames_u8(1, (360, 640), seed=63)
+    landmarks = synthetic_landmarks(1, (360, 640), seed=64)
+    rng = np.random.default_rng(65)
+    faces = rng.integers(0, 256, size=(1, 512, 512, 3), dtype=np.uint8)
+    parse_net = _StubParseNet(seed=66)
+    affines = gpu_ops.estimate_affines(landmarks, face_helper.face_template)
+    inverses = gpu_ops.inverse_affines(affines, upscale_factor=1.0)
+    model = _DescriptorStub("meta")
+
+    pasted = gpu_paste.paste_faces_batch(
+        faces_bgr=faces,
+        inverse_affines=inverses,
+        background_bgr=frames,
+        device=torch.device("cpu"),
+        parse_net=parse_net,
+        face_upscale_model=model,
+    )
+
+    assert len(pasted) == 1
+    # the stage wrap: one move to the device, one restore to the prior
+    # device - the inner manager of ``upscale_faces_batch_gpu`` saw the
+    # weights already on it and moved nothing
+    assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
+    # the face upscaler ran on the 512 face (the ROI warp sampled the x2)
+    assert model.calls == [(1, 3, 512, 512)], model.calls
