@@ -50,16 +50,31 @@ FALLBACK_HANDLER_NAME = "keep-fallback"
 
 
 def comfyui_is_present() -> bool:
-    """Is a real ComfyUI in charge of the console?
+    """Is a real ComfyUI **server** in charge of the console?
 
-    ``True`` when ComfyUI's own logging module is importable (``app.logger`` -
-    the module ``main.py`` uses to configure the root logger) or when the
-    ``comfy`` module of ``sys.modules`` is a **real** one (a file on disk).
+    Three probes, in decreasing order of directness:
+
+    * the **server check** - the running ComfyUI imports its own logging
+      module at startup (``main.py`` does ``from app.logger import
+      setup_logger`` before the custom nodes load), so ``app.logger`` sits in
+      ``sys.modules`` of every server process.  This probe reads process
+      state, not import machinery, so it cannot be defeated by an
+      ``app``-shadowing module or an exotic launcher ``sys.path`` - the
+      owner-reported plain-console stage lines (2026-11-03) mean the import
+      probes missed a real server.  A ``None`` entry (the tests' way to
+      simulate a failed import) counts as absent.
+    * the **import probe** - ``app.logger`` is importable (a ComfyUI tree is
+      on ``sys.path``, but the server has not run - the standalone paths).
+    * the **comfy check** - the ``comfy`` module of ``sys.modules`` is a real
+      one (a file on disk).
 
     The test harness mocks ``comfy`` with a bare ``types.ModuleType`` (no
-    ``__file__``); such a mock is correctly reported as **absent** - the pack
-    falls back to its own handler there.
+    ``__file__``) and never imports ``app.logger``, so it is correctly
+    reported as **absent** - the pack falls back to its own handler there.
     """
+    if sys.modules.get("app.logger") is not None:
+        return True
+
     try:
         import app.logger  # noqa: F401 - the import itself is the probe
     except Exception:  # noqa: BLE001 - any import problem means "no ComfyUI"
