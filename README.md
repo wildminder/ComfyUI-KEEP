@@ -183,12 +183,6 @@ Restart ComfyUI. The weights are downloaded automatically on the first run — n
 | Workflow | What it shows |
 |:---|:---|
 | [`example_workflows/keep-workflow.json`](example_workflows/keep-workflow.json) | The shipped example: a single image (with two upscalers) **and** a video sequence. |
-| [`example_workflows/keep-sequence-workflow.json`](example_workflows/keep-sequence-workflow.json) | The sequence node alone: a batch of frames in, PNG previews out. |
-
-<div align="center">
-<img alt="Graph diagram of the sequence example workflow" width="70%" src="./example_workflows/keep-sequence-workflow.png" />
-<p><sub><i>The sequence example: a graph diagram <b>rendered from the workflow json</b> — not a ComfyUI screenshot.</i></sub></p>
-</div>
 
 > [!IMPORTANT]
 > **The shipped example needs the [VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) pack.** It uses the node types `VHS_LoadVideo` (reads the video) and `VHS_VideoCombine` (writes the restored video). VideoHelperSuite is an **optional dependency of the example only** — the pack itself does not import it, and the two other example nodes (and every node of this pack) work without it.

@@ -113,14 +113,11 @@ def pack_schemas() -> dict:
 
 
 @pytest.mark.unit
-def test_the_examples_directory_holds_the_two_workflows():
-    """The canonical examples directory holds both example workflows."""
+def test_the_examples_directory_holds_the_shipped_workflow():
+    """The canonical examples directory holds the shipped example workflow."""
     names = {path.name for path in _workflow_files()}
     assert "keep-workflow.json" in names, (
         "the shipped example workflow must stay in example_workflows/"
-    )
-    assert "keep-sequence-workflow.json" in names, (
-        "P6.1 adds the sequence example next to the shipped one"
     )
 
 
@@ -348,25 +345,4 @@ def test_the_shipped_example_uses_the_v3_ids_and_the_vhs_nodes():
     assert VHS_NODE_WHITELIST <= types, (
         "the shipped example is a video workflow - it needs the VideoHelperSuite "
         f"nodes {sorted(VHS_NODE_WHITELIST)}"
-    )
-
-
-@pytest.mark.unit
-def test_the_sequence_example_uses_the_sequence_node_and_png_previews():
-    """The sequence example runs the sequence node and writes PNG previews."""
-    data = _load(EXAMPLES_DIR / "keep-sequence-workflow.json")
-    types = {node.get("type") for node in data["nodes"]}
-    assert "KEEP_ProcessImageSequence" in types, (
-        "the sequence example must use the KEEP_ProcessImageSequence node"
-    )
-    assert "KEEP_ModelLoader" in types, (
-        "the sequence example must load the model with the KEEP_ModelLoader node"
-    )
-    # SaveImage writes PNG files (the core node has no other format), the
-    # PreviewImage shows the frames in the UI.
-    assert "SaveImage" in types, (
-        "the sequence example must save the restored frames as PNG previews"
-    )
-    assert "PreviewImage" in types, (
-        "the sequence example must preview the restored frames"
     )

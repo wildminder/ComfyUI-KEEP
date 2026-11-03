@@ -1,13 +1,10 @@
-"""Render a preview image of a ComfyUI workflow json (P6.1).
+"""Render a preview image of a ComfyUI workflow json.
 
-The shipped example workflows carry a preview image next to the workflow
-(``keep-workflow.json`` -> ``keep-workflow.png``).  The **sequence** example
-of P6.1 has no ComfyUI screenshot - it was written by hand - so its preview is
-*rendered* from the workflow graph itself by this script:
+This script *renders* a preview from the workflow graph itself:
 
     python tools/render_workflow_preview.py \\
-        example_workflows/keep-sequence-workflow.json \\
-        example_workflows/keep-sequence-workflow.png
+        example_workflows/keep-workflow.json \\
+        preview.png
 
 The rendered image is a **diagram of the graph** (nodes, titles, widget values
 and the links between them) - not a screenshot of the ComfyUI frontend, and it
