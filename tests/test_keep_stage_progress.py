@@ -1,6 +1,6 @@
 """The stage progress bars of the sequence path (the stage-bar design).
 
-The helper pins (P1-P11, P16) inject the clock and the stream - no
+The helper pins (P1-P11, P16) inject the clock and the logger double - no
 wall-clock value appears in an assertion.  The processor pins (P12-P14)
 monkeypatch ``keep_processor.StageBar`` with a recording double and drive
 the two sequence paths with the CPU-only stub packs the neighboring files
@@ -66,40 +66,6 @@ class _Clock:
         return self._index
 
 
-class _TtyStream:
-    """A minimal TTY stream: it records its writes and claims isatty."""
-
-    def __init__(self) -> None:
-        self.chunks: list[str] = []
-
-    def write(self, text):
-        self.chunks.append(text)
-        return len(text)
-
-    def flush(self) -> None:
-        pass
-
-    def isatty(self) -> bool:
-        return True
-
-
-class _NonTtyStream:
-    """A minimal non-TTY stream (a pipe, a log file, pytest's capture)."""
-
-    def __init__(self) -> None:
-        self.chunks: list[str] = []
-
-    def write(self, text):
-        self.chunks.append(text)
-        return len(text)
-
-    def flush(self) -> None:
-        pass
-
-    def isatty(self) -> bool:
-        return False
-
-
 class _LoggerRecorder:
     """The module-logger double: it records the ``info`` payloads."""
 
@@ -151,112 +117,118 @@ def make_helper(helper_module, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# P1 - the exact line format (CR mode, injected clock)
+# P1 - the exact line format (the logger, the injected clock)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_bar_line_format_is_pinned(stage_progress_module):
-    """P1 - the rendered bytes are exactly the design's example line.
+def test_the_bar_line_format_is_pinned(stage_progress_module, monkeypatch):
+    """P1 - the logged line is exactly the design's example line.
 
     25 of 100 frames after 10.0 s: floor percent 25, rate ``25/10`` =
-    2.5 fps, ETA ``75/2.5`` = 30 s, elapsed 10 s.  CR mode prefixes the
-    ``\\r`` and the ``[KEEP] `` tag of the pack.
+    2.5 fps, ETA ``75/2.5`` = 30 s, elapsed 10 s.  The render is **one
+    log record** - the tag filter of the pack logger adds the ``[KEEP]``
+    tag, the root logger of ComfyUI renders the line like its own.
     """
     StageBar = stage_progress_module.StageBar
-    stream = _TtyStream()
-    clock = _Clock(0.0, 10.0)
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
-    bar = StageBar("Detecting face landmarks", 100, clock=clock, stream=stream)
+    bar = StageBar("Detecting face landmarks", 100, clock=_Clock(0.0, 10.0))
     bar.tick(25)
 
-    assert stream.chunks == [
-        "\r[KEEP] Detecting face landmarks 25/100 (25%) 2.5 fps ETA 00:30 elapsed 00:10",
-    ], stream.chunks
+    assert recorder.lines == [
+        "Detecting face landmarks 25/100 (25%) 2.5 fps ETA 00:30 elapsed 00:10",
+    ], recorder.lines
 
 
 # ---------------------------------------------------------------------------
 # P2 - the percent floor
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_percent_floors_never_reach_100_early(stage_progress_module):
+def test_the_percent_floors_never_reach_100_early(stage_progress_module, monkeypatch):
     """P2 - ``1/3`` renders ``33%``; nothing before ``done == total`` shows 100%."""
     StageBar = stage_progress_module.StageBar
-    stream = _TtyStream()
-    clock = _Clock(0.0, 3.0, 6.0)
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
-    bar = StageBar("Cropping and aligning faces", 3, clock=clock, stream=stream)
+    bar = StageBar("Cropping and aligning faces", 3, clock=_Clock(0.0, 3.0, 6.0))
     bar.tick(1)
     bar.tick(1)
 
-    first, second = stream.chunks
+    first, second = recorder.lines
     assert " 1/3 (33%) " in first, first
     assert " 2/3 (66%) " in second, second
-    assert "(100%)" not in first and "(100%)" not in second, stream.chunks
+    assert "(100%)" not in first and "(100%)" not in second, recorder.lines
 
 
 # ---------------------------------------------------------------------------
 # P3 - the rate and the ETA arithmetic
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_rate_and_eta_arithmetic(stage_progress_module):
+def test_the_rate_and_eta_arithmetic(stage_progress_module, monkeypatch):
     """P3 - 10 frames in 4.0 s: 2.5 fps, ETA 00:12 for the remaining 30.
 
     ``done == 0`` renders ``--:--`` with ``0.0 fps``; ``done == total``
     renders ``ETA 00:00``.
     """
     StageBar = stage_progress_module.StageBar
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
-    stream = _TtyStream()
-    bar = StageBar("Restoring faces with KEEP", 40, clock=_Clock(0.0, 4.0), stream=stream)
+    bar = StageBar("Restoring faces with KEEP", 40, clock=_Clock(0.0, 4.0))
     bar.tick(10)
-    assert stream.chunks[-1] == (
-        "\r[KEEP] Restoring faces with KEEP 10/40 (25%) 2.5 fps ETA 00:12 elapsed 00:04"
-    ), stream.chunks
+    assert recorder.lines[-1] == (
+        "Restoring faces with KEEP 10/40 (25%) 2.5 fps ETA 00:12 elapsed 00:04"
+    ), recorder.lines
 
-    stream = _TtyStream()
-    bar = StageBar("Restoring faces with KEEP", 40, clock=_Clock(0.0, 4.0), stream=stream)
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
+    bar = StageBar("Restoring faces with KEEP", 40, clock=_Clock(0.0, 4.0))
     bar.finish()
-    assert stream.chunks[-1] == (
-        "\r[KEEP] Restoring faces with KEEP 0/40 (0%) 0.0 fps ETA --:-- elapsed 00:04\n"
-    ), stream.chunks
+    assert recorder.lines[-1] == (
+        "Restoring faces with KEEP 0/40 (0%) 0.0 fps ETA --:-- elapsed 00:04"
+    ), recorder.lines
 
-    stream = _TtyStream()
-    bar = StageBar("Restoring faces with KEEP", 10, clock=_Clock(0.0, 4.0), stream=stream)
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
+    bar = StageBar("Restoring faces with KEEP", 10, clock=_Clock(0.0, 4.0))
     bar.tick(10)
-    assert "ETA 00:00" in stream.chunks[-1], stream.chunks
+    assert "ETA 00:00" in recorder.lines[-1], recorder.lines
 
 
 # ---------------------------------------------------------------------------
 # P4 - the mm:ss rendering (floor, unbounded minutes)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_mmss_rendering_is_floor_with_unbounded_minutes(stage_progress_module):
+def test_the_mmss_rendering_is_floor_with_unbounded_minutes(stage_progress_module, monkeypatch):
     """P4 - 75 s -> ``01:15``; 3661 s -> ``61:01`` (minutes unbounded)."""
     StageBar = stage_progress_module.StageBar
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
     # the elapsed of 75 s: 1 of 10 frames (rate 1/75, ETA 675 s = 11:15)
-    stream = _TtyStream()
-    bar = StageBar("Restoring faces with KEEP", 10, clock=_Clock(0.0, 75.0), stream=stream)
+    bar = StageBar("Restoring faces with KEEP", 10, clock=_Clock(0.0, 75.0))
     bar.tick(1)
-    assert "elapsed 01:15" in stream.chunks[-1], stream.chunks
-    assert "ETA 11:15" in stream.chunks[-1], stream.chunks
+    assert "elapsed 01:15" in recorder.lines[-1], recorder.lines
+    assert "ETA 11:15" in recorder.lines[-1], recorder.lines
 
     # the ETA of 3661 s: 1 face of 3662 at rate 1.0 (the interval is
     # shortened so the tick at t = 1.0 renders)
-    stream = _TtyStream()
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
     bar = StageBar(
         "Restoring faces with KEEP", 3662, interval_s=0.5,
-        clock=_Clock(0.0, 1.0), stream=stream)
+        clock=_Clock(0.0, 1.0))
     bar.tick(1)
-    assert "ETA 61:01" in stream.chunks[-1], stream.chunks
-    assert "elapsed 00:01" in stream.chunks[-1], stream.chunks
+    assert "ETA 61:01" in recorder.lines[-1], recorder.lines
+    assert "elapsed 00:01" in recorder.lines[-1], recorder.lines
 
 
 # ---------------------------------------------------------------------------
 # P5 - the cadence gate
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_cadence_gate_bounds_the_renders(stage_progress_module):
-    """P5 - the time gate fires at ``interval_s`` and bounds the writes.
+def test_the_cadence_gate_bounds_the_renders(stage_progress_module, monkeypatch):
+    """P5 - the time gate fires at ``interval_s`` and bounds the renders.
 
     Ticks at t = 0.1 .. 1.9 render nothing; the tick at t = 2.1 renders
     exactly once; ticks every 0.01 s over 10 s render at most six times
@@ -264,107 +236,104 @@ def test_the_cadence_gate_bounds_the_renders(stage_progress_module):
     even when no cadence render fired.
     """
     StageBar = stage_progress_module.StageBar
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
     # ticks before the interval render nothing; the first tick past the
     # interval renders exactly once
-    stream = _TtyStream()
     times = [0.1 * k for k in range(1, 20)]  # 0.1 .. 1.9
     clock = _Clock(0.0, *times, 2.1)
-    bar = StageBar("Detecting face landmarks", 100, clock=clock, stream=stream)
+    bar = StageBar("Detecting face landmarks", 100, clock=clock)
     for _ in range(19):
         bar.tick(1)
-    assert stream.chunks == [], stream.chunks
+    assert recorder.lines == [], recorder.lines
     bar.tick(1)  # the tick at t = 2.1
-    assert len(stream.chunks) == 1, stream.chunks
+    assert len(recorder.lines) == 1, recorder.lines
 
     # the bound holds regardless of the tick rate: 0.01 s steps over 10 s
-    stream = _TtyStream()
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
     clock = _Clock(0.0, *[0.01 * k for k in range(1, 1001)])  # 0.01 .. 10.00
-    bar = StageBar("Detecting face landmarks", 100000, clock=clock, stream=stream)
+    bar = StageBar("Detecting face landmarks", 100000, clock=clock)
     for _ in range(1000):
         bar.tick(1)
-    assert len(stream.chunks) <= 6, len(stream.chunks)
+    assert len(recorder.lines) <= 6, len(recorder.lines)
 
     # finish renders even when no cadence render fired
-    stream = _TtyStream()
-    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 1.0), stream=stream)
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
+    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 1.0))
     bar.tick(1)  # at t = 1.0 - below the interval
-    assert stream.chunks == [], stream.chunks
+    assert recorder.lines == [], recorder.lines
     bar.finish()  # at t = 1.0 (the clock repeats its last value)
-    assert len(stream.chunks) == 1, stream.chunks
+    assert len(recorder.lines) == 1, recorder.lines
 
 
 # ---------------------------------------------------------------------------
-# P6 - the final line (N/N (100%), ETA 00:00, newline, idempotent)
+# P6 - the final line (N/N (100%), ETA 00:00, idempotent)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_final_line_is_exact_and_finish_is_idempotent(stage_progress_module):
+def test_the_final_line_is_exact_and_finish_is_idempotent(stage_progress_module, monkeypatch):
     """P6 - the final render shows ``N/N (100%)`` with ``ETA 00:00``.
 
-    ``finish()`` renders even when no cadence render fired, appends the
-    newline in CR mode, is idempotent (the second call renders nothing)
-    and a ``tick()`` after ``finish()`` is a no-op.
+    ``finish()`` renders even when no cadence render fired, is idempotent
+    (the second call renders nothing) and a ``tick()`` after ``finish()``
+    is a no-op.
     """
     StageBar = stage_progress_module.StageBar
-    stream = _TtyStream()
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
     clock = _Clock(0.0, 1.0, 2.0)
 
-    bar = StageBar("Pasting faces and finalizing frames", 5, clock=clock, stream=stream)
+    bar = StageBar("Pasting faces and finalizing frames", 5, clock=clock)
     bar.tick(5)  # at t = 1.0 - below the interval, no cadence render
-    assert stream.chunks == [], stream.chunks
+    assert recorder.lines == [], recorder.lines
     bar.finish()  # at t = 2.0 - the final render
 
     final_line = (
-        "\r[KEEP] Pasting faces and finalizing frames 5/5 (100%) 2.5 fps ETA 00:00 elapsed 00:02\n"
+        "Pasting faces and finalizing frames 5/5 (100%) 2.5 fps ETA 00:00 elapsed 00:02"
     )
-    assert stream.chunks == [final_line], stream.chunks
+    assert recorder.lines == [final_line], recorder.lines
 
     bar.finish()  # idempotent
     bar.tick(1)  # a no-op after finish
-    assert stream.chunks == [final_line], stream.chunks
+    assert recorder.lines == [final_line], recorder.lines
 
 
 # ---------------------------------------------------------------------------
-# P7 - silence when not attached to a console (logger mode vs CR mode)
+# P7 - the console hygiene (the logger owns every byte of the bar)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_a_non_tty_stream_receives_nothing_and_the_logger_the_lines(
-    stage_progress_module, monkeypatch
-):
-    """P7a - logger mode: the stream gets zero bytes, the logger the lines."""
+def test_the_bar_writes_no_console_byte(stage_progress_module, monkeypatch):
+    """P7a - the rendered line carries no carriage return and no newline.
+
+    The console mode of the earlier design repainted the line in place
+    (``"\\r" + line``) on ``sys.__stdout__`` - the bytes never reached the
+    logger of the host.  The line is now a plain log record: the host
+    terminates it, the pack does not.
+    """
     StageBar = stage_progress_module.StageBar
     recorder = _LoggerRecorder()
     monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
-    stream = _NonTtyStream()
-    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 2.5, 3.0), stream=stream)
-    bar.tick(1)  # the cadence render at t = 2.5
-    bar.finish()  # the final render at t = 3.0
-
-    assert stream.chunks == [], stream.chunks
-    assert recorder.lines == [
-        "Detecting face landmarks 1/10 (10%) 0.4 fps ETA 00:22 elapsed 00:02",
-        "Detecting face landmarks 1/10 (10%) 0.3 fps ETA 00:27 elapsed 00:03",
-    ], recorder.lines
-
-
-@pytest.mark.unit
-def test_a_tty_stream_receives_the_renders_and_the_logger_nothing(
-    stage_progress_module, monkeypatch
-):
-    """P7b - CR mode: the stream gets the ``\\r`` renders, the logger nothing."""
-    StageBar = stage_progress_module.StageBar
-    recorder = _LoggerRecorder()
-    monkeypatch.setattr(stage_progress_module, "logger", recorder)
-
-    stream = _TtyStream()
-    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 2.5), stream=stream)
+    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 2.5, 3.0))
     bar.tick(1)
+    bar.finish()
 
-    assert stream.chunks == [
-        "\r[KEEP] Detecting face landmarks 1/10 (10%) 0.4 fps ETA 00:22 elapsed 00:02",
-    ], stream.chunks
-    assert recorder.lines == [], recorder.lines
+    assert recorder.lines, "the bar rendered nothing"
+    for line in recorder.lines:
+        assert "\r" not in line, repr(line)
+        assert "\n" not in line, repr(line)
+        assert "[KEEP]" not in line, "the tag belongs to the logger's filter"
+
+
+@pytest.mark.unit
+def test_the_bar_has_no_stream_parameter(stage_progress_module):
+    """P7b - the bar takes no stream: it has no console to write to."""
+    StageBar = stage_progress_module.StageBar
+
+    with pytest.raises(TypeError):
+        StageBar("Detecting face landmarks", 10, stream=object())
 
 
 # ---------------------------------------------------------------------------
@@ -372,18 +341,16 @@ def test_a_tty_stream_receives_the_renders_and_the_logger_nothing(
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
 def test_a_zero_total_bar_is_inert(stage_progress_module, monkeypatch):
-    """P8 - a bar over zero work never renders on either channel."""
+    """P8 - a bar over zero work never renders."""
     StageBar = stage_progress_module.StageBar
     recorder = _LoggerRecorder()
     monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
-    stream = _TtyStream()
-    bar = StageBar("Cropping and aligning faces", 0, clock=_Clock(0.0, 1.0, 2.0), stream=stream)
+    bar = StageBar("Cropping and aligning faces", 0, clock=_Clock(0.0, 1.0, 2.0))
     bar.tick(1)
     bar.tick(5)
     bar.finish()
 
-    assert stream.chunks == [], stream.chunks
     assert recorder.lines == [], recorder.lines
 
 
@@ -391,87 +358,86 @@ def test_a_zero_total_bar_is_inert(stage_progress_module, monkeypatch):
 # P9 - the faces unit
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_faces_unit_renders_faces_per_second(stage_progress_module):
+def test_the_faces_unit_renders_faces_per_second(stage_progress_module, monkeypatch):
     """P9 - ``unit="faces"`` renders ``N.N faces/s``; an unknown unit fails."""
     StageBar = stage_progress_module.StageBar
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
 
     # 40 of 96 faces after 4.8 s: rate 8.3 faces/s, ETA 00:06 (the
     # design's faces example)
-    stream = _TtyStream()
     bar = StageBar(
         "Restoring faces with KEEP", 96, unit="faces",
-        clock=_Clock(0.0, 4.8), stream=stream)
+        clock=_Clock(0.0, 4.8))
     bar.tick(40)
-    assert stream.chunks[-1] == (
-        "\r[KEEP] Restoring faces with KEEP 40/96 (41%) 8.3 faces/s ETA 00:06 elapsed 00:04"
-    ), stream.chunks
+    assert recorder.lines[-1] == (
+        "Restoring faces with KEEP 40/96 (41%) 8.3 faces/s ETA 00:06 elapsed 00:04"
+    ), recorder.lines
 
     with pytest.raises(ValueError):
         StageBar("Restoring faces with KEEP", 10, unit="bogus")
 
 
 # ---------------------------------------------------------------------------
-# P10 - the default-stream resolution (stream=None -> sys.__stdout__)
+# P10 - the module never touches a console stream
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_the_default_stream_resolution_follows_sys_stdout(
-    stage_progress_module, monkeypatch
-):
-    """P10 - ``stream=None`` resolves ``sys.__stdout__`` (the TTY probe)."""
-    StageBar = stage_progress_module.StageBar
+def test_the_module_never_references_a_console_stream():
+    """P10 - the source of the bar mentions no console stream at all.
 
-    # a fake TTY on ``sys.__stdout__`` -> carriage-return mode
-    tty = _TtyStream()
-    monkeypatch.setattr(sys, "__stdout__", tty)
-    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 2.5))
-    bar.tick(1)
-    assert tty.chunks == [
-        "\r[KEEP] Detecting face landmarks 1/10 (10%) 0.4 fps ETA 00:22 elapsed 00:02",
-    ], tty.chunks
+    The static pin: the module must not import ``sys`` and must not name
+    ``stdout`` / ``stderr`` - every byte of the bar leaves through the
+    logger.
+    """
+    source = (SRC_DIR / "keep_stage_progress.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
 
-    # a ``None`` ``sys.__stdout__`` (the windowed interpreter) -> logger mode
-    recorder = _LoggerRecorder()
-    monkeypatch.setattr(stage_progress_module, "logger", recorder)
-    monkeypatch.setattr(sys, "__stdout__", None)
-    bar = StageBar("Detecting face landmarks", 10, clock=_Clock(0.0, 2.5))
-    bar.tick(1)
-    assert recorder.lines == [
-        "Detecting face landmarks 1/10 (10%) 0.4 fps ETA 00:22 elapsed 00:02",
-    ], recorder.lines
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                continue
+            imported.add(node.module.split(".")[0] if node.module else "")
+
+    assert "sys" not in imported, imported
+
+    named = [
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr in {"stdout", "stderr", "__stdout__", "__stderr__"}
+    ]
+    assert named == [], named
 
 
 # ---------------------------------------------------------------------------
-# P11 - the CR residue erasure
+# P11 - the render carries no residue of the console mode
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-def test_a_shorter_render_erases_the_previous_one(stage_progress_module):
-    """P11 - a shorter render is padded so no residue byte survives.
+def test_the_render_carries_no_console_residue(stage_progress_module, monkeypatch):
+    """P11 - a fast early render and a slower final render stay clean lines.
 
-    A fast early render carries a long rate field (``428571.4 fps``); the
-    final render is slower and shorter (``9000.0 fps``) - the padding
-    erases the two surplus bytes of the previous line.
+    The console mode padded the shorter render to the length of the
+    previous one so no residue byte survived on the terminal.  As log
+    records the lines need no padding - they are separate lines, each one
+    terminated by the host.
     """
     StageBar = stage_progress_module.StageBar
-    stream = _TtyStream()
+    recorder = _LoggerRecorder()
+    monkeypatch.setattr(stage_progress_module, "logger", recorder)
     clock = _Clock(0.0, 2.1, 2.2, 100.0)
 
-    bar = StageBar("Detecting face landmarks", 1000000, clock=clock, stream=stream)
+    bar = StageBar("Detecting face landmarks", 1000000, clock=clock)
     bar.tick(900000)  # the long cadence render at t = 2.1
     bar.tick(1)  # no render at t = 2.2 (below the interval)
     bar.finish()  # the shorter final render at t = 100.0
 
     line1 = "Detecting face landmarks 900000/1000000 (90%) 428571.4 fps ETA 00:00 elapsed 00:02"
     line2 = "Detecting face landmarks 900001/1000000 (90%) 9000.0 fps ETA 00:11 elapsed 01:40"
-    tagged1, tagged2 = f"[KEEP] {line1}", f"[KEEP] {line2}"
-    assert stream.chunks[0] == f"\r{tagged1}", stream.chunks
-    # the final render: the shorter line padded to the previous render's
-    # length, then the newline
-    last = stream.chunks[-1]
-    assert last.endswith("\n"), stream.chunks
-    body = last[:-1]
-    assert body.startswith(f"\r{tagged2}"), stream.chunks
-    assert len(body) == 1 + len(tagged1), stream.chunks
-    assert body[1:].rstrip() == tagged2, stream.chunks
+    assert recorder.lines[0] == line1, recorder.lines
+    assert recorder.lines[-1] == line2, recorder.lines
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +445,7 @@ def test_a_shorter_render_erases_the_previous_one(stage_progress_module):
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
 def test_the_module_imports_the_stdlib_and_the_pack_logger_only():
-    """P16 - the new module's imports are ``time``/``sys`` + the pack logger."""
+    """P16 - the module's imports are ``time`` + the pack logger."""
     tree = ast.parse(
         (SRC_DIR / "keep_stage_progress.py").read_text(encoding="utf-8"))
     roots = set()
@@ -490,7 +456,7 @@ def test_the_module_imports_the_stdlib_and_the_pack_logger_only():
             if node.module == "__future__":  # the annotations convention
                 continue
             roots.add(node.module.split(".")[0] if node.module else "")
-    assert roots == {"time", "sys", "keep_logger"}, roots
+    assert roots == {"time", "keep_logger"}, roots
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +654,7 @@ def test_the_single_face_stage_bars_count_the_stages(processor_module, monkeypat
         """The StageBar double: it records every call the processor makes."""
 
         def __init__(self, label, total, *, unit="frames",
-                     interval_s=None, clock=None, stream=None):
+                     interval_s=None, clock=None):
             self.label = label
             self.total = total
             self.unit = unit
@@ -783,7 +749,7 @@ def test_the_multiface_stage_bars_count_the_stages(
 
     class _RecordingStageBar:
         def __init__(self, label, total, *, unit="frames",
-                     interval_s=None, clock=None, stream=None):
+                     interval_s=None, clock=None):
             self.label = label
             self.total = total
             self.unit = unit
@@ -868,7 +834,7 @@ def test_the_all_nan_clip_finishes_the_detection_bar(processor_module, monkeypat
 
     class _RecordingStageBar:
         def __init__(self, label, total, *, unit="frames",
-                     interval_s=None, clock=None, stream=None):
+                     interval_s=None, clock=None):
             self.label = label
             self.total = total
             self.unit = unit
@@ -916,7 +882,7 @@ def test_the_zero_faces_clip_finishes_the_detection_bar(
 
     class _RecordingStageBar:
         def __init__(self, label, total, *, unit="frames",
-                     interval_s=None, clock=None, stream=None):
+                     interval_s=None, clock=None):
             self.label = label
             self.total = total
             self.unit = unit

@@ -1,53 +1,47 @@
-"""The console progress bar of the KEEP sequence stages.
+"""The progress lines of the KEEP sequence stages - through the logger.
 
 The four sequence stages log their start line (``Detecting face
 landmarks``, ``Cropping and aligning faces``, ``Restoring faces with
-KEEP``, ``Pasting faces and finalizing frames``) and then go silent until
-the next stage line.  This module is the second, **console-only** progress
-channel the stage-bar design adds:
+KEEP``, ``Pasting faces and finalizing frames``) and then report their
+progress on the **same** channel - the pack logger.
 
-* :class:`StageBar` - one bar per stage per run: the per-chunk counts of
-  the chunked loops accumulate into the stage total (one construction
-  before the loop, one ``finish`` after it, no per-chunk reset);
-* the bar never touches the V3 execution-API reporter
-  (:mod:`ComfyUI_KEEP.src.keep_progress`) - the UI progress keeps its exact
-  totals and update sequence.  The bar's ``tick`` calls are inserted
-  **beside** the reporter's ``update`` calls, never instead.
+The bar is **logger-only** (owner request, 2026-11-04): the pack never
+writes to the console itself.  The earlier carriage-return mode wrote
+``"\\r" + "[KEEP] " + line`` straight to ``sys.__stdout__`` - that bypassed
+the logger of the host, so the progress never reached the log file of
+ComfyUI, never reached the web UI and showed up in the terminal as a
+plain, untagged console line.  Every render is now one ``logger.info``
+record: the root logger of ComfyUI renders it exactly like the host's own
+lines, and the pack owns no console stream at all.
 
-The output channel is decided **once** at construction:
+:class:`StageBar` is one bar per stage per run: the per-chunk counts of
+the chunked loops accumulate into the stage total (one construction
+before the loop, one ``finish`` after it, no per-chunk reset).
 
-* **carriage-return mode** - a real console is attached (the resolved
-  stream claims ``isatty()``): every render rewrites the line in place -
-  ``"\\r" + line``, padded with trailing spaces to erase the previous
-  render's residue, then flushed; ``finish()`` writes the final render
-  plus ``"\\n"`` so the next log line starts below it.  No ANSI escape
-  codes (portable across the classic Windows console and Windows
-  Terminal).  The line carries the pack tag ``[KEEP]`` so the bar is
-  visually linked to the stage lines.  The writes go to
-  ``sys.__stdout__`` - neither the D4 console router nor ComfyUI's log
-  interceptor ever replaces ``__stdout__``, so a render never enters a
-  capture session's line buffer and the one-record-per-line contract of
-  the D4 capture is untouched.
-* **logger mode** - piped output, log file, CI, pytest: every render is
-  one complete line through ``logger.info`` on the pack logger (the tag
-  filter adds the tag).  The routed streams receive **zero bytes** from
-  the bar - no ``\\r`` garbage in pipes or log files.
+The bar never touches the V3 execution-API reporter
+(:mod:`ComfyUI_KEEP.src.keep_progress`) - the UI progress keeps its exact
+totals and update sequence.  The bar's ``tick`` calls are inserted
+**beside** the reporter's ``update`` calls, never instead.
 
-The bar is stdlib-only (``time`` and ``sys``): no new dependency, and the
-tqdm tripwire (``tests/test_keep_regressions.py``) stays green.  It holds
-no global state, registers nothing, and never touches ``keep_interrupt``
-or the VRAM releases; abandoning a bar without ``finish()`` (the
-exception paths) leaks nothing - the bar renders from ``tick``/``finish``
-only, so an exception leaves the stage silent, which is the intended
-behavior: a 100%-looking line after a failure would lie.
+The cadence is the design's time gate: a render fires only when
+``now - last_render >= interval_s``, so a fast stage renders every
+``interval_s`` (not per tick) and a slow stage at most once per tick.  One
+clock read per call.
+
+The bar is stdlib-only (``time``): no new dependency, and the tqdm
+tripwire (``tests/test_keep_regressions.py``) stays green.  It holds no
+global state, registers nothing, and never touches ``keep_interrupt`` or
+the VRAM releases; abandoning a bar without ``finish()`` (the exception
+paths) leaks nothing - the bar renders from ``tick``/``finish`` only, so
+an exception leaves the stage silent, which is the intended behavior: a
+100%-looking line after a failure would lie.
 """
 
 from __future__ import annotations
 
-import sys
 import time
 
-from .keep_logger import TAG, logger
+from .keep_logger import logger
 
 #: The rate label of each accepted unit ("frames" -> "fps",
 #: "faces" -> "faces/s").  Anything else fails the construction.
@@ -64,7 +58,7 @@ def _mmss(seconds: float) -> str:
 
 
 class StageBar:
-    """A per-stage console progress bar (the stage-bar design, D1).
+    """A per-stage progress line through the pack logger (the stage-bar design, D1).
 
     One bar counts **one** stage of one run: the processor constructs it
     right after the stage's log line and finishes it when the stage's work
@@ -81,8 +75,8 @@ class StageBar:
       and ``00:00`` once ``done >= total``; the ``mm:ss`` fields floor and
       keep unbounded minutes.
 
-    The tests inject the clock (``clock``) and the stream (``stream``) -
-    no wall-clock value reaches an assertion.
+    The tests inject the clock (``clock``) - no wall-clock value reaches
+    an assertion.
     """
 
     def __init__(
@@ -93,7 +87,6 @@ class StageBar:
         unit: str = "frames",
         interval_s: float = 2.0,
         clock=time.monotonic,
-        stream=None,
     ) -> None:
         if unit not in _UNIT_RATES:
             raise ValueError(
@@ -105,16 +98,10 @@ class StageBar:
         self._rate_unit = _UNIT_RATES[unit]
         self._interval_s = interval_s
         self._clock = clock
-        self._stream = stream if stream is not None else sys.__stdout__
-        isatty = getattr(self._stream, "isatty", None)
-        self._cr_mode = bool(
-            self._stream is not None and callable(isatty) and isatty()
-        )
         self._done = 0
         self._start = clock()
         self._last_render = self._start
         self._finished = False
-        self._last_len = 0
 
     def tick(self, n: int = 1) -> None:
         """Count ``n`` more processed units; render when the cadence allows.
@@ -137,34 +124,26 @@ class StageBar:
 
         The stage calls ``finish`` on its normal path only: when a stage
         raises (OOM, cancel), ``finish`` is never reached and no final
-        line is written - the exception is the report.  A bar over zero
+        line is logged - the exception is the report.  A bar over zero
         work stays silent (``total == 0`` is inert).
         """
         if self._finished or self.total <= 0:
             return
         self._finished = True
         now = self._clock()
-        self._render(now, final=True)
+        self._render(now)
 
     # -- the rendering -------------------------------------------------
-    def _render(self, now: float, *, final: bool = False) -> None:
+    def _render(self, now: float) -> None:
         """One render - the cadence render of :meth:`tick` or the final one.
 
-        Carriage-return mode writes ``"\\r"`` + the tagged line, padded to
-        the previous render's length so no residue survives, and flushes;
-        the final render appends the newline.  Logger mode emits one
-        complete line through the pack logger.
+        The render is **one log record** through the pack logger: the tag
+        filter of :mod:`keep_logger` adds the ``[KEEP]`` tag and the root
+        logger of ComfyUI renders the line like its own.  The pack writes
+        no byte to any console stream.
         """
         self._last_render = now
-        line = self._line(now)
-        if self._cr_mode:
-            tagged_line = f"{TAG} {line}"
-            terminator = "\n" if final else ""
-            self._stream.write(f"\r{tagged_line.ljust(self._last_len)}{terminator}")
-            self._stream.flush()
-            self._last_len = len(tagged_line)
-        else:
-            logger.info(line)
+        logger.info(self._line(now))
 
     def _line(self, now: float) -> str:
         """The rendered line - the exact format the design pins."""

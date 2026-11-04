@@ -485,6 +485,33 @@ def test_the_pack_does_not_print_to_the_console():
 
 
 @pytest.mark.unit
+def test_the_pack_never_touches_a_console_stream():
+    """No module of the pack runtime names a console stream.
+
+    A console write bypasses the logger of ComfyUI: it never reaches the
+    log file of the host, it never reaches the web UI and it shows up in
+    the terminal as a plain line.  The pack runtime therefore names no
+    console stream at all - the two exceptions are the router of the
+    vendored writes (``src/keep_console.py`` - it *replaces* the streams)
+    and the fallback handler of the no-ComfyUI mode
+    (``src/keep_logger.py``).
+    """
+    offenders = []
+    for path in PACK_SOURCES:
+        if path.name in {"keep_console.py", "keep_logger.py"}:
+            continue
+        for node in ast.walk(_tree(path)):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in {"stdout", "stderr", "__stdout__", "__stderr__"}
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+            ):
+                offenders.append((path.name, node.lineno))
+    assert offenders == [], offenders
+
+
+@pytest.mark.unit
 def test_the_pack_does_not_import_tqdm():
     """The progress bars of ``tqdm`` are gone from the pack.
 
