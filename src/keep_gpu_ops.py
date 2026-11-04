@@ -298,6 +298,13 @@ def crop_faces_batch(
 # tensor2img batch (design section 7.6)
 # ---------------------------------------------------------------------------
 
+#: The pixel budget of one tensor2img chunk: the float32 working copy of a
+#: group is twelve bytes per RGB pixel (3 channels * 4 bytes), so a chunk
+#: holds at most this many pixels of it.  The same pixel-bound convention as
+#: ``GRAY_CHUNK_PIXELS`` and ``COMFY_BATCH_CHUNK_PIXELS``.
+TENSOR2IMG_CHUNK_PIXELS = 4 << 20
+
+
 def tensor2img_u8_batch(tensor: torch.Tensor, min_max: tuple[float, float] = (-1, 1)) -> torch.Tensor:
     """The vendored ``tensor2img`` elementwise chain on an RGB stack, on device.
 
@@ -312,11 +319,23 @@ def tensor2img_u8_batch(tensor: torch.Tensor, min_max: tuple[float, float] = (-1
         raise ValueError(
             f"tensor2img_u8_batch expects (N, 3, H, W) RGB, got {tuple(tensor.shape)}"
         )
+    # round 16 (2026-11-04): the chain runs per group, not whole-batch - the
+    # former kept several whole-batch float32 copies alive; a group is bounded
+    # by the pixel budget, and the elementwise chain is bit-identical per
+    # group.  The operator order is frozen (clamp, rescale, *255,
+    # round-half-to-even, uint8 cast, RGB->BGR) by the equivalence pins below.
     low, high = min_max
-    t = tensor.detach().float().clamp(low, high)
-    t = (t - low) / (high - low)
-    t = (t * 255.0).round().to(torch.uint8)
-    return t.permute(0, 2, 3, 1)[..., [2, 1, 0]].contiguous()
+    num, height, width = int(tensor.shape[0]), int(tensor.shape[2]), int(tensor.shape[3])
+    pixels = max(1, height * width)
+    chunk = max(1, TENSOR2IMG_CHUNK_PIXELS // pixels)
+    out = torch.empty((num, 3, height, width), dtype=torch.uint8, device=tensor.device)
+    for start in range(0, num, chunk):
+        stop = min(start + chunk, num)
+        t = tensor[start:stop].detach().float().clamp(low, high)
+        t = (t - low) / (high - low)
+        t = (t * 255.0).round().to(torch.uint8)
+        out[start:stop] = t
+    return out.permute(0, 2, 3, 1)[..., [2, 1, 0]].contiguous()
 
 
 def tensor2img_batch(

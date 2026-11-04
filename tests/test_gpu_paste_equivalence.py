@@ -1526,6 +1526,58 @@ def test_is_gray_batch_agrees_with_the_vendored_is_gray(gpu_paste, misc_module):
     assert flags[len(color)]
 
 
+@pytest.mark.unit
+def test_the_device_gray_pass_never_uploads_more_than_one_group(
+    gpu_paste, monkeypatch
+):
+    """Round 16: the gray-flag pass uploads one pixel-budget group at a time.
+
+    The former implementation moved the whole (N, H, W, 3) stack to the
+    device (3.78 GB on the 777-frame clip) before the pixel-chunk loop in
+    ``_is_gray_diff_sums_device``.  With the pixel budget smaller than one
+    frame, the pass must split the batch; the values must still be the
+    numpy ones (the CPU device exercises the same float64 reduction on the
+    host, because ``is_gray_batch`` only routes CUDA devices to it).
+    """
+    rng = np.random.default_rng(63)
+    frames = np.concatenate(
+        [
+            rng.integers(0, 256, size=(4, 32, 48, 3), dtype=np.uint8),
+            np.repeat(
+                rng.integers(0, 256, size=(4, 32, 48, 1), dtype=np.uint8), 3, axis=3
+            ),
+        ]
+    )
+
+    device = torch.device("cpu")
+    sizes: list[tuple[int, ...]] = []
+
+    real_from_numpy = torch.from_numpy
+
+    def _recording_from_numpy(array):
+        result = real_from_numpy(array)
+        sizes.append(tuple(result.shape))
+        return result
+
+    monkeypatch.setattr(torch, "from_numpy", _recording_from_numpy)
+    monkeypatch.setattr(gpu_paste, "GRAY_CHUNK_PIXELS", 1024)  # < 1 frame
+    values = gpu_paste._is_gray_diff_sums_device(frames, device)
+
+    budget = 1024 // (32 * 48)
+    assert budget < 1
+    assert sizes, "the pass must upload through torch.from_numpy"
+    assert max(size[0] for size in sizes) == 1, sizes
+    assert max(size[0] for size in sizes) <= len(frames)
+
+    reference = np.array(
+        [
+            gpu_paste._is_gray_diff_sum_numpy(frames[i])
+            for i in range(len(frames))
+        ]
+    )
+    assert np.allclose(values, reference), (values, reference)
+
+
 # ---------------------------------------------------------------------------
 # The VRAM-aware chunk sizes (design section 7.7, step 3)
 # ---------------------------------------------------------------------------

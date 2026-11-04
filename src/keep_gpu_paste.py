@@ -712,16 +712,21 @@ def _is_gray_diff_sums_device(
     num_frames = int(frames.shape[0])
     if num_frames == 0:
         return np.zeros(0, dtype=np.float64)
-    host = np.ascontiguousarray(frames)
-    if not host.flags.writeable:
-        host = host.copy()
-    stack = torch.from_numpy(host).to(device)  # the (N, H, W, 3) uint8 frames
+    # round 16 (2026-11-04): only one group of frames lives on the device at a
+    # time - the upload below used to move the whole (N, H, W, 3) stack
+    # (3.78 GB on the 777-frame clip) although the pixel-chunk loop reads
+    # only ``chunk`` frames at a time.  The per-frame reduction order is
+    # unchanged, so the values are the same.
     pixels = max(1, int(frames.shape[1]) * int(frames.shape[2]))
     chunk = max(1, GRAY_CHUNK_PIXELS // pixels)
-    diff_sums = torch.empty(num_frames, dtype=torch.float64, device=device)
+    values = np.empty(num_frames, dtype=np.float64)
     for start in range(0, num_frames, chunk):
         stop = min(start + chunk, num_frames)
-        block = stack[start:stop].permute(0, 3, 1, 2)  # the (n, 3, H, W) uint8
+        host = np.ascontiguousarray(frames[start:stop])
+        if not host.flags.writeable:
+            host = host.copy()
+        stack = torch.from_numpy(host).to(device)  # the (n, H, W, 3) uint8 frames
+        block = stack.permute(0, 3, 1, 2)  # the (n, 3, H, W) uint8
         variances = []
         for first, second in ((0, 1), (1, 2), (2, 0)):
             difference = (
@@ -731,11 +736,9 @@ def _is_gray_diff_sums_device(
                 difference.to(torch.float64).var(dim=(1, 2), correction=0)
             )
             del difference
-        diff_sums[start:stop] = (
-            variances[0] + variances[1] + variances[2]
-        ) / 3.0
-    values = diff_sums.cpu().numpy()
-    del stack, diff_sums
+        sums = (variances[0] + variances[1] + variances[2]) / 3.0
+        values[start:stop] = sums.cpu().numpy()
+        del stack, block, variances, sums
     return values
 
 

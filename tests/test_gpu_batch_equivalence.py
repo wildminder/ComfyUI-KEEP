@@ -544,6 +544,39 @@ def test_tensor2img_u8_batch_stays_on_the_device_and_matches_the_numpy_form(gpu_
     assert torch.equal(u8, torch.from_numpy(as_numpy))
 
 
+@pytest.mark.unit
+def test_tensor2img_u8_batch_converts_in_pixel_budget_groups(gpu_ops, monkeypatch):
+    """Round 16: no group converts more than the pixel budget.
+
+    With the budget below the frame size, a three-frame stack must convert
+    in at least two groups; the preallocated uint8 output is the full batch
+    and the bytes are identical to the un-chunked chain.
+    """
+    tensor = torch.randn((3, 3, 16, 16), generator=torch.Generator().manual_seed(23)) * 1.5
+
+    real_empty = torch.empty
+    sizes: list[int] = []
+
+    def _recording_empty(*args, **kwargs):
+        result = real_empty(*args, **kwargs)
+        if isinstance(result, torch.Tensor) and result.dtype == torch.uint8:
+            sizes.append(int(result.numel()))
+        return result
+
+    monkeypatch.setattr(torch, "empty", _recording_empty)
+    monkeypatch.setattr(gpu_ops, "TENSOR2IMG_CHUNK_PIXELS", 8)  # far below a frame
+
+    u8 = gpu_ops.tensor2img_u8_batch(tensor, min_max=(-1, 1))
+
+    assert sizes == [3 * 3 * 16 * 16], "one full uint8 output is preallocated"
+    assert u8.shape == (3, 16, 16, 3) and u8.dtype == torch.uint8
+
+    monkeypatch.setattr(torch, "empty", real_empty)
+    monkeypatch.setattr(gpu_ops, "TENSOR2IMG_CHUNK_PIXELS", 1 << 62)
+    whole = gpu_ops.tensor2img_u8_batch(tensor, min_max=(-1, 1))
+    assert torch.equal(u8, whole)
+
+
 # ---------------------------------------------------------------------------
 # The parse postprocess (design section 7.7, step 4)
 # ---------------------------------------------------------------------------
