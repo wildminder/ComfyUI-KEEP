@@ -76,6 +76,13 @@ def resize_bgr_u8(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
 # The batch forms of the conversions (the GPU video pipeline redesign)
 # ---------------------------------------------------------------------------
 
+#: The pixel budget of one batch-conversion chunk: the ``* 255`` float32
+#: transient is four bytes per value (twelve per RGB pixel), so a chunk
+#: holds at most this many pixels of it.  The same pixel-bound convention
+#: as ``src/keep_gpu_paste.py``'s ``GRAY_CHUNK_PIXELS`` (``4 << 20``) so one
+#: canvas size means one bound everywhere.
+COMFY_BATCH_CHUNK_PIXELS = 4 << 20
+
 
 def comfy_batch_to_bgr_u8(comfy_batch: torch.Tensor) -> np.ndarray:
     """A ComfyUI IMAGE batch ``(N, H, W, C)`` -> ``(N, H, W, 3)`` uint8 BGR.
@@ -86,13 +93,25 @@ def comfy_batch_to_bgr_u8(comfy_batch: torch.Tensor) -> np.ndarray:
     where the per-frame loop of the sequence path made one transfer per
     frame.  The ops are the same elementwise math, so the output is bit-exact
     against the per-frame loop (pinned in ``tests/test_gpu_batch_equivalence.py``).
+
+    The ``* 255`` float32 transient is chunked over the frame axis against
+    :data:`COMFY_BATCH_CHUNK_PIXELS` so no whole-batch float32 exists; the
+    elementwise chain is identical per group, so the bytes are unchanged.
     """
     if comfy_batch.ndim != 4:
         raise ValueError(
             f"comfy_batch_to_bgr_u8 expects (N, H, W, C), got {tuple(comfy_batch.shape)}"
         )
-    u8 = (comfy_batch * 255).to(torch.uint8)
-    return u8[..., [2, 1, 0]].cpu().numpy()
+    num, height, width = comfy_batch.shape[:3]
+    num, height, width = int(num), int(height), int(width)
+    pixels = max(1, height * width)
+    chunk = max(1, COMFY_BATCH_CHUNK_PIXELS // pixels)
+    out = torch.empty((num, height, width, 3), dtype=torch.uint8, device=comfy_batch.device)
+    for start in range(0, num, chunk):
+        stop = min(start + chunk, num)
+        block = (comfy_batch[start:stop] * 255).to(torch.uint8)
+        out[start:stop] = block[..., [2, 1, 0]]
+    return out.cpu().numpy()
 
 
 def bgr_u8_batch_to_comfy(u8_batch: np.ndarray | torch.Tensor) -> torch.Tensor:

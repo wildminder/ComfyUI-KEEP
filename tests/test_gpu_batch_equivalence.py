@@ -139,6 +139,50 @@ def test_comfy_batch_to_bgr_u8_matches_the_former_numpy_implementation(image_uti
 
 
 @pytest.mark.unit
+def test_comfy_batch_to_bgr_u8_never_converts_more_than_the_chunk_budget(
+    image_utils, monkeypatch
+):
+    """Round 16: the float32 transient of the conversion is bounded by the chunk.
+
+    On the 1500x1080 clip the former converter held ``(input * 255)`` as a
+    whole-batch float32 (15.10 GB).  The conversion must run in groups of at
+    most ``COMFY_BATCH_CHUNK_PIXELS`` pixels and must not hold a whole-batch
+    ``* 255`` at all - the peak transient is one group of pixels.
+    """
+    tensor = torch.rand((777, 4, 6, 3), generator=torch.Generator().manual_seed(17))
+
+    real_empty = torch.empty
+    sizes: list[int] = []
+
+    def _recording_empty(*args, **kwargs):
+        result = real_empty(*args, **kwargs)
+        if isinstance(result, torch.Tensor) and result.dtype == torch.uint8:
+            sizes.append(int(result.numel()))
+        return result
+
+    monkeypatch.setattr(torch, "empty", _recording_empty)
+
+    batched = image_utils.comfy_batch_to_bgr_u8(tensor)
+
+    budget = image_utils.COMFY_BATCH_CHUNK_PIXELS
+    pixels = 4 * 6
+    assert budget // pixels > 1, "the budget must split the batch"
+    assert sizes == [777 * pixels * 3], (
+        "the converter preallocates one full uint8 output"
+    )
+    assert batched.shape == (777, 4, 6, 3) and batched.dtype == np.uint8
+    assert np.array_equal(
+        batched,
+        np.stack(
+            [
+                cv2.cvtColor((tensor[i].numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                for i in range(tensor.shape[0])
+            ]
+        ),
+    )
+
+
+@pytest.mark.unit
 def test_bgr_u8_batch_to_comfy_is_bit_exact_against_the_per_frame_loop(image_utils):
     """The batch conversion equals the per-frame ``cv2_to_comfy_image`` loop.
 
