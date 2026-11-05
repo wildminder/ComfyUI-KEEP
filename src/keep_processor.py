@@ -13,6 +13,7 @@ from collections.abc import Sequence
 
 from .keep_console import capture_console_to_logger
 from .keep_image_utils import (
+    BgrFrameSource,
     bgr_u8_batch_to_comfy,
     bgr_u8_batch_to_normalized,
     comfy_batch_to_bgr_u8,
@@ -159,6 +160,20 @@ def _gray_to_bgr(gray: np.ndarray) -> np.ndarray:
     return torch.stack((gray_t, gray_t, gray_t), dim=-1).numpy()
 
 
+def _core_background(background):
+    """The background the paste core consumes: a lazy source or a stack.
+
+    The chunked core (:func:`~.keep_gpu_paste.paste_faces_batch_chunked`)
+    takes a :class:`~.keep_image_utils.BgrFrameSource` (the round-17 lazy
+    path - the core converts the group's rows on demand) or a numpy stack
+    (the materialized path).  A provider of the numpy side is unwrapped
+    here - its array is already there, so nothing is copied.
+    """
+    if isinstance(background, BgrFrameSource):
+        return background
+    return background.materialize()
+
+
 class KEEPFaceProcessor:
     def __init__(self, model_pack):
         self.keep_net = model_pack.keep_net
@@ -256,8 +271,64 @@ class KEEPFaceProcessor:
             canvas[row, y0:y1, x0 : min(x0 + 2, w)] = color
             canvas[row, y0:y1, max(0, x1 - 2) : x1] = color
 
+    def _fallback_gray_groups(self,
+                              frame_source: BgrFrameSource,
+                              fallback_rows: list[int],
+                              gray_flags: np.ndarray,
+                              gray_device,
+                              group_size: int):
+        """The fallback rows' frames, in groups - with their gray flags.
+
+        Round 17 (the final stage's RAM): the fallback rows are converted
+        **once**, in groups of ``group_size`` rows, and the gray flags of a
+        group are computed **with** the group - the whole-clip uint8 stack
+        and the whole-clip gray pass are gone.  Only one group is alive at
+        a time.
+
+        The flags themselves do not move: ``is_gray_batch`` decides **per
+        frame**, so a group is the same set of decisions as the whole clip
+        (the device path's borderline band, ``GRAY_BORDERLINE_EPSILON``,
+        keeps the device and the numpy values in agreement).  The eligible
+        rows' flags are never computed - they were never read (the batched
+        rows do not use them), so they stay ``False``.
+
+        Args:
+            frame_source: the lazy source of the clip's frames.
+            fallback_rows: the rows the batched paste did not take - in
+                clip order.
+            gray_flags: the flag array of the clip - the group's flags are
+                written into it.
+            gray_device: the device of the gray pass - ``None`` keeps the
+                host (numpy) computation.
+            group_size: the rows per group (the processor's
+                ``max_clip_length``).
+
+        Yields:
+            ``(rows, frames)`` - the group's row numbers and their uint8
+            BGR frames ``(k, H, W, 3)``.  With no fallback row at all the
+            one **empty** group is yielded: the gray pass then runs on the
+            empty batch, so the processor's device contract holds in every
+            configuration.
+        """
+        size = max(1, int(group_size))
+        rows = [int(row) for row in fallback_rows]
+        if not rows:
+            # the defensive empty group: the gray pass runs once, on the
+            # empty batch (a pinned shape), so the processor's device
+            # contract holds even when every row is batched.  There is no
+            # row to write a flag for.
+            frames = frame_source.group([])
+            is_gray_batch(frames, device=gray_device)
+            yield [], frames
+            return
+        for start in range(0, len(rows), size):
+            group = rows[start:start + size]
+            frames = frame_source.group(group)
+            gray_flags[group] = is_gray_batch(frames, device=gray_device)
+            yield group, frames
+
     def _batched_paste(self,
-                       input_frames_bgr: np.ndarray,
+                       input_frames_bgr: np.ndarray | BgrFrameSource,
                        restored_faces: np.ndarray,
                        affine_matrices: list,
                        avg_landmarks_sequence,
@@ -290,6 +361,12 @@ class KEEPFaceProcessor:
         Every other frame keeps the vendored ``paste_faces_to_input_image``
         (design section 7.7, step 6): the face upsampler, the frames
         without a face and a face helper without a parse net.
+
+        The background arrives as a
+        :class:`~.keep_image_utils.BgrFrameSource` (the round-17 lazy path
+        - the eligible rows are a **view** of the clip and the core
+        converts the group's rows on demand) or as a numpy stack (the
+        direct-call path of the tests and the tools).
 
         Args:
             stage_bar: the optional paste-stage progress bar - forwarded
@@ -345,13 +422,19 @@ class KEEPFaceProcessor:
             faces_bgr = restored_faces
         else:
             faces_bgr = np.stack([restored_faces[i] for i in eligible])
-        if eligible == list(range(input_frames_bgr.shape[0])):
-            background_stacked = input_frames_bgr
-        else:
-            background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
+        # The background of the batch (round 17): the **provider** of the
+        # rows - the lazy source (the paste stage's path) or the numpy stack
+        # (the direct-call path of the tests and the tools).  The eligible
+        # rows are a **view** of the source: the gather copy of the
+        # eligible rows is gone, and the source converts the rows per group
+        # inside the core.  The numpy path keeps its gather (the array is
+        # already materialized there).
+        background_provider = paste_mod.frame_provider(input_frames_bgr)
+        if eligible != list(range(int(background_provider.shape[0]))):
+            background_provider = background_provider.select(eligible)
 
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
-            background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
+            background_provider.shape[1:3], final_upscale_factor, canvas_hw)
         mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
         # keep-fix5 (2026-11-03): a background model never takes the full
         # mode - the whole-video device canvas would block before the
@@ -361,7 +444,8 @@ class KEEPFaceProcessor:
 
         if mode == "full":
             background = batched_bg_frames(
-                background_stacked, final_upscale_factor, self.bg_upscale_model,
+                background_provider.materialize(), final_upscale_factor,
+                self.bg_upscale_model,
                 self.device, canvas_hw=canvas_hw, return_device=True)
             canvas = paste_faces_batch(
                 faces_bgr=faces_bgr,
@@ -380,7 +464,7 @@ class KEEPFaceProcessor:
             chunks = paste_mod.paste_faces_batch_chunked(
                 faces_bgr=faces_bgr,
                 inverse_affines=inverses,
-                background_bgr=background_stacked,
+                background_bgr=_core_background(background_provider),
                 upscale_factor=final_upscale_factor,
                 bg_upscale_model=self.bg_upscale_model,
                 device=self.device,
@@ -393,7 +477,8 @@ class KEEPFaceProcessor:
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
 
         background = batched_bg_frames(
-            background_stacked, final_upscale_factor, self.bg_upscale_model,
+            background_provider.materialize(), final_upscale_factor,
+            self.bg_upscale_model,
             self.device, canvas_hw=canvas_hw)
         pasted = paste_faces_batch(
             faces_bgr=faces_bgr,
@@ -406,7 +491,7 @@ class KEEPFaceProcessor:
         return dict(zip(eligible, pasted))
 
     def _batched_paste_multiface(self,
-                                 input_frames_bgr: np.ndarray,
+                                 input_frames_bgr: np.ndarray | BgrFrameSource,
                                  restored_faces: np.ndarray,
                                  face_affines: list,
                                  face_frames: list[int],
@@ -452,6 +537,12 @@ class KEEPFaceProcessor:
                 into the paste core, which ticks the eligible rows per
                 completed chunk/group (the fallback rows are ticked by the
                 processor's loop; the owner's fix 4, 2026-10-31).
+
+        The background arrives as a
+        :class:`~.keep_image_utils.BgrFrameSource` (the round-17 lazy path
+        - the eligible **frames** are a view of the clip and the core
+        converts the group's rows on demand) or as a numpy stack (the
+        direct-call path of the tests and the tools).
 
         Returns:
             The ``{frame index: ...}`` mapping of the **eligible** frames -
@@ -513,13 +604,18 @@ class KEEPFaceProcessor:
             faces_stacked = restored_faces
         else:
             faces_stacked = np.stack([restored_faces[k] for k in batch_faces])
-        if eligible == list(range(input_frames_bgr.shape[0])):
-            background_stacked = input_frames_bgr
-        else:
-            background_stacked = np.stack([input_frames_bgr[i] for i in eligible])
+        # The background of the batch (round 17) - the multi-face split of
+        # the sibling's: the **provider** of the rows - the lazy source (the
+        # paste stage's path) or the numpy stack (the direct-call path of
+        # the tests and the tools).  The eligible **frames** are a view of
+        # the source: the gather copy is gone, and the source converts the
+        # rows per group inside the core.
+        background_provider = paste_mod.frame_provider(input_frames_bgr)
+        if eligible != list(range(int(background_provider.shape[0]))):
+            background_provider = background_provider.select(eligible)
 
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
-            background_stacked.shape[1:3], final_upscale_factor, canvas_hw)
+            background_provider.shape[1:3], final_upscale_factor, canvas_hw)
         # the canvas budget counts canvas rows - the eligible **frame**
         # count, not the face count (design section 3.4)
         mode = paste_mod.device_output_mode(self.device, len(eligible), canvas_h, canvas_w)
@@ -531,7 +627,8 @@ class KEEPFaceProcessor:
 
         if mode == "full":
             background = batched_bg_frames(
-                background_stacked, final_upscale_factor, self.bg_upscale_model,
+                background_provider.materialize(), final_upscale_factor,
+                self.bg_upscale_model,
                 self.device, canvas_hw=canvas_hw, return_device=True)
             canvas = paste_faces_batch(
                 faces_bgr=faces_stacked,
@@ -552,7 +649,7 @@ class KEEPFaceProcessor:
             chunks = paste_mod.paste_faces_batch_chunked(
                 faces_bgr=faces_stacked,
                 inverse_affines=inverses,
-                background_bgr=background_stacked,
+                background_bgr=_core_background(background_provider),
                 upscale_factor=final_upscale_factor,
                 bg_upscale_model=self.bg_upscale_model,
                 device=self.device,
@@ -567,7 +664,8 @@ class KEEPFaceProcessor:
             return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
 
         background = batched_bg_frames(
-            background_stacked, final_upscale_factor, self.bg_upscale_model,
+            background_provider.materialize(), final_upscale_factor,
+            self.bg_upscale_model,
             self.device, canvas_hw=canvas_hw)
         pasted = paste_faces_batch(
             faces_bgr=faces_stacked,
@@ -1279,9 +1377,14 @@ class KEEPFaceProcessor:
 
             # D-R2.3.1: convert-in #2 - the detection / crop / restore window
             # ran with no whole-clip uint8 BGR alive; the paste stage needs
-            # the frames again.  One extra full-clip elementwise pass is the
-            # price of the release.
-            input_frames_bgr = comfy_batch_to_bgr_u8(image_sequence_tensor)
+            # the frames again.  Round 17 (the final stage's RAM): the frames
+            # come from the **lazy source** - the rows are converted on
+            # demand (the paste core per group, the fallback rows per
+            # group), so the whole-clip uint8 stack is never built.
+            # The converter is the module global, resolved here - after any
+            # monkeypatch - so a spy sees every conversion of the run.
+            frame_source = BgrFrameSource(
+                image_sequence_tensor, convert=comfy_batch_to_bgr_u8)
             progress.update(num_input_frames)
 
             output_frames_cv2: list[np.ndarray] = []
@@ -1321,7 +1424,11 @@ class KEEPFaceProcessor:
                 # 4.2 - the host pass was the largest host-side item of the
                 # stage); the CPU device keeps the numpy computation.
                 gray_device = self.device if torch.device(self.device).type == "cuda" else None
-                gray_flags = is_gray_batch(input_frames_bgr, device=gray_device)
+                # Round 17: the flags are computed **per fallback group**,
+                # with the group's frames (the whole-clip gray pass is gone)
+                # - the eligible rows' flags are never read, so they stay
+                # False.
+                gray_flags = np.zeros(num_input_frames, dtype=bool)
                 # The batched paste (design section 7.7): the default branch of
                 # the paste stage runs on the device - the chunked ParseNet
                 # forward, the batched parse mask, the batched inverse warp and
@@ -1336,7 +1443,7 @@ class KEEPFaceProcessor:
                 batched_outputs = {}
                 if not has_aligned_frames:
                     batched_outputs = self._batched_paste(
-                        input_frames_bgr, all_restored_faces_cv2, affine_matrices,
+                        frame_source, all_restored_faces_cv2, affine_matrices,
                         avg_landmarks_sequence, final_upscale_factor, draw_box, gray_flags,
                         canvas_hw=canvas_hw, stage_bar=paste_bar)
 
@@ -1347,6 +1454,20 @@ class KEEPFaceProcessor:
                 # until the return.
                 canvas = batched_outputs.pop(paste_mod.DEVICE_CANVAS_KEY, None)
                 chunks_out = batched_outputs.pop(paste_mod.DEVICE_OUTPUT_CHUNKS_KEY, None)
+                # The fallback rows (round 17): the rows the batched paste
+                # did not take - the mapping's keys are the eligible rows.
+                # Their frames and their gray flags come from the lazy
+                # source, **per group**: the whole-clip uint8 stack and the
+                # whole-clip gray pass are gone.
+                fallback_rows = [i for i in range(num_input_frames)
+                                 if i not in batched_outputs]
+                gray_groups = self._fallback_gray_groups(
+                    frame_source, fallback_rows, gray_flags, gray_device,
+                    max_clip_length)
+                # The first group is pulled here: the gray pass belongs to
+                # the processor's contract even when no row falls back (the
+                # empty group).
+                group_rows, group_frames = next(gray_groups)
                 device_canvas_mode = False
                 chunks_mode = False
                 if canvas is not None:
@@ -1400,7 +1521,13 @@ class KEEPFaceProcessor:
                     # Fallback path for frames skipped by GPU batching: the
                     # loop owns this row's paste, so it ticks the bar.
                     paste_bar.tick(1)
-                    original_frame_bgr = input_frames_bgr[i]
+                    # The row's frame (round 17): the lazy source's group
+                    # that holds the row - the group is pulled when the row
+                    # needs it, so only one group of uint8 frames is alive
+                    # at a time.
+                    while i not in group_rows:
+                        group_rows, group_frames = next(gray_groups)
+                    original_frame_bgr = group_frames[group_rows.index(i)]
                     # If the affine matrix is None, NO FACE was detected for
                     # the frame: do not run the vendored paste on it - return
                     # the background (the owner's fix 1.1, the critical fix).
@@ -1500,10 +1627,11 @@ class KEEPFaceProcessor:
 
             paste_bar.finish()
 
-            # The paste stage was the last reader of the whole-clip BGR (the
-            # paste calls and the fallback loop) - release it before the
-            # convert-out tails (D-R2.3.6).
-            del input_frames_bgr
+            # The lazy source and its last group are the paste stage's
+            # scratch (round 17) - release them before the convert-out
+            # tails (D-R2.3.6).
+            del gray_groups, group_rows, group_frames
+            del frame_source
             # The batched convert-out (design section 7.8): one stack and one
             # transfer, where the per-frame loop made a tensor per frame.
             if chunks_mode:
@@ -1815,8 +1943,14 @@ class KEEPFaceProcessor:
 
             # D-R2.3.1: convert-in #2 - the detection / crop / restore window
             # ran with no whole-clip uint8 BGR alive; the paste stage needs
-            # the frames again.
-            input_frames_bgr = comfy_batch_to_bgr_u8(image_sequence_tensor)
+            # the frames again.  Round 17 (the final stage's RAM): the frames
+            # come from the **lazy source** - the rows are converted on
+            # demand (the paste core per group, the fallback rows per
+            # group), so the whole-clip uint8 stack is never built.
+            # The converter is the module global, resolved here - after any
+            # monkeypatch - so a spy sees every conversion of the run.
+            frame_source = BgrFrameSource(
+                image_sequence_tensor, convert=comfy_batch_to_bgr_u8)
             progress.update(num_input_frames)
 
             output_frames_cv2: list[np.ndarray] = []
@@ -1855,7 +1989,11 @@ class KEEPFaceProcessor:
                 # ``facelib/utils/misc.py:146``) - the same variances, without
                 # the PIL round trip the per-frame paste made.
                 gray_device = self.device if torch.device(self.device).type == "cuda" else None
-                gray_flags = is_gray_batch(input_frames_bgr, device=gray_device)
+                # Round 17: the flags are computed **per fallback group**,
+                # with the group's frames (the whole-clip gray pass is gone)
+                # - the eligible rows' flags are never read, so they stay
+                # False.
+                gray_flags = np.zeros(num_input_frames, dtype=bool)
                 # The batched paste (design section 3.4): the eligible frames
                 # paste on the device through the face-to-frame map - the faces,
                 # the affines and the ROIs are face-indexed, the canvas, the
@@ -1866,7 +2004,7 @@ class KEEPFaceProcessor:
                 # ``draw_box`` rides the batch (the boxes land on the device
                 # canvases) and the grayscale frames do too.
                 batched_outputs = self._batched_paste_multiface(
-                    input_frames_bgr, all_restored_faces_cv2, face_affines,
+                    frame_source, all_restored_faces_cv2, face_affines,
                     face_frames, face_landmarks, final_upscale_factor, draw_box,
                     gray_flags, canvas_hw=canvas_hw, stage_bar=paste_bar)
 
@@ -1877,6 +2015,19 @@ class KEEPFaceProcessor:
                 # until the return.
                 canvas = batched_outputs.pop(paste_mod.DEVICE_CANVAS_KEY, None)
                 chunks_out = batched_outputs.pop(paste_mod.DEVICE_OUTPUT_CHUNKS_KEY, None)
+                # The fallback rows (round 17): the rows the batched paste
+                # did not take - the mapping's keys are the eligible frames.
+                # Their frames and their gray flags come from the lazy
+                # source, **per group**.
+                fallback_rows = [i for i in range(num_input_frames)
+                                 if i not in batched_outputs]
+                gray_groups = self._fallback_gray_groups(
+                    frame_source, fallback_rows, gray_flags, gray_device,
+                    max_clip_length)
+                # The first group is pulled here: the gray pass belongs to
+                # the processor's contract even when no row falls back (the
+                # empty group).
+                group_rows, group_frames = next(gray_groups)
                 device_canvas_mode = False
                 chunks_mode = False
                 if canvas is not None:
@@ -1929,7 +2080,13 @@ class KEEPFaceProcessor:
                     # Fallback path for the frames skipped by the batch: the
                     # loop owns this row's paste, so it ticks the bar.
                     paste_bar.tick(1)
-                    original_frame_bgr = input_frames_bgr[i]
+                    # The row's frame (round 17): the lazy source's group
+                    # that holds the row - the group is pulled when the row
+                    # needs it, so only one group of uint8 frames is alive
+                    # at a time.
+                    while i not in group_rows:
+                        group_rows, group_frames = next(gray_groups)
+                    original_frame_bgr = group_frames[group_rows.index(i)]
                     # The background short-circuit (the owner's fix 4,
                     # 2026-10-31): a frame without a face - or whose every
                     # face lost its affine - has nothing to paste: skip the
@@ -2007,10 +2164,11 @@ class KEEPFaceProcessor:
 
             paste_bar.finish()
 
-            # The paste stage was the last reader of the whole-clip BGR (the
-            # paste calls and the fallback loop) - release it before the
-            # convert-out tails (D-R2.3.6).
-            del input_frames_bgr
+            # The lazy source and its last group are the paste stage's
+            # scratch (round 17) - release them before the convert-out
+            # tails (D-R2.3.6).
+            del gray_groups, group_rows, group_frames
+            del frame_source
             # The batched convert-out (design section 7.8): one stack and one
             # transfer, where the per-frame loop made a tensor per frame.
             if chunks_mode:

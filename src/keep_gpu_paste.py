@@ -39,6 +39,11 @@ This module runs the default branch of that stage on the device:
   variances of the three channel differences, with the numpy computation as
   the fallback of the borderline frames (the paste-stage CPU optimization
   round, section 4.2).
+- the **background** of the paste is asked **per group**: a numpy stack is
+  sliced (a view, as before) and the lazy source
+  (:class:`~.keep_image_utils.BgrFrameSource`) converts the group's rows on
+  demand, so the whole-clip uint8 stack of the final stage is never built
+  (round 17 - the final stage's RAM).
 
 The **non-default branches stay with the vendored paste** (design section
 7.7, step 6): a face helper without a parse net.  The face upsampler left
@@ -87,7 +92,7 @@ import torch.nn.functional as F
 
 from . import keep_interrupt
 from .keep_gpu_ops import parse_soft_masks, resize_lanczos_u8, warp_affine_batch
-from .keep_image_utils import bgr_u8_batch_to_comfy
+from .keep_image_utils import BgrFrameSource, bgr_u8_batch_to_comfy
 
 #: The size the ParseNet works on (``face_restoration_helper.py:452`` -
 #: ``cv2.resize(current_restored_face, (512, 512))``).
@@ -399,10 +404,86 @@ def comfy_convert_out(
     return out
 
 
+# ---------------------------------------------------------------------------
+# The background providers of the paste (the lazy-source round)
+# ---------------------------------------------------------------------------
+
+
+class NumpyFrameProvider:
+    """The numpy side of the frame-source protocol of the paste core.
+
+    The paste core consumes its background through **one** protocol - the
+    ``.shape``, the ``.group(rows)``, the ``.select(rows)`` and the
+    ``.materialize()`` of a provider - so the lazy source of the round 17
+    (:class:`~.keep_image_utils.BgrFrameSource`) and a plain numpy stack
+    share a single code path.
+
+    This adapter is the numpy side: it serves the **same** rows the array
+    served before, with the same bytes and the same zero-copy slicing - the
+    ``group`` of a contiguous range is the **view** the core used to take
+    itself (``background[start:stop]``).  The array is never copied:
+    ``materialize()`` returns the very array the adapter wraps.
+    """
+
+    def __init__(self, frames: np.ndarray) -> None:
+        self._frames = frames
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The shape of the stack - the shape of the array itself."""
+        return tuple(self._frames.shape)
+
+    def __len__(self) -> int:
+        """The number of rows of the stack."""
+        return int(self._frames.shape[0])
+
+    def group(
+        self, indices: Sequence[int] | range | slice | np.ndarray
+    ) -> np.ndarray:
+        """The asked rows of the array.
+
+        A contiguous range is the **slice** the core used to take itself -
+        a view, no copy.  Any other index follows numpy's own semantics (a
+        list of row numbers is an advanced index - a copy, like the gather
+        it replaces).
+        """
+        if isinstance(indices, slice):
+            return self._frames[indices]
+        if isinstance(indices, range) and indices.step == 1 and indices.start >= 0:
+            return self._frames[indices.start : indices.stop]
+        return self._frames[indices]
+
+    def select(
+        self, indices: Sequence[int] | range | slice | np.ndarray
+    ) -> "NumpyFrameProvider":
+        """A provider of the selected rows (the gather of the eligible rows)."""
+        return NumpyFrameProvider(self._frames[indices])
+
+    def materialize(self) -> np.ndarray:
+        """The stack itself - the array is materialized already."""
+        return self._frames
+
+
+def frame_provider(
+    background_bgr: np.ndarray | BgrFrameSource,
+) -> NumpyFrameProvider | BgrFrameSource:
+    """The provider of the paste's background rows.
+
+    The **source is detected first**: ``np.asarray`` on a lazy source would
+    materialize it - rebuilding the whole-clip uint8 stack (~3.78 GB on the
+    owner's 777-frame 1500x1080 clip) that the lazy path exists to avoid.
+    A numpy array keeps the old behaviour exactly (``np.asarray`` - no copy
+    for an array) and is served by :class:`NumpyFrameProvider`.
+    """
+    if isinstance(background_bgr, BgrFrameSource):
+        return background_bgr
+    return NumpyFrameProvider(np.asarray(background_bgr))
+
+
 def paste_faces_batch_chunked(
     faces_bgr: np.ndarray,
     inverse_affines: Sequence[np.ndarray],
-    background_bgr: np.ndarray,
+    background_bgr: np.ndarray | BgrFrameSource,
     upscale_factor: float,
     bg_upscale_model,
     device: torch.device,
@@ -442,6 +523,14 @@ def paste_faces_batch_chunked(
     the eligible rows are converted; the processor writes the fallback
     rows host-side (one stack, one conversion) into its own buffer.
 
+    The background is asked **per group**: a numpy stack is sliced (the
+    view the core took before) and the lazy source
+    (:class:`~.keep_image_utils.BgrFrameSource`) converts the group's rows
+    on demand, so the whole-clip uint8 stack is never built (round 17).
+    The bytes are the same either way - the converter is elementwise, so a
+    row converted alone is the row of the whole-clip conversion (pinned
+    in ``tests/test_gpu_batch_equivalence.py``).
+
     Args:
         faces_bgr: the ``(N, 512, 512, 3)`` uint8 BGR restored faces of
             the eligible frames.
@@ -450,8 +539,11 @@ def paste_faces_batch_chunked(
             vendored ``get_inverse_affine``
             (:func:`.keep_gpu_ops.inverse_affines`).
         background_bgr: the ``(N, h, w, 3)`` uint8 BGR **raw** background
-            frames (the processor's ``background_stacked``) - the resize
-            to the canvas happens per group.
+            frames - a numpy stack (the processor's ``background_stacked``)
+            or a lazy :class:`~.keep_image_utils.BgrFrameSource` (the
+            round-17 path: the rows are converted per group, so the
+            whole-clip uint8 stack is never built).  The resize to the
+            canvas happens per group.
         upscale_factor: the ``final_upscale_factor`` of the paste.
         bg_upscale_model: the optional background upscaler (``None`` in
             the production default).
@@ -494,7 +586,7 @@ def paste_faces_batch_chunked(
         ComfyUI IMAGE rows of the eligible canvas rows.
     """
     faces = np.asarray(faces_bgr)
-    background = np.asarray(background_bgr)
+    background = frame_provider(background_bgr)
     num_faces = int(faces.shape[0])
     if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
         raise ValueError(
@@ -524,7 +616,7 @@ def paste_faces_batch_chunked(
         num_rows = (
             int(num_frames) if num_frames is not None else int(background.shape[0])
         )
-    if background.ndim != 4 or background.shape[0] != num_rows:
+    if len(background.shape) != 4 or background.shape[0] != num_rows:
         if rows is None:
             raise ValueError(
                 f"paste_faces_batch_chunked: {tuple(background.shape)} background "
@@ -571,8 +663,9 @@ def paste_faces_batch_chunked(
                 keep_interrupt.check_interrupted()
                 stop = min(start + frame_chunk, num_rows)
                 group_background = batched_bg_frames(
-                    background[start:stop], upscale_factor, bg_upscale_model,
-                    device, canvas_hw=canvas_hw, return_device=True,
+                    background.group(slice(start, stop)), upscale_factor,
+                    bg_upscale_model, device, canvas_hw=canvas_hw,
+                    return_device=True,
                 )
                 canvas = paste_faces_batch(
                     faces[start:stop],
@@ -614,8 +707,9 @@ def paste_faces_batch_chunked(
                     index for row in range(start, stop) for index in row_faces[row]
                 ]
                 group_background = batched_bg_frames(
-                    background[start:stop], upscale_factor, bg_upscale_model,
-                    device, canvas_hw=canvas_hw, return_device=True,
+                    background.group(slice(start, stop)), upscale_factor,
+                    bg_upscale_model, device, canvas_hw=canvas_hw,
+                    return_device=True,
                 )
                 canvas = paste_faces_batch(
                     faces[face_indices],

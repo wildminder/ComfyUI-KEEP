@@ -1263,8 +1263,109 @@ def test_the_detection_pass_converts_at_most_a_group_at_a_time(
     # group conversion per chunk (the grouped D-R2.2.1) - the per-row
     # re-derivations of the first round-4 cut are gone: across the whole
     # run only the detection groups, the crop groups and the paste stage's
-    # second convert-in may call the converter (2 * ceil(3 / 2) + 1 = 5).
-    assert len(conversions) <= 5, conversions
+    # convert-ins may call the converter.
+    #
+    # Round 17 (the final stage's RAM) moved the paste stage's convert-in:
+    # it was ONE whole-clip conversion (3 rows - the uint8 stack of the
+    # clip, ~3.78 GB on the owner's 777-frame clip), and it is now the
+    # **fallback groups** (the lazy source, one group of
+    # ``max_clip_length`` rows per group).  The count therefore moves UP
+    # (3 -> 4 here: the detection groups [2, 1] plus the two fallback
+    # groups [2, 1]) while the LARGEST conversion moves DOWN (3 -> 2).
+    # The budget follows the movement: the paste stage's convert-ins are
+    # the fallback groups now (ceil(3 / 2) = 2 of them), so the ceiling
+    # is 2 * ceil(3 / 2) + 2 = 6 (the detection chunks, the crop chunks
+    # and the fallback groups).
+    assert len(conversions) <= 6, conversions
+
+
+@pytest.mark.unit
+def test_the_paste_stage_never_converts_the_whole_clip(
+    processor_module, monkeypatch
+):
+    """Round 17: the paste stage converts group by group, never the clip.
+
+    The paste stage used to materialize the clip's uint8 BGR stack in one
+    conversion (``input_frames_bgr = comfy_batch_to_bgr_u8(
+    image_sequence_tensor)``) - ~3.78 GB of host RAM on the owner's
+    777-frame 1500x1080 clip.  Round 17 replaced it with the lazy
+    :class:`~.keep_image_utils.BgrFrameSource`: the paste core asks the
+    source for the rows of the group it is about to paste, and the
+    fallback rows arrive in groups of their own.
+
+    The pin drives the **chunked** mode - the production mode of a long
+    clip (the full mode needs the whole device canvas and the host mode
+    is the no-CUDA fallback; both materialize the eligible rows, the
+    disclosed limitation of the design) - with a group size of 2 over a
+    4-frame clip, and records the batch size of every conversion of the
+    run:
+
+    * no conversion covers the whole clip (4 rows): the stack is never
+      built;
+    * the paste stage's conversions are group-sized (at most
+      ``paste_chunk_size`` rows): it converts the rows it pastes, not the
+      clip.
+
+    The measured run (the pin's fixture): the whole run converts
+    ``[2, 2, 2, 2, 2, 2, 0]`` - the detection chunks, the crop chunks,
+    the paste core's two eligible groups and the **empty** fallback group
+    (every row was batched, so the fallback generator runs its defensive
+    empty pass).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+    monkeypatch.setattr(paste_mod, "paste_chunk_size", lambda *args, **kwargs: 2)
+
+    conversions: list[int] = []
+    real_convert = processor_module.comfy_batch_to_bgr_u8
+
+    def recording_convert(tensor):
+        conversions.append(int(tensor.shape[0]))
+        return real_convert(tensor)
+
+    monkeypatch.setattr(processor_module, "comfy_batch_to_bgr_u8", recording_convert)
+
+    # The paste stage's conversions are the ones the core makes (the core
+    # is the first consumer of the lazy source) plus the fallback groups
+    # the vendored paste pulls afterwards.
+    paste_at: list[int] = []
+    real_chunked = paste_mod.paste_faces_batch_chunked
+
+    def recording_chunked(*args, **kwargs):
+        paste_at.append(len(conversions))
+        return real_chunked(*args, **kwargs)
+
+    monkeypatch.setattr(paste_mod, "paste_faces_batch_chunked", recording_chunked)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((4, 64, 64, 3), dtype=torch.float32)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=2,
+    )
+
+    assert conversions, "the run must convert through the module function"
+    assert paste_at, "the chunked paste core must run"
+    assert 4 not in conversions, (
+        f"no conversion may cover the whole clip, got {conversions}"
+    )
+    paste_stage = conversions[paste_at[0]:]
+    assert paste_stage, "the paste stage must convert its groups"
+    assert max(paste_stage) <= 2, (
+        f"the paste stage must convert group by group, got {paste_stage}"
+    )
 
 
 @pytest.mark.unit

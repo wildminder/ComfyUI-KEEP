@@ -182,6 +182,117 @@ def test_comfy_batch_to_bgr_u8_never_converts_more_than_the_chunk_budget(
     )
 
 
+# ---------------------------------------------------------------------------
+# The lazy BGR frame source (round 17 - the final stage RAM)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_bgr_frame_source_converts_the_whole_clip_byte_for_byte(image_utils):
+    """The lazy source's rows are the whole-clip conversion's bytes.
+
+    The paste stage converts the background **per group** instead of
+    building the whole-clip uint8 stack (~3.78 GB on the owner's
+    777-frame clip).  The converter is elementwise - the ``* 255`` scale,
+    the uint8 cast and the RGB -> BGR flip - so a row converted alone must
+    be the same bytes as the same row of the whole-clip conversion.  This
+    pin is what makes the lazy path a pure RAM change and not a pixel
+    change: a drift in the bytes would move every golden.
+    """
+    tensor = torch.rand((5, 7, 9, 3), generator=torch.Generator().manual_seed(41))
+
+    whole = image_utils.comfy_batch_to_bgr_u8(tensor)
+    source = image_utils.BgrFrameSource(tensor)
+
+    # the shape of the materialized stack, and the row count
+    assert source.shape == (5, 7, 9, 3)
+    assert len(source) == 5
+
+    # the whole clip, asked as one group
+    everything = source.group(range(5))
+    assert everything.shape == (5, 7, 9, 3)
+    assert everything.dtype == np.uint8
+    assert np.array_equal(everything, whole)
+
+    # a scattered group of rows
+    assert np.array_equal(source.group([1, 3]), whole[[1, 3]])
+
+    # a contiguous slice of the rows, and a scattered one
+    assert np.array_equal(source.group(slice(1, 4)), whole[1:4])
+    assert np.array_equal(source.group([0, 2, 4]), whole[[0, 2, 4]])
+
+    # the empty group is a valid ask (the gray pass of the processor may
+    # ask for one when no frame falls back)
+    assert source.group([]).shape == (0, 7, 9, 3)
+
+    # one row on its own
+    assert np.array_equal(source.row(3), whole[3])
+
+    # a lazy view: its local rows are the clip's rows it selected
+    view = source.select([1, 3])
+    assert view.shape == (2, 7, 9, 3)
+    assert len(view) == 2
+    assert np.array_equal(view.group(range(2)), whole[[1, 3]])
+    assert np.array_equal(view.row(1), whole[3])
+
+    # the disclosed limitation: the modes that need the whole stack build
+    # it from the source - with the same bytes as before
+    assert np.array_equal(source.materialize(), whole)
+    assert np.array_equal(view.materialize(), whole[[1, 3]])
+
+
+@pytest.mark.unit
+def test_bgr_frame_source_converts_nothing_until_a_row_is_asked(image_utils):
+    """Neither the construction nor the selection converts anything.
+
+    The point of the source is that the whole-clip uint8 stack is never
+    built: the clip is converted one group at a time, in the paste stage.
+    """
+    tensor = torch.rand((5, 7, 9, 3), generator=torch.Generator().manual_seed(43))
+    calls: list[tuple[int, ...]] = []
+
+    def _recording_convert(batch):
+        calls.append(tuple(batch.shape))
+        return image_utils.comfy_batch_to_bgr_u8(batch)
+
+    source = image_utils.BgrFrameSource(tensor, convert=_recording_convert)
+    assert calls == [], "the construction must not convert anything"
+
+    view = source.select([1, 3])
+    assert calls == [], "the selection must not convert anything"
+
+    view.group(range(2))
+    assert calls == [(2, 7, 9, 3)], "the group must convert exactly its rows"
+
+
+@pytest.mark.unit
+def test_bgr_frame_source_resolves_the_converter_at_call_time(
+    image_utils, monkeypatch
+):
+    """The converter seam: injected, or the module global read when used.
+
+    The processor injects its own module global as the seam (so a spy on
+    the processor's converter sees every conversion of a run); the
+    standalone default resolves this module's global **at call time**, so
+    a patched global is observed too.
+    """
+    tensor = torch.rand((4, 5, 6, 3), generator=torch.Generator().manual_seed(47))
+    calls: list[tuple[int, ...]] = []
+    real_convert = image_utils.comfy_batch_to_bgr_u8
+
+    def _recording_convert(batch):
+        calls.append(tuple(batch.shape))
+        return real_convert(batch)
+
+    monkeypatch.setattr(image_utils, "comfy_batch_to_bgr_u8", _recording_convert)
+    image_utils.BgrFrameSource(tensor).group(range(2))
+    assert calls == [(2, 5, 6, 3)], "the default converter is read at call time"
+
+    calls.clear()
+    image_utils.BgrFrameSource(tensor, convert=_recording_convert).group(range(4))
+    assert calls == [(4, 5, 6, 3)], "the injected converter is the one used"
+
+
 @pytest.mark.unit
 def test_bgr_u8_batch_to_comfy_is_bit_exact_against_the_per_frame_loop(image_utils):
     """The batch conversion equals the per-frame ``cv2_to_comfy_image`` loop.

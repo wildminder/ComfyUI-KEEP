@@ -44,6 +44,11 @@ def processor_module():
     return importlib.import_module("ComfyUI_KEEP.src.keep_processor")
 
 
+@pytest.fixture(scope="module")
+def image_utils():
+    return importlib.import_module("ComfyUI_KEEP.src.keep_image_utils")
+
+
 def vendored_diff_sum(frame_bgr_u8: np.ndarray) -> float:
     """The variance sum of the vendored ``is_gray`` (``misc.py:146-160``).
 
@@ -170,6 +175,64 @@ def _run_sequence(processor_module, device: torch.device) -> None:
         draw_box=False,
         max_clip_length=20,
     )
+
+
+class _RecordingGrayFaceHelper(_StubFaceHelper):
+    """The stub helper that records the gray flags the fallback paste reads.
+
+    The fallback loop sets ``face_helper.is_gray`` from the clip's flag
+    array right before the vendored paste, so the value the paste sees is
+    the flag the row was given.
+    """
+
+    def __init__(self, landmarks: np.ndarray) -> None:
+        super().__init__(landmarks)
+        self.gray_flags_read: list[bool] = []
+
+    def paste_faces_to_input_image(self, *args, **kwargs) -> np.ndarray:
+        self.gray_flags_read.append(bool(self.is_gray))
+        return super().paste_faces_to_input_image(*args, **kwargs)
+
+
+def _run_sequence_with(processor_module, device: torch.device, helper,
+                        frames: torch.Tensor, max_clip_length: int = 20):
+    """Run the sequence path of the processor with the given helper."""
+    pack = type(
+        "Pack",
+        (),
+        {
+            "keep_net": _StubKeepNet(),
+            "face_helper": helper,
+            "bg_upscale_model": None,
+            "face_upscale_model": None,
+            "device": device,
+            "model_type_str": "KEEP",
+        },
+    )()
+    processor = processor_module.KEEPFaceProcessor(pack)
+    return processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=max_clip_length,
+    )
+
+
+def _gray_and_colour_frames(seed: int = 17, num_frames: int = 4,
+                            gray_rows: tuple[int, ...] = (0, 3)) -> torch.Tensor:
+    """A clip of IMAGE rows: the named rows are gray, the others colour.
+
+    A gray row has all three channels equal - the vendored ``is_gray``
+    measures the variance of the channel differences, so the row's flag
+    is True and the pins are not vacuous.
+    """
+    rng = np.random.default_rng(seed)
+    rows = rng.uniform(0.0, 1.0, size=(num_frames, 64, 96, 3)).astype(np.float32)
+    for index in gray_rows:
+        rows[index] = rows[index, :, :, :1].copy()
+    return torch.from_numpy(rows)
 
 
 @pytest.mark.unit
@@ -350,3 +413,130 @@ def test_the_processor_passes_the_cuda_device(processor_module, monkeypatch):
 
     assert calls, "the processor did not call is_gray_batch"
     assert torch.device(calls[0]).type == "cuda", calls
+
+
+# ---------------------------------------------------------------------------
+# Round 17 - the fallback rows' gray flags (the whole-clip gray pass is gone)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_fallback_gray_flags_are_the_whole_clip_flags(
+    processor_module, gpu_paste, image_utils, monkeypatch
+):
+    """The fallback rows' gray flags are the whole-clip flags, exactly.
+
+    Round 17 (the final stage's RAM) replaced the whole-clip gray pass
+    with a **per fallback group** pass: the flags are computed with the
+    group's frames, one group at a time, so the whole-clip uint8 stack
+    (and the whole-clip gray pass) are gone.  The values do not move -
+    ``is_gray_batch`` decides **per frame**, so a group is the same set of
+    decisions as the whole clip.
+
+    The pin runs the sequence path over a 4-frame clip whose helper has
+    no parse net: the batched paste takes no row, so every row falls
+    back to the vendored paste - the rows that read the flags.  The
+    captured flags of the fallback groups must equal the flags of the
+    whole clip, exactly, and the flags the fallback paste reads must be
+    the same values.
+    """
+    calls: list[tuple[np.ndarray, object, np.ndarray]] = []
+    original = processor_module.is_gray_batch
+
+    def spy(frames, device=None):
+        flags = original(frames, device=device)
+        calls.append((np.asarray(frames), device, np.asarray(flags)))
+        return flags
+
+    monkeypatch.setattr(processor_module, "is_gray_batch", spy)
+
+    frames = _gray_and_colour_frames()
+    helper = _RecordingGrayFaceHelper(
+        (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0]))
+    _run_sequence_with(
+        processor_module, torch.device("cpu"), helper, frames, max_clip_length=2)
+
+    whole = image_utils.comfy_batch_to_bgr_u8(frames)
+    whole_flags = gpu_paste.is_gray_batch(whole)
+
+    assert calls, "the processor did not call is_gray_batch"
+    # the CPU device contract: the host (numpy) computation, no device
+    assert calls[0][1] is None, [call[1] for call in calls]
+    # the pin is not vacuous: the clip has both flags
+    assert list(whole_flags) == [True, False, False, True], list(whole_flags)
+    # the flags of the fallback groups are the flags of the whole clip
+    captured = np.concatenate([flags for _, _, flags in calls])
+    assert list(captured) == list(whole_flags), (
+        list(captured), list(whole_flags)
+    )
+    # the flags the fallback paste reads are the same values
+    assert helper.gray_flags_read == list(whole_flags), helper.gray_flags_read
+    # the gray pass runs in groups (max_clip_length rows), never the clip
+    assert [len(group) for group, _, _ in calls] == [2, 2], calls
+    # every group holds whole-clip rows, byte for byte
+    whole_rows = {row.tobytes() for row in whole}
+    for group, _, _ in calls:
+        for row in group:
+            assert row.tobytes() in whole_rows
+
+
+@pytest.mark.unit
+def test_the_gray_pass_covers_only_the_fallback_rows(
+    processor_module, gpu_paste, image_utils, monkeypatch
+):
+    """The eligible rows' flags are never computed - they were never read.
+
+    The fallback set is the rows the batched paste did **not** take (the
+    twin's returned keys), so the gray pass - and the conversion of the
+    rows it needs - covers the fallback rows only.  The eligible rows'
+    flags are never computed: they were never read (the batched rows do
+    not use them), so they stay False.
+
+    The pin stubs the twin with a mapping for rows 1 and 3, so the
+    fallback rows are exactly 0 and 2 - the gray pass must see those two
+    rows (and only those), with the flags of the whole clip at those
+    rows.
+    """
+    calls: list[tuple[np.ndarray, object, np.ndarray]] = []
+    original = processor_module.is_gray_batch
+
+    def spy(frames, device=None):
+        flags = original(frames, device=device)
+        calls.append((np.asarray(frames), device, np.asarray(flags)))
+        return flags
+
+    monkeypatch.setattr(processor_module, "is_gray_batch", spy)
+
+    def fake_batched_paste(self, *args, **kwargs):
+        """The twin takes rows 1 and 3 - the other rows fall back."""
+        return {
+            1: np.zeros((64, 96, 3), dtype=np.uint8),
+            3: np.zeros((64, 96, 3), dtype=np.uint8),
+        }
+
+    monkeypatch.setattr(
+        processor_module.KEEPFaceProcessor, "_batched_paste", fake_batched_paste)
+
+    frames = _gray_and_colour_frames()
+    helper = _RecordingGrayFaceHelper(
+        (FACE_TEMPLATE - 256.0) * 0.1 + np.array([48.0, 32.0]))
+    _run_sequence_with(
+        processor_module, torch.device("cpu"), helper, frames, max_clip_length=2)
+
+    whole = image_utils.comfy_batch_to_bgr_u8(frames)
+    whole_flags = gpu_paste.is_gray_batch(whole)
+    fallback_rows = [0, 2]
+
+    assert calls, "the processor did not call is_gray_batch"
+    assert calls[0][1] is None, [call[1] for call in calls]
+    # the gray pass saw the fallback rows only - the eligible rows' flags
+    # are never computed
+    assert [len(group) for group, _, _ in calls] == [2], calls
+    assert sum(len(group) for group, _, _ in calls) == len(fallback_rows), calls
+    # the flags are the whole-clip flags at exactly the fallback rows
+    captured = np.concatenate([flags for _, _, flags in calls])
+    assert list(captured) == list(whole_flags[fallback_rows]), (
+        list(captured), list(whole_flags[fallback_rows])
+    )
+    # the flags the fallback paste reads are the same values
+    assert helper.gray_flags_read == list(whole_flags[fallback_rows]), (
+        helper.gray_flags_read
+    )

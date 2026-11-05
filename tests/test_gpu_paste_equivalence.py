@@ -1353,6 +1353,104 @@ def test_the_chunked_assembly_is_independent_of_the_group_boundaries(
     )
 
 
+@pytest.mark.unit
+def test_the_chunked_assembly_accepts_the_lazy_source_and_matches_the_numpy_stack(
+    gpu_paste, image_utils
+):
+    """The lazy background source: the same pixels, asked group by group.
+
+    The round-17 source (:class:`~.keep_image_utils.BgrFrameSource`) wraps
+    the caller's float32 IMAGE tensor and converts the rows **on demand**,
+    so the paste never holds the whole-clip uint8 stack (~3.78 GB on the
+    owner's 777-frame clip).  The pin is **bit-exact**: the chunked
+    assembly over the source equals the one over the numpy stack, byte for
+    byte - the converter is elementwise, so a row converted alone is the
+    row of the whole-clip conversion.
+
+    The second half is the memory discipline: the source is asked **per
+    group** (the spy records the batch shapes), so no conversion ever
+    covers the whole clip.
+    """
+    num_frames = 3
+    rng = np.random.default_rng(251)
+    faces = rng.integers(0, 256, size=(num_frames, 512, 512, 3), dtype=np.uint8)
+    matrices = [
+        _face_to_canvas(
+            ROI_CANVAS_HW, "interior" if index % 2 == 0 else "edge", scale=0.3
+        )
+        for index in range(num_frames)
+    ]
+    # the node's float32 IMAGE batch - the payload of the lazy source
+    image_batch = torch.rand(
+        (num_frames, *ROI_CANVAS_HW, 3),
+        generator=torch.Generator().manual_seed(257),
+    )
+    whole = image_utils.comfy_batch_to_bgr_u8(image_batch)
+
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=matrices,
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        device=torch.device("cpu"),
+        canvas_hw=None,
+        parse_net=_StubParseNet(seed=259),
+        frame_chunk=2,
+    )
+
+    numpy_rows = gpu_paste.paste_faces_batch_chunked(background_bgr=whole, **kwargs)
+
+    calls: list[tuple[int, ...]] = []
+
+    def _recording_convert(batch):
+        calls.append(tuple(batch.shape))
+        return image_utils.comfy_batch_to_bgr_u8(batch)
+
+    source = image_utils.BgrFrameSource(image_batch, convert=_recording_convert)
+    source_rows = gpu_paste.paste_faces_batch_chunked(background_bgr=source, **kwargs)
+
+    assert torch.equal(source_rows, numpy_rows), (
+        "the lazy source drifted from the numpy stack"
+    )
+    assert calls == [(2, *ROI_CANVAS_HW, 3), (1, *ROI_CANVAS_HW, 3)], (
+        f"the source was not asked group by group: {calls}"
+    )
+
+
+@pytest.mark.unit
+def test_the_numpy_background_provider_serves_the_same_rows_without_copying(gpu_paste):
+    """The numpy adapter: the rows the core used to slice, as views.
+
+    The paste core consumes its background through one provider protocol,
+    so the lazy source and a numpy stack share a single code path.  This
+    adapter is the numpy side: the ``group`` of a contiguous range is the
+    **view** the core took before (``background[start:stop]``), the shape
+    is the array's shape and the ``materialize`` is the array itself.  The
+    zero-copy claim is the pin - a copy here would rebuild the whole
+    eligible stack.
+    """
+    frames = np.arange(3 * 4 * 5 * 3, dtype=np.uint8).reshape(3, 4, 5, 3)
+
+    provider = gpu_paste.frame_provider(frames)
+    assert provider.shape == (3, 4, 5, 3)
+    assert len(provider) == 3
+
+    group = provider.group(slice(1, 3))
+    assert np.array_equal(group, frames[1:3])
+    assert np.shares_memory(group, frames), "the group copied the rows"
+
+    assert np.array_equal(provider.group(range(1, 3)), frames[1:3])
+    assert np.array_equal(provider.group([0, 2]), frames[[0, 2]])
+
+    # the materialized stack is the array itself - no copy
+    assert provider.materialize() is frames
+
+    # the gather of the eligible rows: the copy the numpy path always made
+    selected = provider.select([0, 2])
+    assert selected.shape == (2, 4, 5, 3)
+    assert np.array_equal(selected.materialize(), frames[[0, 2]])
+
+
 # ---------------------------------------------------------------------------
 # The batched background (design section 7.7, step 1)
 # ---------------------------------------------------------------------------
