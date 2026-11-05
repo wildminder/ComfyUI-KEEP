@@ -294,6 +294,44 @@ def test_bgr_frame_source_resolves_the_converter_at_call_time(
 
 
 @pytest.mark.unit
+def test_bgr_frame_source_is_byte_exact_across_the_chunk_boundary(
+    image_utils, monkeypatch
+):
+    """The lazy source is byte-exact where the converter's chunk splits.
+
+    The round-17 byte-identity pin used a 5x7x9 tensor, which never splits
+    ``COMFY_BATCH_CHUNK_PIXELS`` - it compared a single-chunk whole-clip
+    conversion with a single-chunk group.  Production splits: at 1500x1080
+    the budget holds 2 frames per chunk, so the whole clip is converted in
+    chunks and a group is converted in its own chunks.  The two must be the
+    same bytes - the lazy path is a pure RAM change only if they are.
+
+    The budget is patched down (the split is the point, the size is not),
+    and the frames are sized so that the whole-clip conversion and the
+    per-group conversions land on **different** chunk boundaries.
+    """
+    tensor = torch.rand((5, 8, 8, 3), generator=torch.Generator().manual_seed(53))
+    pixels = 8 * 8
+    whole = image_utils.comfy_batch_to_bgr_u8(tensor)
+    source = image_utils.BgrFrameSource(tensor)
+    view = source.select([1, 3])
+
+    for budget in (pixels * 2, pixels * 3, pixels * 5):
+        monkeypatch.setattr(image_utils, "COMFY_BATCH_CHUNK_PIXELS", budget)
+        # the chunked whole-clip conversion is the single-chunk one
+        chunked_whole = image_utils.comfy_batch_to_bgr_u8(tensor)
+        assert np.array_equal(chunked_whole, whole), budget
+        # every group - on its own chunks - is the whole clip's rows
+        for group in ([0], [1, 2], [0, 1, 2], [3, 4], range(5)):
+            assert np.array_equal(
+                source.group(group), whole[list(group)]
+            ), (budget, group)
+        # the lazy view of a subset of the rows, on its own chunks
+        assert np.array_equal(view.group(range(2)), whole[[1, 3]]), budget
+        assert np.array_equal(view.row(1), whole[3]), budget
+
+
+@pytest.mark.unit
 def test_bgr_u8_batch_to_comfy_is_bit_exact_against_the_per_frame_loop(image_utils):
     """The batch conversion equals the per-frame ``cv2_to_comfy_image`` loop.
 
