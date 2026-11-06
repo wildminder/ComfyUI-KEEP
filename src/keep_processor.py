@@ -379,10 +379,13 @@ class KEEPFaceProcessor:
             in the mapping take the vendored path.  A device-output mode
             replaces the mapped frames with one sentinel key:
             :data:`~.keep_gpu_paste.DEVICE_CANVAS_KEY` (the ``"full"``
-            mode's one uint8 canvas) or
+            mode's one uint8 canvas - the mapped indices name its rows,
+            in order) or
             :data:`~.keep_gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY` (the
-            ``"chunked"`` mode's float32 IMAGE rows) - the mapped indices
-            name the rows of that tensor, in order.
+            ``"chunked"`` mode's float32 IMAGE rows - round 18: the
+            **whole-clip** buffer the twin allocates and hands to the
+            core, so the eligible rows land in their final rows and the
+            mapped index is the buffer's own row).
         """
         parse_net = getattr(self.face_helper, "face_parse", None)
         if parse_net is None or not getattr(self.face_helper, "use_parse", False):
@@ -430,7 +433,14 @@ class KEEPFaceProcessor:
         # inside the core.  The numpy path keeps its gather (the array is
         # already materialized there).
         background_provider = paste_mod.frame_provider(input_frames_bgr)
-        if eligible != list(range(int(background_provider.shape[0]))):
+        # Round 18: the clip's row count - the row count of the final
+        # buffer.  It is read **before** the select (the select narrows
+        # the provider to the eligible rows), and it is the frame count
+        # the eligible rows are indexed by: the restored-face stack is
+        # frame-indexed (``num_input_frames`` rows - one row per input
+        # frame), so an eligible index is a frame index.
+        num_input_frames = int(background_provider.shape[0])
+        if eligible != list(range(num_input_frames)):
             background_provider = background_provider.select(eligible)
 
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
@@ -461,6 +471,14 @@ class KEEPFaceProcessor:
             return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
 
         if mode == "chunked":
+            # Round 18: the final whole-clip float32 buffer is allocated
+            # **before** the paste and handed to the core - the eligible
+            # rows land straight in it (the core writes them by index).
+            # The core's own buffer would be a second whole-clip float32
+            # buffer alive at the same time (the defect this round
+            # removes).
+            final_batch = torch.empty(
+                (num_input_frames, canvas_h, canvas_w, 3), dtype=torch.float32)
             chunks = paste_mod.paste_faces_batch_chunked(
                 faces_bgr=faces_bgr,
                 inverse_affines=inverses,
@@ -471,10 +489,23 @@ class KEEPFaceProcessor:
                 canvas_hw=canvas_hw,
                 parse_net=parse_net,
                 stage_bar=stage_bar,
-                face_upscale_model=self.face_upscale_model)
+                face_upscale_model=self.face_upscale_model,
+                out=final_batch,
+                # the core's canvas row r is the r-th eligible frame, so
+                # the eligible rows land in their final rows.
+                out_rows=eligible)
             if draw_box:
-                self._draw_boxes_on_canvas(chunks, inverses, (canvas_h, canvas_w))
-            return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
+                # the boxes land on the **final** rows (the float32 IMAGE
+                # rows) - the eligible-space row of a face is its final
+                # row ``eligible[face]``.
+                self._draw_boxes_on_canvas(
+                    chunks, inverses, (canvas_h, canvas_w),
+                    face_rows=list(eligible))
+            # the mapped values are **views** into the final buffer (basic
+            # integer indexing) - the tail drops them into a set, so no
+            # second copy of the rows is ever alive.
+            return {**{frame: chunks[frame] for frame in eligible},
+                    paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
 
         background = batched_bg_frames(
             background_provider.materialize(), final_upscale_factor,
@@ -548,10 +579,11 @@ class KEEPFaceProcessor:
             The ``{frame index: ...}`` mapping of the **eligible** frames -
             the frames that are not in it take the vendored fallback.  A
             device-output mode replaces the mapped frames with the sentinel
-            keys, exactly like :meth:`_batched_paste`: the canvas and the
-            chunk buffer are allocated over the eligible **frame** count
-            (``device_output_mode`` counts canvas rows), the faces ride the
-            map.
+            keys, exactly like :meth:`_batched_paste`: the canvas is
+            allocated over the eligible **frame** count
+            (``device_output_mode`` counts canvas rows) and the faces ride
+            the map; the chunk buffer (round 18) is the **whole-clip**
+            float32 buffer - the eligible frames land in it by index.
 
             Since keep-fix5 (2026-11-03) a configured face upsampler is
             batch-eligible here too - the ``return {}`` abort is deleted,
@@ -611,7 +643,12 @@ class KEEPFaceProcessor:
         # the source: the gather copy is gone, and the source converts the
         # rows per group inside the core.
         background_provider = paste_mod.frame_provider(input_frames_bgr)
-        if eligible != list(range(int(background_provider.shape[0]))):
+        # Round 18: the clip's row count - the row count of the final
+        # buffer.  It is read **before** the select (the select narrows
+        # the provider to the eligible frames), and it is the frame count
+        # the eligible frames are indexed by.
+        num_input_frames = int(background_provider.shape[0])
+        if eligible != list(range(num_input_frames)):
             background_provider = background_provider.select(eligible)
 
         canvas_h, canvas_w = paste_mod.paste_canvas_hw(
@@ -646,6 +683,14 @@ class KEEPFaceProcessor:
             return {**dict(zip(eligible, list(canvas))), paste_mod.DEVICE_CANVAS_KEY: canvas}
 
         if mode == "chunked":
+            # Round 18: the final whole-clip float32 buffer is allocated
+            # **before** the paste and handed to the core - the eligible
+            # frames land straight in it (the core writes them by index).
+            # The core's own buffer would be a second whole-clip float32
+            # buffer alive at the same time (the defect this round
+            # removes).
+            final_batch = torch.empty(
+                (num_input_frames, canvas_h, canvas_w, 3), dtype=torch.float32)
             chunks = paste_mod.paste_faces_batch_chunked(
                 faces_bgr=faces_stacked,
                 inverse_affines=inverses,
@@ -658,10 +703,24 @@ class KEEPFaceProcessor:
                 face_frame=face_frame,
                 num_frames=len(eligible),
                 stage_bar=stage_bar,
-                face_upscale_model=self.face_upscale_model)
+                face_upscale_model=self.face_upscale_model,
+                out=final_batch,
+                # the core's canvas row r is the r-th eligible frame, so
+                # the eligible frames land in their final rows.
+                out_rows=eligible)
             if draw_box:
-                self._draw_boxes_on_canvas(chunks, inverses, (canvas_h, canvas_w), face_rows=face_frame)
-            return {**dict(zip(eligible, chunks)), paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
+                # the boxes land on the **final** rows (the float32 IMAGE
+                # rows) - the eligible-space row of a face is
+                # ``face_frame[face]``, so its final row is
+                # ``eligible[face_frame[face]]``.
+                self._draw_boxes_on_canvas(
+                    chunks, inverses, (canvas_h, canvas_w),
+                    face_rows=[eligible[row] for row in face_frame])
+            # the mapped values are **views** into the final buffer (basic
+            # integer indexing) - the tail drops them into a set, so no
+            # second copy of the rows is ever alive.
+            return {**{frame: chunks[frame] for frame in eligible},
+                    paste_mod.DEVICE_OUTPUT_CHUNKS_KEY: chunks}
 
         background = batched_bg_frames(
             background_provider.materialize(), final_upscale_factor,
@@ -1489,24 +1548,21 @@ class KEEPFaceProcessor:
                     batched_outputs = set(batched_outputs)
                     canvas = None
                 if chunks_out is not None:
-                    if len(batched_outputs) == num_input_frames:
-                        # every frame is batched: the chunk buffer already
-                        # holds the rows in order - alias it (no fresh
-                        # buffer, no copy)
-                        final_batch = chunks_out
-                    else:
-                        # one float32 host buffer of the whole batch: the
-                        # chunked mode's per-group convert-outs already
-                        # landed in it (the eligible rows are IMAGE rows) -
-                        # one indexed copy places them; the vendored-fallback
-                        # frames are converted host-side below (one stack,
-                        # never per-frame transfers)
-                        final_batch = torch.empty(
-                            (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
-                        final_batch[list(batched_outputs)] = chunks_out
+                    # Round 18: the twin's buffer **is** the final buffer -
+                    # the eligible rows landed in it (the core wrote them
+                    # by index) and the vendored-fallback frames are
+                    # written host-side into the same object below.  One
+                    # whole-clip float32 buffer in the mixed case; the
+                    # all-eligible case is the same object (the alias - no
+                    # copy).  The old eligible-rows scatter is gone.
+                    final_batch = chunks_out
                     chunks_mode = True
                     batched_outputs = set(batched_outputs)
                     chunks_out = None
+                    if final_batch.shape[0] != num_input_frames:
+                        raise RuntimeError(
+                            f"the paste buffer has {final_batch.shape[0]} rows "
+                            f"for {num_input_frames} input frames")
                 for i in range(num_input_frames):
                     keep_interrupt.check_interrupted()
                     if i in batched_outputs:
@@ -2049,23 +2105,21 @@ class KEEPFaceProcessor:
                     canvas = None
 
                 if chunks_out is not None:
-                    if len(batched_outputs) == num_input_frames:
-                        # every frame is batched: the chunk buffer already
-                        # holds the rows in order - alias it (no fresh
-                        # buffer, no copy)
-                        final_batch = chunks_out
-                    else:
-                        # one float32 host buffer of the whole batch: the chunked
-                        # mode's per-group convert-outs already landed in it (the
-                        # eligible rows are IMAGE rows) - one indexed copy places
-                        # them; the vendored-fallback frames are converted host-side
-                        # below (one stack, never per-frame transfers)
-                        final_batch = torch.empty(
-                            (num_input_frames, *chunks_out.shape[1:]), dtype=torch.float32)
-                        final_batch[list(batched_outputs)] = chunks_out
+                    # Round 18: the twin's buffer **is** the final buffer -
+                    # the eligible frames landed in it (the core wrote them
+                    # by index) and the vendored-fallback frames are
+                    # written host-side into the same object below.  One
+                    # whole-clip float32 buffer in the mixed case; the
+                    # all-eligible case is the same object (the alias - no
+                    # copy).  The old eligible-rows scatter is gone.
+                    final_batch = chunks_out
                     chunks_mode = True
                     batched_outputs = set(batched_outputs)
                     chunks_out = None
+                    if final_batch.shape[0] != num_input_frames:
+                        raise RuntimeError(
+                            f"the paste buffer has {final_batch.shape[0]} rows "
+                            f"for {num_input_frames} input frames")
                 for i in range(num_input_frames):
                     keep_interrupt.check_interrupted()
                     if i in batched_outputs:

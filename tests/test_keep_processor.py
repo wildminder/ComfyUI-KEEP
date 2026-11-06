@@ -1430,6 +1430,151 @@ def test_the_chunked_mode_keeps_one_tail_buffer(processor_module, monkeypatch):
 
 
 @pytest.mark.unit
+def test_the_mixed_case_holds_one_whole_clip_buffer(processor_module, monkeypatch):
+    """Round 18: the mixed case holds **one** whole-clip float32 buffer.
+
+    The paste stage's output used to be assembled in two steps: the paste
+    core allocated its own buffer (the eligible rows) and the tail
+    allocated a **second** whole-clip buffer and copied the eligible rows
+    into it - two whole-clip float32 tensors alive at the same time in
+    the mixed case (one frame without a face is enough).  Round 18 hands
+    the tail's buffer to the core, so the eligible rows land in their
+    final rows and exactly one whole-clip float32 buffer exists.
+
+    The pin drives the **chunked** mode (the production mode of a long
+    clip) over a 3-frame clip whose middle frame has no affine (the
+    LMEDS failure - a real production mode) - the mixed case, with the
+    eligible rows **scattered** (``[0, 2]``).  Every ``torch.empty`` of
+    the run is recorded: exactly one 4-D float32 allocation carries the
+    canvas's trailing dims (the core's own eligible-sized buffer would
+    carry them too - the census sees both), and that tensor **is** the
+    returned IMAGE (the weakref identity - the alias, not a copy).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    # the LMEDS failure of the middle frame: its affine stays ``None``, so
+    # the frame is not batch-eligible and rides the vendored fallback.
+    real_estimate_affines = processor_module.estimate_affines
+
+    def failing_estimate_affines(landmarks, template):
+        matrices = list(real_estimate_affines(landmarks, template))
+        if len(matrices) > 1:
+            matrices[1] = None
+        return matrices
+
+    monkeypatch.setattr(processor_module, "estimate_affines", failing_estimate_affines)
+
+    empties: list[tuple[tuple, torch.dtype, weakref.ref]] = []
+    real_empty = torch.empty
+
+    def recording_empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        empties.append((tuple(tensor.shape), tensor.dtype, weakref.ref(tensor)))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((3, 64, 64, 3), dtype=torch.float32)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    canvas_shape = tuple(int(value) for value in output.shape[1:])
+    float_buffers = [
+        (shape, ref) for shape, dtype, ref in empties
+        if dtype == torch.float32 and len(shape) == 4
+        and shape[1:] == canvas_shape
+    ]
+    assert len(float_buffers) == 1, (
+        f"the mixed case must hold one canvas-shaped float32 buffer, got "
+        f"{[shape for shape, _ in float_buffers]}"
+    )
+    assert float_buffers[0][0][0] == 3, (
+        f"the buffer must carry the whole clip's rows, got {float_buffers[0][0]}"
+    )
+    # the returned IMAGE is the paste buffer itself (the alias, no copy)
+    assert float_buffers[0][1]() is output, (
+        "the returned IMAGE must be the paste buffer itself"
+    )
+
+
+@pytest.mark.unit
+def test_the_mixed_case_draws_the_boxes_on_the_final_rows(processor_module, monkeypatch):
+    """Round 18: the boxes land on the **final** rows of the mixed case.
+
+    ``draw_box`` moved from the eligible-space rows to the final buffer
+    (the float32 IMAGE rows - the uint8 colour casts on assignment, the
+    documented 0.0 / 255.0 / 0.0).  The translation is the point of the
+    pin: the eligible rows of a mixed clip are **scattered** (here
+    ``[0, 2]`` - the middle frame has no affine), so a box addressed to
+    the eligible-space row would land on the wrong final row.
+
+    The pin compares two runs of the same clip - ``draw_box=True`` and
+    ``draw_box=False``: the eligible rows differ (the box is on them) and
+    the fallback row is **identical** (a frame without a face never gets
+    a box - in either design).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    real_estimate_affines = processor_module.estimate_affines
+
+    def failing_estimate_affines(landmarks, template):
+        matrices = list(real_estimate_affines(landmarks, template))
+        if len(matrices) > 1:
+            matrices[1] = None
+        return matrices
+
+    monkeypatch.setattr(processor_module, "estimate_affines", failing_estimate_affines)
+
+    generator = torch.Generator().manual_seed(17)
+    frames = torch.rand((3, 64, 64, 3), dtype=torch.float32, generator=generator)
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+
+    def run(draw_box):
+        face_helper = _LandmarkFaceHelper(landmarks)
+        face_helper.face_parse = _TinyParseNet()
+        face_helper.use_parse = True
+        processor = processor_module.KEEPFaceProcessor(
+            _make_pack(_StubKeepNet(), face_helper)
+        )
+        return processor.process_image_sequence(
+            image_sequence_tensor=frames,
+            final_upscale_factor=1.0,
+            has_aligned_frames=False,
+            only_center_face=True,
+            draw_box=draw_box,
+            max_clip_length=20,
+        )
+
+    boxed = run(True)
+    plain = run(False)
+
+    assert tuple(boxed.shape) == (3, 512, 512, 3), boxed.shape
+    for row in (0, 2):
+        assert not torch.equal(boxed[row], plain[row]), (
+            f"the eligible row {row} must carry the box"
+        )
+    assert torch.equal(boxed[1], plain[1]), (
+        "the fallback row must not carry a box"
+    )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("case_name", ["image_single", "image_multiface"])
 def test_the_image_paths_release_the_helper_after_the_run(
     processor_module, monkeypatch, case_name

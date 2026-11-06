@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import weakref
 from pathlib import Path
 
 import cv2
@@ -1167,3 +1168,117 @@ def test_the_sequence_paths_release_the_helper_after_the_run(
             "inverse_affine_matrices", "all_landmarks_5",
         ):
             assert getattr(face_helper, name) == [], (only_center_face, name)
+
+
+# ---------------------------------------------------------------------------
+# Round 18 - the mixed case holds ONE whole-clip buffer
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_the_multiface_mixed_case_holds_one_whole_clip_buffer(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """Round 18: the mixed case holds **one** whole-clip float32 buffer.
+
+    The sibling of the single-face pin (``tests/test_keep_processor.py``):
+    the paste stage's output used to be assembled in two steps - the paste
+    core allocated its own buffer (the eligible rows) and the tail
+    allocated a **second** whole-clip buffer and copied the eligible rows
+    into it, so the mixed case held two whole-clip float32 tensors at the
+    same time.  Round 18 hands the tail's buffer to the core: the eligible
+    rows land in their final rows and exactly one whole-clip float32
+    buffer exists.
+
+    The rig is the recurring one - ``[[FACE_A], [], [FACE_C]]``: the middle
+    frame has **no face**, so it rides the vendored fallback and the
+    eligible rows are **scattered** (``[0, 2]``).  The pin drives the
+    **chunked** mode (the production mode of a long clip) and records
+    every ``torch.empty`` of the run: exactly one 4-D float32 allocation
+    carries the canvas's trailing dims (the core's own eligible-sized
+    buffer would carry them too - the census sees both), and that tensor
+    **is** the returned IMAGE (the weakref identity - the alias, not a
+    copy).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    empties: list[tuple[tuple, torch.dtype, weakref.ref]] = []
+    real_empty = torch.empty
+
+    def recording_empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        empties.append((tuple(tensor.shape), tensor.dtype, weakref.ref(tensor)))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+
+    face_helper = make_helper(use_parse=True)
+    face_helper.face_parse = _StubParseNet(seed=217)
+    _attach_detector(face_helper, _SequenceDetector([[FACE_A], [], [FACE_C]]))
+    frames = _sequence_tensor(image_utils, _smooth_frames(3))
+
+    output = _run_sequence(processor_module, _KeepNet(), face_helper, frames)
+
+    canvas_shape = tuple(int(value) for value in output.shape[1:])
+    float_buffers = [
+        (shape, ref) for shape, dtype, ref in empties
+        if dtype == torch.float32 and len(shape) == 4
+        and shape[1:] == canvas_shape
+    ]
+    assert len(float_buffers) == 1, (
+        f"the mixed case must hold one canvas-shaped float32 buffer, got "
+        f"{[shape for shape, _ in float_buffers]}"
+    )
+    assert float_buffers[0][0][0] == 3, (
+        f"the buffer must carry the whole clip's rows, got {float_buffers[0][0]}"
+    )
+    # the returned IMAGE is the paste buffer itself (the alias, no copy)
+    assert float_buffers[0][1]() is output, (
+        "the returned IMAGE must be the paste buffer itself"
+    )
+
+
+@pytest.mark.unit
+def test_the_multiface_mixed_case_draws_the_boxes_on_the_final_rows(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """Round 18: the boxes land on the **final** rows of the mixed case.
+
+    ``draw_box`` moved from the eligible-space rows to the final buffer
+    (the float32 IMAGE rows - the uint8 colour casts on assignment, the
+    documented 0.0 / 255.0 / 0.0).  The translation is the point of the
+    pin: the eligible rows of a mixed clip are **scattered** (here
+    ``[0, 2]`` - the middle frame has no face), so a box addressed to the
+    eligible-space row would land on the wrong final row.
+
+    The pin compares two runs of the same clip - ``draw_box=True`` and
+    ``draw_box=False``: the eligible rows differ (the box is on them) and
+    the fallback row is **identical** (a frame without a face never gets a
+    box - in either design).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    frames = _sequence_tensor(image_utils, _smooth_frames(3))
+
+    def run(draw_box):
+        face_helper = make_helper(use_parse=True)
+        face_helper.face_parse = _StubParseNet(seed=219)
+        _attach_detector(
+            face_helper, _SequenceDetector([[FACE_A], [], [FACE_C]]))
+        return _run_sequence(
+            processor_module, _KeepNet(), face_helper, frames,
+            draw_box=draw_box)
+
+    boxed = run(True)
+    plain = run(False)
+
+    assert tuple(boxed.shape) == (3, *FRAME_HW, 3), boxed.shape
+    for row in (0, 2):
+        assert not torch.equal(boxed[row], plain[row]), (
+            f"the eligible row {row} must carry the box"
+        )
+    assert torch.equal(boxed[1], plain[1]), (
+        "the fallback row must not carry a box"
+    )

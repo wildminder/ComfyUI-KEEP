@@ -586,6 +586,78 @@ def test_the_chunked_multi_face_assembly_is_independent_of_the_group_boundaries(
     )
 
 
+@pytest.mark.unit
+def test_the_multi_face_core_writes_the_indexed_destination_byte_for_byte(
+    gpu_paste, gpu_ops
+):
+    """The multi-face branch of the indexed destination: the same bytes.
+
+    The multi-face path is the second half of round 18: the faces, the
+    affines and the ROIs are **face-indexed** while the canvas rows stay
+    **frame-indexed**, so the destination of a canvas row is a row of the
+    caller's buffer - the same indexed write as the single-face branch,
+    on the multi-face group's rows.
+
+    The pin is **bit-exact**: the destination rows carry the core's
+    own-buffer bytes (the same run without ``out=``), byte for byte, and
+    the rows the map does **not** name keep the sentinel fill.  The map
+    ``[0, 2, 5]`` is scattered on purpose and the group size of two splits
+    it across the groups (the first group owns the rows 0 and 2, the
+    second one the row 5) - a slice write or a read-side ``out[rows]``
+    copy (advanced indexing - a temporary) would fail this pin loudly.
+    """
+    faces, affines, face_frame, background = _multiface_corpus(
+        gpu_ops,
+        [
+            [(0.38, 0.45, 0.28, "smooth"), (0.52, 0.45, 0.28, "smooth")],
+            [(0.5, 0.5, 0.25, "noise")],
+            [(0.25, 0.35, 0.22, "noise"), (0.75, 0.65, 0.22, "smooth")],
+        ],
+        face_seed=401,
+        bg_seed=403,
+    )
+    assert face_frame == [0, 0, 1, 2, 2], face_frame
+    parse_net = _StubParseNet(seed=405)
+    inverses = gpu_ops.inverse_affines(affines, upscale_factor=1.0)
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=inverses,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=parse_net,
+        face_frame=face_frame,
+        num_frames=3,
+    )
+    core_kwargs = dict(
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        canvas_hw=None,
+        frame_chunk=2,
+    )
+    destination_rows = [0, 2, 5]
+
+    own = gpu_paste.paste_faces_batch_chunked(**core_kwargs, **kwargs)
+    assert tuple(own.shape) == (3, *MULTI_CANVAS_HW, 3), own.shape
+
+    sentinel = -7.5
+    given = torch.full((6, *MULTI_CANVAS_HW, 3), sentinel, dtype=torch.float32)
+    returned = gpu_paste.paste_faces_batch_chunked(
+        **core_kwargs, **kwargs, out=given, out_rows=destination_rows)
+
+    assert returned is given, "the core did not return the destination it was given"
+    for canvas_row, destination_row in enumerate(destination_rows):
+        assert torch.equal(given[destination_row], own[canvas_row]), (
+            f"the destination row {destination_row} does not carry the "
+            f"canvas row {canvas_row}'s bytes"
+        )
+    untouched = torch.full((3, *MULTI_CANVAS_HW, 3), sentinel, dtype=torch.float32)
+    for offset, row in enumerate((1, 3, 4)):
+        assert torch.equal(given[row], untouched[offset]), (
+            f"the row {row} was written although the map does not name it - "
+            "the write was a slice, not an indexed assignment"
+        )
+
+
 # ---------------------------------------------------------------------------
 # The per-row near-black tail
 # ---------------------------------------------------------------------------

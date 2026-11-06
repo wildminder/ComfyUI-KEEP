@@ -44,6 +44,12 @@ This module runs the default branch of that stage on the device:
   (:class:`~.keep_image_utils.BgrFrameSource`) converts the group's rows on
   demand, so the whole-clip uint8 stack of the final stage is never built
   (round 17 - the final stage's RAM).
+- the **output** of the chunked paste can land in a **caller-owned**
+  buffer: :func:`paste_faces_batch_chunked` takes an optional ``out=``
+  with the ``out_rows=`` map of the canvas rows, so the processor's final
+  whole-clip buffer receives the eligible rows by index - the core
+  allocates no buffer of its own and the second whole-clip float32 tensor
+  is never alive at the same time (round 18 - the single output buffer).
 
 The **non-default branches stay with the vendored paste** (design section
 7.7, step 6): a face helper without a parse net.  The face upsampler left
@@ -177,12 +183,14 @@ PASTE_DEVICE_STACK_SHARE = 0.25
 DEVICE_CANVAS_KEY = "__device_canvas__"
 
 #: The key of :func:`_batched_paste`'s mapping that carries the converted
-#: IMAGE rows of the chunked device-output mode - the
-#: ``(N_eligible, canvas_h, canvas_w, 3)`` float32 host tensor of
-#: :func:`paste_faces_batch_chunked`.  The full mode sets
-#: :data:`DEVICE_CANVAS_KEY` (its rows are still one uint8 canvas), the
-#: host mode sets neither, so the ``{frame index: frame}`` contract is
-#: unchanged.
+#: IMAGE rows of the chunked device-output mode - the **whole-clip**
+#: ``(N_input, canvas_h, canvas_w, 3)`` float32 host tensor the processor
+#: hands to :func:`paste_faces_batch_chunked` (round 18: the core writes the
+#: eligible rows into it by index, so the sentinel carries the final
+#: buffer and the core's own ``(N_eligible, ...)`` allocation is gone).
+#: The full mode sets :data:`DEVICE_CANVAS_KEY` (its rows are still one
+#: uint8 canvas), the host mode sets neither, so the ``{frame index:
+#: frame}`` contract is unchanged.
 DEVICE_OUTPUT_CHUNKS_KEY = "__device_output_chunks__"
 
 PASTE_TRANSFER_STATS: dict[str, int] = {
@@ -358,6 +366,7 @@ def comfy_convert_out(
     canvas: torch.Tensor,
     out: torch.Tensor | None = None,
     budget: int | None = None,
+    out_rows: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """A uint8 BGR canvas -> a ComfyUI IMAGE batch, in budget-sized sub-chunks.
 
@@ -385,11 +394,43 @@ def comfy_convert_out(
             sub-chunk results are written into - ``None`` allocates it.
         budget: the device bytes the transient may peak at; ``None`` (and
             values at or below zero) converts the whole batch in one call.
+        out_rows: the destination row of every canvas frame in ``out``
+            (round 18) - ``None`` (the default) writes the frames into
+            ``out``'s rows ``0..N-1``, the contiguous run the canvas
+            covers.  With the map the frames are **scattered**: the write
+            is an indexed assignment (``index_put_``, in place) into the
+            named rows, so a caller-owned whole-clip buffer can receive
+            the eligible rows without a second buffer and without a copy
+            of the rows.  The map needs ``out`` - it names the rows of a
+            destination, it cannot allocate one.
 
     Returns:
         The ``(N, H, W, 3)`` float32 CPU IMAGE batch (``out``).
     """
     num_frames, height, width = (int(value) for value in canvas.shape[:3])
+    dest: list[int] | None = None
+    if out_rows is not None:
+        if out is None:
+            raise ValueError(
+                "comfy_convert_out: out_rows names the rows of a destination - "
+                "it needs the destination tensor (out=)"
+            )
+        dest = [int(value) for value in out_rows]
+        if len(dest) != num_frames:
+            raise ValueError(
+                f"comfy_convert_out: {len(dest)} out_rows for {num_frames} "
+                "canvas frames"
+            )
+        limit = int(out.shape[0])
+        if any(not 0 <= row < limit for row in dest):
+            raise ValueError(
+                f"comfy_convert_out: out_rows names a row outside the "
+                f"destination's {limit} rows"
+            )
+        if len(set(dest)) != len(dest):
+            raise ValueError(
+                "comfy_convert_out: out_rows repeats a destination row"
+            )
     if out is None:
         out = torch.empty(
             (num_frames, height, width, int(canvas.shape[3])), dtype=torch.float32
@@ -400,7 +441,14 @@ def comfy_convert_out(
         sub_chunk = max(1, int(budget) // (9 * height * width * int(canvas.shape[3])))
     for start in range(0, num_frames, sub_chunk):
         stop = min(start + sub_chunk, num_frames)
-        out[start:stop] = bgr_u8_batch_to_comfy(canvas[start:stop])
+        value = bgr_u8_batch_to_comfy(canvas[start:stop])
+        if dest is None:
+            out[start:stop] = value
+        else:
+            # The indexed write (index_put_) - in place, into the named
+            # rows.  The read-side ``out[dest]`` would be advanced
+            # indexing - a **copy** - and the rows would be lost.
+            out[dest[start:stop]] = value
     return out
 
 
@@ -495,6 +543,9 @@ def paste_faces_batch_chunked(
     num_frames: int | None = None,
     stage_bar=None,
     face_upscale_model=None,
+    *,
+    out: torch.Tensor | None = None,
+    out_rows: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """The device-output paste of the whole eligible batch, in frame groups.
 
@@ -580,10 +631,26 @@ def paste_faces_batch_chunked(
             them; the parse masks stay computed on the 512 faces (the
             vendored ParseNet input).  ``None`` (the production default)
             pastes the 512 faces.
+        out: the preallocated float32 **host** tensor the converted rows
+            land in (round 18) - ``None`` (the default) keeps the core's
+            own allocation of the ``(num_rows, canvas_h, canvas_w, 3)``
+            buffer.  With it the core allocates **no** buffer of its own:
+            the processor hands its final whole-clip buffer over, so a
+            second whole-clip float32 tensor is never alive at the same
+            time (the defect the round removes).
+        out_rows: the destination row of every canvas row in ``out`` -
+            ``out_rows[r]`` is the row of ``out`` the core's canvas row
+            ``r`` is written into.  It needs ``out`` (the two are a pair)
+            and must name ``num_rows`` distinct rows of it.  The
+            processor's map is the eligible list: the core's row ``r`` is
+            the ``r``-th eligible frame, so the eligible rows land
+            straight in the final buffer.  ``None`` (the default) writes
+            the rows into ``out``'s own rows ``0..num_rows-1``.
 
     Returns:
         The ``(N, canvas_h, canvas_w, 3)`` float32 **CPU** tensor - the
-        ComfyUI IMAGE rows of the eligible canvas rows.
+        ComfyUI IMAGE rows of the eligible canvas rows (``out`` when it
+        is given).
     """
     faces = np.asarray(faces_bgr)
     background = frame_provider(background_bgr)
@@ -634,6 +701,52 @@ def paste_faces_batch_chunked(
     canvas_h, canvas_w = paste_canvas_hw(
         background.shape[1:3], upscale_factor, canvas_hw
     )
+    dest_rows: list[int] | None = None
+    if (out is None) != (out_rows is None):
+        raise ValueError(
+            "paste_faces_batch_chunked: out and out_rows are a pair - both "
+            "name an indexed destination, or neither"
+        )
+    if out is not None and out_rows is not None:
+        dest_rows = [int(value) for value in out_rows]
+        if len(dest_rows) != num_rows:
+            raise ValueError(
+                f"paste_faces_batch_chunked: {len(dest_rows)} out_rows for "
+                f"{num_rows} canvas rows"
+            )
+        # The destination is validated against the core's **own** canvas
+        # derivation - the core is the authority of the shape, so a
+        # divergence between the caller's canvas and the core's is a
+        # loud failure, not a silent corruption.
+        if out.dtype != torch.float32:
+            raise ValueError(
+                "paste_faces_batch_chunked: the destination must be float32"
+            )
+        if out.device.type != "cpu":
+            raise ValueError(
+                "paste_faces_batch_chunked: the destination must be a host "
+                "tensor (the convert-out's IMAGE rows)"
+            )
+        if tuple(int(value) for value in out.shape[1:]) != (canvas_h, canvas_w, 3):
+            raise ValueError(
+                f"paste_faces_batch_chunked: the destination's rows are "
+                f"{tuple(int(value) for value in out.shape[1:])}, the canvas "
+                f"is {(canvas_h, canvas_w, 3)}"
+            )
+        if int(out.shape[0]) < num_rows:
+            raise ValueError(
+                f"paste_faces_batch_chunked: the destination has "
+                f"{int(out.shape[0])} rows for {num_rows} canvas rows"
+            )
+        if any(not 0 <= row < int(out.shape[0]) for row in dest_rows):
+            raise ValueError(
+                "paste_faces_batch_chunked: out_rows names a row outside the "
+                f"destination's {int(out.shape[0])} rows"
+            )
+        if len(set(dest_rows)) != len(dest_rows):
+            raise ValueError(
+                "paste_faces_batch_chunked: out_rows repeats a destination row"
+            )
     if frame_chunk is None:
         frame_chunk = paste_chunk_size(canvas_h, canvas_w, device)
         if bg_upscale_model is not None:
@@ -645,7 +758,8 @@ def paste_faces_batch_chunked(
             frame_chunk = min(frame_chunk, 2)
     frame_chunk = max(1, int(frame_chunk))
     budget = device_canvas_budget(device)
-    out = torch.empty((num_rows, canvas_h, canvas_w, 3), dtype=torch.float32)
+    if out is None:
+        out = torch.empty((num_rows, canvas_h, canvas_w, 3), dtype=torch.float32)
     reset_paste_transfer_stats()
     totals: dict[str, int] = {key: 0 for key in PASTE_TRANSFER_STATS}
     # keep-fix5-implement2 (2026-11-03): the stage-level lifecycle wrap of
@@ -684,7 +798,13 @@ def paste_faces_batch_chunked(
                 for key, value in PASTE_TRANSFER_STATS.items():
                     if key not in ("frames", "canvas_bytes"):
                         totals[key] += value
-                comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+                group_dest = None if dest_rows is None else dest_rows[start:stop]
+                comfy_convert_out(
+                    canvas,
+                    out=out if group_dest is not None else out[start:stop],
+                    out_rows=group_dest,
+                    budget=budget,
+                )
                 # the paste bar (fix 2.3, 2026-10-30): the group's rows are
                 # done - converted out into the host buffer.  The multi-face
                 # groups below tick the same way (the owner's fix 4,
@@ -726,7 +846,13 @@ def paste_faces_batch_chunked(
                 for key, value in PASTE_TRANSFER_STATS.items():
                     if key not in ("frames", "canvas_bytes"):
                         totals[key] += value
-                comfy_convert_out(canvas, out=out[start:stop], budget=budget)
+                group_dest = None if dest_rows is None else dest_rows[start:stop]
+                comfy_convert_out(
+                    canvas,
+                    out=out if group_dest is not None else out[start:stop],
+                    out_rows=group_dest,
+                    budget=budget,
+                )
                 # the paste bar (fix 2.3, extended to the multi-face groups by
                 # the owner's fix 4, 2026-10-31): the group's rows are done -
                 # converted out into the host buffer.

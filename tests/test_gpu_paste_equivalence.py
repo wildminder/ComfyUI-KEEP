@@ -1418,6 +1418,158 @@ def test_the_chunked_assembly_accepts_the_lazy_source_and_matches_the_numpy_stac
 
 
 @pytest.mark.unit
+def test_the_core_writes_the_indexed_destination_byte_for_byte(gpu_paste):
+    """The indexed destination: the core's own bytes, in the named rows.
+
+    Round 18 hands the core a **caller-owned** buffer: the processor
+    allocates the final whole-clip float32 tensor and the core writes the
+    eligible rows straight into it, by index - no second buffer alive at
+    the same time, no copy of the rows.  The pin is **bit-exact**: the
+    destination rows carry the core's own-buffer bytes (the same run
+    without ``out=``), byte for byte, and the rows the map does **not**
+    name keep the sentinel fill.
+
+    The sentinel is the point of the pin: a slice write
+    (``out[start:stop] = ...``) would land the rows on the wrong indices,
+    and the read-side ``out[rows]`` (advanced indexing - a **copy**) would
+    write into a temporary and lose the rows.  Both fail this pin loudly
+    instead of shipping a corrupted buffer.
+
+    The map ``[0, 2, 5]`` is scattered on purpose, and the group size of
+    two splits it across the groups (the first group owns the rows 0 and
+    2, the second one the row 5) - the indexed write has to survive the
+    group boundary.
+    """
+    num_rows = 3
+    rng = np.random.default_rng(401)
+    faces = np.stack([
+        _face_u8("smooth", 403),
+        _face_u8("noise", 405),
+        _face_u8("smooth", 407),
+    ])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "edge", scale=0.3),
+        _face_to_canvas(ROI_CANVAS_HW, "interior", scale=0.22),
+    ]
+    background = rng.integers(
+        0, 256, size=(num_rows, *ROI_CANVAS_HW, 3), dtype=np.uint8)
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=409),
+    )
+    core_kwargs = dict(
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        canvas_hw=None,
+        frame_chunk=2,
+    )
+    destination_rows = [0, 2, 5]
+
+    own = gpu_paste.paste_faces_batch_chunked(**core_kwargs, **kwargs)
+    assert tuple(own.shape) == (num_rows, *ROI_CANVAS_HW, 3), own.shape
+
+    sentinel = -7.5
+    given = torch.full((6, *ROI_CANVAS_HW, 3), sentinel, dtype=torch.float32)
+    returned = gpu_paste.paste_faces_batch_chunked(
+        **core_kwargs, **kwargs, out=given, out_rows=destination_rows)
+
+    assert returned is given, "the core did not return the destination it was given"
+    for canvas_row, destination_row in enumerate(destination_rows):
+        assert torch.equal(given[destination_row], own[canvas_row]), (
+            f"the destination row {destination_row} does not carry the "
+            f"canvas row {canvas_row}'s bytes"
+        )
+    untouched = torch.full((3, *ROI_CANVAS_HW, 3), sentinel, dtype=torch.float32)
+    for offset, row in enumerate((1, 3, 4)):
+        assert torch.equal(given[row], untouched[offset]), (
+            f"the row {row} was written although the map does not name it - "
+            "the write was a slice, not an indexed assignment"
+        )
+
+
+@pytest.mark.unit
+def test_the_indexed_destination_is_validated_loudly(gpu_paste):
+    """A broken destination map fails loudly instead of losing a row.
+
+    The indexed destination is a **pair**: ``out`` names the tensor and
+    ``out_rows`` names its rows, so one without the other cannot be
+    honoured.  The map has to cover exactly the canvas rows, name
+    distinct rows of the destination and stay inside it, and the
+    destination has to be the float32 **host** tensor of the canvas shape
+    - the core's own canvas derivation is the authority of the shape, so a
+    divergence between the caller's canvas and the core's is a loud
+    failure, not a silent corruption.
+    """
+    num_rows = 3
+    rng = np.random.default_rng(411)
+    faces = np.stack([
+        _face_u8("smooth", 413),
+        _face_u8("noise", 415),
+        _face_u8("smooth", 417),
+    ])
+    matrices = [
+        _face_to_canvas(ROI_CANVAS_HW, "interior"),
+        _face_to_canvas(ROI_CANVAS_HW, "edge", scale=0.3),
+        _face_to_canvas(ROI_CANVAS_HW, "interior", scale=0.22),
+    ]
+    background = rng.integers(
+        0, 256, size=(num_rows, *ROI_CANVAS_HW, 3), dtype=np.uint8)
+    kwargs = dict(
+        faces_bgr=faces,
+        inverse_affines=matrices,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=_StubParseNet(seed=419),
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        canvas_hw=None,
+    )
+    canvas = torch.zeros((num_rows, *ROI_CANVAS_HW, 3), dtype=torch.uint8)
+
+    def destination(rows=6, dtype=torch.float32, shape=None):
+        if shape is None:
+            shape = (rows, *ROI_CANVAS_HW, 3)
+        return torch.zeros(shape, dtype=dtype)
+
+    # the pair: the destination without its map, and the map without its
+    # destination
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination())
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out_rows=[0, 1, 2])
+    # the map: the wrong length, a repeated row, a row outside the buffer
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination(), out_rows=[0, 2])
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination(), out_rows=[0, 0, 5])
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination(), out_rows=[0, 2, 6])
+    # the destination: the wrong dtype, the wrong canvas, too few rows
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination(dtype=torch.uint8), out_rows=[0, 2, 5])
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination(shape=(6, 64, 64, 3)), out_rows=[0, 2, 5])
+    with pytest.raises(ValueError):
+        gpu_paste.paste_faces_batch_chunked(
+            **kwargs, out=destination(rows=2), out_rows=[0, 1, 2])
+    # the convert-out: the map names the rows of a destination, so it
+    # cannot allocate one
+    with pytest.raises(ValueError):
+        gpu_paste.comfy_convert_out(canvas, out_rows=[0, 1, 2])
+
+
+@pytest.mark.unit
 def test_the_numpy_background_provider_serves_the_same_rows_without_copying(gpu_paste):
     """The numpy adapter: the rows the core used to slice, as views.
 
@@ -1962,8 +2114,10 @@ def test_the_batched_paste_returns_the_device_output_sentinels(
     with one uint8 canvas, the ``"chunked"`` verdict
     :data:`~.keep_gpu_paste.DEVICE_OUTPUT_CHUNKS_KEY` with the float32
     IMAGE rows, and the unpatched CPU run keeps the host mapping
-    (``{index: frame}``, no sentinel).  The mapped indices name the rows
-    of the sentinel tensor, in order.
+    (``{index: frame}``, no sentinel).  Since round 18 the chunk sentinel
+    carries the **whole-clip** float32 buffer, so a mapped index names the
+    buffer's own final row (in the all-eligible case of this pin that is
+    also the order of the eligible rows).
     """
     frames = smooth_frames_u8(2, (64, 96), seed=251)
     landmarks = synthetic_landmarks(2, (64, 96), seed=257)
