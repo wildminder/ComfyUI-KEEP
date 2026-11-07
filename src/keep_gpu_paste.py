@@ -460,11 +460,13 @@ def comfy_convert_out(
 class NumpyFrameProvider:
     """The numpy side of the frame-source protocol of the paste core.
 
-    The paste core consumes its background through **one** protocol - the
-    ``.shape``, the ``.group(rows)``, the ``.select(rows)`` and the
-    ``.materialize()`` of a provider - so the lazy source of the round 17
-    (:class:`~.keep_image_utils.BgrFrameSource`) and a plain numpy stack
-    share a single code path.
+    The paste core consumes its background **and** its faces through
+    **one** protocol - the ``.shape``, the ``.group(rows)``, the
+    ``.select(rows)`` and the ``.materialize()`` of a provider - so the
+    lazy sources (the round-17
+    :class:`~.keep_image_utils.BgrFrameSource` and the round-19
+    :class:`LazyFaceSource`) and a plain numpy stack share a single code
+    path.
 
     This adapter is the numpy side: it serves the **same** rows the array
     served before, with the same bytes and the same zero-copy slicing - the
@@ -528,8 +530,139 @@ def frame_provider(
     return NumpyFrameProvider(np.asarray(background_bgr))
 
 
+class LazyFaceSource:
+    """A lazy source of the restored faces - the selected rows of a stack.
+
+    The mixed case of the paste gathered the eligible faces into one copy
+    (``np.stack([restored_faces[i] for i in eligible])``) although the
+    paste cores read the faces **per group** (at most ``frame_chunk`` rows)
+    - on the owner's 776-eligible 512x512 faces that gather was ~611 MB of
+    host RAM (round 19, FIX 1).  This source wraps the caller's
+    face-indexed uint8 stack (no copy - the stack the restore stage built)
+    and serves the selected rows **on demand**: a group contiguous in
+    stack space is the slice (a view), a scattered one is the small
+    advanced-index copy of at most the group's rows.  The faces are
+    already uint8 BGR, so unlike the round-17
+    :class:`~.keep_image_utils.BgrFrameSource` the source converts
+    nothing - it only selects rows.
+
+    The bytes are the same either way - a row served here is the very row
+    of the caller's stack, so the group rows are ``np.array_equal`` to the
+    same rows of the old ``np.stack`` gather (pinned in
+    ``tests/test_gpu_paste_equivalence.py``).
+
+    The source speaks the protocol the paste cores consume (the same
+    protocol as the background providers): ``.shape`` (the shape of the
+    materialized gather), ``len()``, ``.group(indices)`` (the asked rows),
+    ``.row(index)`` (one row), ``.select(indices)`` (a lazy view of a
+    subset of the rows - the view copies nothing until one of its rows is
+    asked for) and ``.materialize()`` (the whole selected gather, for a
+    consumer that needs the array).
+
+    Args:
+        faces: the ``(N, 512, 512, 3)`` uint8 BGR restored faces - the
+            frame-indexed (single-face) or face-indexed (multi-face) stack
+            the restore stage built.
+    """
+
+    def __init__(self, faces: np.ndarray) -> None:
+        if faces.ndim != 4:
+            raise ValueError(
+                "LazyFaceSource expects a face stack (N, H, W, 3), got "
+                f"{tuple(faces.shape)}"
+            )
+        self._faces = faces
+        self._rows = np.arange(int(faces.shape[0]), dtype=np.int64)
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        """The shape of the materialized gather: ``(N, H, W, 3)``."""
+        return (len(self),) + tuple(self._faces.shape[1:])
+
+    def __len__(self) -> int:
+        """The number of selected rows."""
+        return int(self._rows.size)
+
+    def group(
+        self, indices: Sequence[int] | range | slice | np.ndarray
+    ) -> np.ndarray:
+        """The asked rows as one uint8 BGR array ``(k, H, W, 3)``.
+
+        A contiguous run in stack space is the **slice** - a view, no
+        copy.  Anything else is the advanced-index gather of exactly the
+        asked rows - the small per-group copy the lazy path trades the
+        whole-batch one for.
+        """
+        rows = self._local_rows(indices)
+        if rows.size == 0:
+            return self._faces[:0]
+        if bool(np.all(np.diff(rows) == 1)):
+            start = int(rows[0])
+            return self._faces[start : start + int(rows.size)]
+        return self._faces[rows]
+
+    def row(self, index: int) -> np.ndarray:
+        """One selected row as a uint8 BGR face ``(H, W, 3)``."""
+        return self.group((index,))[0]
+
+    def select(
+        self, indices: Sequence[int] | range | slice | np.ndarray
+    ) -> "LazyFaceSource":
+        """A lazy view of the selected rows - no copy.
+
+        The view maps its **local** indices to the rows of the stack: the
+        view's row ``i`` is the stack's row ``indices[i]``.  The paste
+        twins use the view to hand the cores their eligible rows, so the
+        faces the paste does not read are never gathered.
+        """
+        view = LazyFaceSource(self._faces)
+        view._rows = self._local_rows(indices)
+        return view
+
+    def materialize(self) -> np.ndarray:
+        """The whole (selected) gather as one uint8 BGR array.
+
+        The disclosed limitation of the lazy path: a consumer that needs
+        the whole selected stack builds it here - one gather, the bytes
+        the old ``np.stack`` branch produced.
+        """
+        return self.group(range(len(self)))
+
+    def _local_rows(
+        self, indices: Sequence[int] | range | slice | np.ndarray
+    ) -> np.ndarray:
+        """Map this source's local indices to the rows of the stack."""
+        if isinstance(indices, (slice, range)):
+            return self._rows[indices]
+        selected = np.asarray(indices, dtype=np.int64)
+        if selected.ndim != 1:
+            raise ValueError(
+                "the face indices must be a 1-D sequence of row numbers "
+                f"(got {selected.ndim} dimensions); use .row() for one row"
+            )
+        return self._rows[selected]
+
+
+def faces_provider(
+    faces_bgr: np.ndarray | LazyFaceSource,
+) -> NumpyFrameProvider | LazyFaceSource:
+    """The provider of the paste's face rows - the faces half of the seam.
+
+    The mirror of :func:`frame_provider` for the restored faces (round 19,
+    FIX 1): ``np.asarray`` on a lazy source would force the gather the
+    lazy path exists to avoid, so the source is detected first - the same
+    order :func:`frame_provider` runs.  A numpy array keeps the old
+    behaviour exactly (``np.asarray`` - no copy for an array) and is
+    served by :class:`NumpyFrameProvider`; a lazy source passes through
+    as itself.
+    """
+    if isinstance(faces_bgr, LazyFaceSource):
+        return faces_bgr
+    return NumpyFrameProvider(np.asarray(faces_bgr))
+
+
 def paste_faces_batch_chunked(
-    faces_bgr: np.ndarray,
+    faces_bgr: np.ndarray | LazyFaceSource,
     inverse_affines: Sequence[np.ndarray],
     background_bgr: np.ndarray | BgrFrameSource,
     upscale_factor: float,
@@ -584,7 +717,10 @@ def paste_faces_batch_chunked(
 
     Args:
         faces_bgr: the ``(N, 512, 512, 3)`` uint8 BGR restored faces of
-            the eligible frames.
+            the eligible frames - a numpy stack or a lazy
+            :class:`LazyFaceSource` (the round-19 path: the rows are
+            served per group, so the eligible-sized gather is never
+            built).
         inverse_affines: the ``N`` inverse warps of the paste - the
             ``cv2.invertAffineTransform(affine) * upscale_factor`` of the
             vendored ``get_inverse_affine``
@@ -652,10 +788,14 @@ def paste_faces_batch_chunked(
         ComfyUI IMAGE rows of the eligible canvas rows (``out`` when it
         is given).
     """
-    faces = np.asarray(faces_bgr)
+    # The faces speak the same provider protocol as the background (round
+    # 19, FIX 1): a lazy source is detected first - ``np.asarray`` on it
+    # would force the gather the lazy path exists to avoid - and a numpy
+    # stack keeps the old behaviour exactly (no copy for an array).
+    faces = faces_provider(faces_bgr)
     background = frame_provider(background_bgr)
     num_faces = int(faces.shape[0])
-    if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
+    if len(faces.shape) != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
         raise ValueError(
             f"paste_faces_batch_chunked expects (N, {PARSE_FACE_SIZE}, "
             f"{PARSE_FACE_SIZE}, 3) faces, got {tuple(faces.shape)}"
@@ -782,7 +922,7 @@ def paste_faces_batch_chunked(
                     return_device=True,
                 )
                 canvas = paste_faces_batch(
-                    faces[start:stop],
+                    faces.group(slice(start, stop)),
                     list(inverse_affines[start:stop]),
                     group_background,
                     device,
@@ -832,7 +972,7 @@ def paste_faces_batch_chunked(
                     return_device=True,
                 )
                 canvas = paste_faces_batch(
-                    faces[face_indices],
+                    faces.group(face_indices),
                     [inverse_affines[index] for index in face_indices],
                     group_background,
                     device,
@@ -1507,7 +1647,7 @@ def _quantize_and_clip(
 
 
 def paste_faces_batch(
-    faces_bgr: np.ndarray,
+    faces_bgr: np.ndarray | LazyFaceSource,
     inverse_affines: Sequence[np.ndarray],
     background_bgr: np.ndarray,
     device: torch.device,
@@ -1534,7 +1674,10 @@ def paste_faces_batch(
        quantizing tail of the vendored code.
 
     Args:
-        faces_bgr: the ``(N, 512, 512, 3)`` uint8 BGR restored faces.
+        faces_bgr: the ``(N, 512, 512, 3)`` uint8 BGR restored faces - a
+            numpy stack or a lazy :class:`LazyFaceSource` (the round-19
+            path: the rows are served per group, so the eligible-sized
+            gather is never built).
         inverse_affines: the ``N`` inverse warps of the paste - the
             ``cv2.invertAffineTransform(affine) * upscale_factor`` of the
             vendored ``get_inverse_affine`` (:func:`.keep_gpu_ops.inverse_affines`).
@@ -1587,13 +1730,16 @@ def paste_faces_batch(
         The pasted frames as uint8 BGR arrays - one per canvas row - or
         one uint8 BGR device tensor when ``device_output`` is set.
     """
-    faces = np.asarray(faces_bgr)
+    # The faces speak the provider protocol too (round 19, FIX 1): a lazy
+    # source is detected first (``np.asarray`` on it would force the
+    # gather), a numpy stack keeps the old behaviour exactly.
+    faces = faces_provider(faces_bgr)
     background = (
         background_bgr if torch.is_tensor(background_bgr)
         else np.asarray(background_bgr)
     )
     num_faces = int(faces.shape[0])
-    if faces.ndim != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
+    if len(faces.shape) != 4 or faces.shape[1:3] != (PARSE_FACE_SIZE, PARSE_FACE_SIZE):
         # the vendored paste resizes the face to the ParseNet size and the
         # parse mask back to the face size - the batched path keeps the
         # production size (512x512) and leaves the other sizes to the
@@ -1684,7 +1830,7 @@ def paste_faces_batch(
                 if device_output:
                     canvas[start:stop] = background_device[start:stop].to(device)
                     chunk(
-                        faces[start:stop],
+                        faces.group(slice(start, stop)),
                         list(inverse_affines[start:stop]),
                         background_device[start:stop],
                         device,
@@ -1698,7 +1844,7 @@ def paste_faces_batch(
                 else:
                     pasted.extend(
                         chunk(
-                            faces[start:stop],
+                            faces.group(slice(start, stop)),
                             list(inverse_affines[start:stop]),
                             background[start:stop],
                             device,
@@ -1733,7 +1879,7 @@ def paste_faces_batch(
             if device_output:
                 canvas[start:stop] = background_device[start:stop].to(device)
                 _paste_chunk_faces(
-                    faces[face_indices],
+                    faces.group(face_indices),
                     [inverse_affines[index] for index in face_indices],
                     [rows[index] - start for index in face_indices],
                     background_device[start:stop],
@@ -1748,7 +1894,7 @@ def paste_faces_batch(
             else:
                 pasted.extend(
                     _paste_chunk_faces(
-                        faces[face_indices],
+                        faces.group(face_indices),
                         [inverse_affines[index] for index in face_indices],
                         [rows[index] - start for index in face_indices],
                         background[start:stop],

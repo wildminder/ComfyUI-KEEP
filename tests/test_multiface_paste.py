@@ -905,3 +905,62 @@ def test_the_face_frame_map_is_validated_loudly(gpu_paste):
         gpu_paste.paste_faces_batch_chunked(
             faces_bgr=faces, inverse_affines=inverses, background_bgr=background,
             face_frame=[0, 7], **chunked_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Round 19 (FIX 1) - the multi-face core consumes the lazy face source
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_chunked_multi_face_core_consumes_the_lazy_face_source_byte_for_byte(
+    gpu_paste, gpu_ops
+):
+    """Round 19 (FIX 1): the multi-face core's IMAGE rows are unchanged.
+
+    The multi-face twin's mixed branch hands the chunked core a lazy
+    selected-rows source over the face-indexed stack instead of the
+    eligible-sized ``np.stack``.  The pin is **bit-exact**: the chunked
+    assembly over the lazy source equals the one over the old gather,
+    byte for byte, with the selected faces scattered (``[0, 2, 4]`` of a
+    5-face corpus) and the groups of two rows splitting the selection
+    across the group boundaries.
+    """
+    faces, affines, face_frame, background = _multiface_corpus(
+        gpu_ops,
+        [
+            [(0.38, 0.45, 0.28, "smooth"), (0.52, 0.45, 0.28, "smooth")],
+            [(0.5, 0.5, 0.25, "noise")],
+            [(0.25, 0.35, 0.22, "noise"), (0.75, 0.65, 0.22, "smooth")],
+        ],
+        face_seed=421,
+        bg_seed=423,
+    )
+    assert face_frame == [0, 0, 1, 2, 2], face_frame
+    selected = [0, 2, 4]
+    parse_net = _StubParseNet(seed=425)
+    inverses = gpu_ops.inverse_affines(
+        [affines[k] for k in selected], upscale_factor=1.0)
+    kwargs = dict(
+        inverse_affines=inverses,
+        background_bgr=background,
+        device=torch.device("cpu"),
+        parse_net=parse_net,
+        face_frame=[face_frame[k] for k in selected],
+        num_frames=3,
+    )
+    core_kwargs = dict(
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        canvas_hw=None,
+        frame_chunk=2,
+    )
+
+    gathered = np.stack([faces[row] for row in selected])  # the old branch
+    reference = gpu_paste.paste_faces_batch_chunked(
+        faces_bgr=gathered, **core_kwargs, **kwargs)
+    lazy = gpu_paste.paste_faces_batch_chunked(
+        faces_bgr=gpu_paste.LazyFaceSource(faces).select(selected),
+        **core_kwargs, **kwargs)
+
+    assert tuple(lazy.shape) == (3, *MULTI_CANVAS_HW, 3), lazy.shape
+    assert torch.equal(lazy, reference), "the lazy faces drifted from the gather"

@@ -1614,3 +1614,373 @@ def test_the_image_paths_release_the_helper_after_the_run(
         "inverse_affine_matrices", "all_landmarks_5",
     ):
         assert getattr(face_helper, name) == [], (case_name, name)
+
+
+# ---------------------------------------------------------------------------
+# Round 19 (FIX 1) - the mixed case builds no face gather
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_mixed_case_gathers_no_face_stack(processor_module, monkeypatch):
+    """Round 19 (FIX 1): the mixed case builds no eligible-sized face gather.
+
+    The mixed case used to copy the eligible faces once
+    (``np.stack([restored_faces[i] for i in eligible])`` - ~611 MB on the
+    owner's 776-eligible clip) although the paste core reads the faces
+    per group.  The twin's mixed branch now builds the lazy selected-rows
+    source (:class:`~.keep_gpu_paste.LazyFaceSource`) instead, and the
+    core serves the group's rows from it - a view when the group is
+    contiguous in stack space, a group-sized copy otherwise.
+
+    The pin drives the **chunked** mode (the production mode of a long
+    clip) over the round-18 mixed rig - the middle frame has no affine
+    (the LMEDS failure), so the eligible rows are scattered (``[0, 2]``)
+    - and spies the hand-off plus every ``np.stack`` of the run: the core
+    receives the lazy source (never a gathered copy) and no ``np.stack``
+    of the run carries the eligible-sized faces shape.
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    handed: list = []
+    real_chunked = paste_mod.paste_faces_batch_chunked
+
+    def recording_chunked(*args, **kwargs):
+        handed.append(kwargs.get("faces_bgr"))
+        return real_chunked(*args, **kwargs)
+
+    monkeypatch.setattr(paste_mod, "paste_faces_batch_chunked", recording_chunked)
+
+    stacks: list[tuple] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        stacks.append(tuple(int(value) for value in result.shape))
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    # the LMEDS failure of the middle frame - the mixed case
+    real_estimate_affines = processor_module.estimate_affines
+
+    def failing_estimate_affines(landmarks, template):
+        matrices = list(real_estimate_affines(landmarks, template))
+        if len(matrices) > 1:
+            matrices[1] = None
+        return matrices
+
+    monkeypatch.setattr(processor_module, "estimate_affines", failing_estimate_affines)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((3, 64, 64, 3), dtype=torch.float32)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    assert tuple(output.shape) == (3, 512, 512, 3), output.shape
+    assert len(handed) == 1 and isinstance(handed[0], paste_mod.LazyFaceSource), (
+        "the mixed case must hand the core the lazy face source, got "
+        f"{type(handed[0]) if handed else None}"
+    )
+    canvas_shape = tuple(int(value) for value in output.shape[1:])
+    gathers = [shape for shape in stacks if shape == (2, *canvas_shape)]
+    assert gathers == [], (
+        f"the eligible-sized faces gather is gone from the run, got {gathers}"
+    )
+
+
+@pytest.mark.unit
+def test_the_all_eligible_gate_keeps_the_raw_stack_and_serves_slice_views(
+    processor_module, monkeypatch
+):
+    """Round 19 (FIX 1): the all-eligible gate keeps the raw stack, views ride.
+
+    The pass-through gate (round 4, D-R2.3.2) keeps the mixed-case change
+    object-wise out of the all-eligible case: the raw restored stack is
+    handed to the core **as the ndarray it is** - the lazy source only
+    enters through the mixed branch.  And the core's numpy path serves
+    the group rows as the slice views it served before
+    (``np.shares_memory`` per group row) - no copy is reintroduced on the
+    all-eligible path.
+
+    The rig is the round-18 one with the affine failure removed - all
+    three frames batch-eligible - and the spies record the hand-off,
+    every faces group the numpy provider serves and every ``np.stack``
+    of the run (there was no eligible-sized gather before the round
+    either; the census pins the non-regression).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    handed: list = []
+    real_chunked = paste_mod.paste_faces_batch_chunked
+
+    def recording_chunked(*args, **kwargs):
+        handed.append(kwargs.get("faces_bgr"))
+        return real_chunked(*args, **kwargs)
+
+    monkeypatch.setattr(paste_mod, "paste_faces_batch_chunked", recording_chunked)
+
+    shares: list[bool] = []
+    real_group = paste_mod.NumpyFrameProvider.group
+
+    def recording_group(provider, indices):
+        rows = real_group(provider, indices)
+        if handed and provider.materialize() is handed[-1]:
+            shares.append(bool(np.shares_memory(rows, handed[-1])))
+        return rows
+
+    monkeypatch.setattr(paste_mod.NumpyFrameProvider, "group", recording_group)
+
+    stacks: list[tuple] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        stacks.append(tuple(int(value) for value in result.shape))
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((3, 64, 64, 3), dtype=torch.float32)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=20,
+    )
+
+    assert tuple(output.shape) == (3, 512, 512, 3), output.shape
+    assert len(handed) == 1 and isinstance(handed[0], np.ndarray), (
+        "the all-eligible gate must hand the raw restored stack, got "
+        f"{type(handed[0]) if handed else None}"
+    )
+    assert shares, "the numpy provider must serve the faces groups"
+    assert all(shares), f"every faces group must be a slice view: {shares}"
+    canvas_shape = tuple(int(value) for value in output.shape[1:])
+    gathers = [shape for shape in stacks if shape == (3, *canvas_shape)]
+    assert gathers == [], (
+        f"no eligible-sized gather may exist on the all-eligible path, got {gathers}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 19 (FIX 2) - the fallback tail converts per gray group
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_fallback_rows_convert_per_gray_group_across_the_boundary(
+    processor_module, monkeypatch
+):
+    """Round 19 (FIX 2), pin 4: the fallback rows convert per gray group.
+
+    The chunks_mode tail used to stack **all** fallback frames of the clip
+    and convert the whole stack in one call - an O(fallback rows) peak (the
+    stack plus the ~10x float32 conversion chain).  The tail now flushes
+    every gray group the loop advances past (the pull site) plus the last
+    group (at the tail): the group's frames stack (at most
+    ``max_clip_length`` rows), convert through the same elementwise chain
+    and land in ``final_batch`` with the **indexed write**
+    (``final_batch[rows] = value`` - the round-18 ``index_put_`` pattern;
+    the read-side would be an advanced-indexing copy).
+
+    The pin crosses a group boundary: a 6-frame clip whose frames 1-4 have
+    no affine (the round-18 mixed rig's LMEDS failure, four of them) falls
+    back on rows [1, 2, 3, 4]; with ``max_clip_length=2`` the gray groups
+    are [1, 2] and [3, 4] - two flushes.  The spy records the frames of
+    every canvas-shaped ``np.stack`` of the run; the reference is the
+    **one-shot whole-stack conversion** the old tail produced
+    (``bgr_u8_batch_to_comfy(np.stack(all four frames))``), computed here
+    from the recorded frames.  Every fallback row of ``final_batch`` must
+    be byte-equal (``torch.equal``) to its row of the reference - the
+    conversion is elementwise per row, so the pixels cannot move.
+    """
+    image_utils = importlib.import_module("ComfyUI_KEEP.src.keep_image_utils")
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    # the LMEDS failure of the frames 1-4 - the four fallback rows
+    real_estimate_affines = processor_module.estimate_affines
+
+    def failing_estimate_affines(landmarks, template):
+        matrices = list(real_estimate_affines(landmarks, template))
+        for index in range(1, 5):
+            if index < len(matrices):
+                matrices[index] = None
+        return matrices
+
+    monkeypatch.setattr(
+        processor_module, "estimate_affines", failing_estimate_affines)
+
+    # the frames of every canvas-shaped np.stack of the run - the flush's
+    # per-group stacks (the old tail's one-shot record would carry all 4)
+    groups: list[list[np.ndarray]] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        if result.ndim == 4 and result.shape[1:] == (512, 512, 3):
+            groups.append([np.array(frame) for frame in arrays])
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((6, 64, 64, 3), dtype=torch.float32)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=2,
+    )
+
+    assert tuple(output.shape) == (6, 512, 512, 3), output.shape
+    # the boundary was crossed: two group stacks of two frames each - the
+    # whole-fallback stack would be one record of four
+    assert [len(group) for group in groups] == [2, 2], (
+        f"the fallback frames must flush per gray group, got "
+        f"{[len(group) for group in groups]}")
+    # the reference: the one-shot whole-stack conversion the old tail ran
+    # (the snapshot first - the conversion below rides the same spy)
+    recorded = [list(group) for group in groups]
+    all_frames = [frame for group in recorded for frame in group]
+    reference = image_utils.bgr_u8_batch_to_comfy(np.stack(all_frames))
+    assert tuple(reference.shape) == (4, 512, 512, 3), reference.shape
+    for row, ref_row in zip((1, 2, 3, 4), range(4)):
+        assert torch.equal(output[row], reference[ref_row]), (
+            f"the fallback row {row} must be byte-equal to the one-shot "
+            f"whole-stack conversion's row {ref_row}")
+
+
+@pytest.mark.unit
+def test_the_chunks_mode_tail_builds_no_whole_fallback_stack(
+    processor_module, monkeypatch
+):
+    """Round 19 (FIX 2), pin 5: no whole-fallback stack in the chunks_mode tail.
+
+    The census pin: the same boundary rig as pin 4 (6 frames, the fallback
+    rows [1, 2, 3, 4], ``max_clip_length=2`` - two gray groups), with every
+    ``np.stack`` and every ``torch.empty`` of the run recorded.  No stack
+    may carry more rows than one gray group's fallback rows (2 here - the
+    old tail's whole-fallback record would be a 4), and the round-18
+    contract stays: exactly **one** canvas-shaped whole-clip float32
+    ``torch.empty`` exists and it **is** the returned IMAGE (the eligible
+    rows' buffer - the tail writes the fallback rows into it, it does not
+    allocate a second one).
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    real_estimate_affines = processor_module.estimate_affines
+
+    def failing_estimate_affines(landmarks, template):
+        matrices = list(real_estimate_affines(landmarks, template))
+        for index in range(1, 5):
+            if index < len(matrices):
+                matrices[index] = None
+        return matrices
+
+    monkeypatch.setattr(
+        processor_module, "estimate_affines", failing_estimate_affines)
+
+    stacks: list[tuple] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        stacks.append(tuple(int(value) for value in result.shape))
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    empties: list[tuple[tuple, torch.dtype, weakref.ref]] = []
+    real_empty = torch.empty
+
+    def recording_empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        empties.append((tuple(tensor.shape), tensor.dtype, weakref.ref(tensor)))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+
+    landmarks = (FACE_TEMPLATE_512 - 256.0) * 0.1 + np.array([48.0, 32.0])
+    face_helper = _LandmarkFaceHelper(landmarks)
+    face_helper.face_parse = _TinyParseNet()
+    face_helper.use_parse = True
+    frames = torch.rand((6, 64, 64, 3), dtype=torch.float32)
+
+    processor = processor_module.KEEPFaceProcessor(
+        _make_pack(_StubKeepNet(), face_helper)
+    )
+    output = processor.process_image_sequence(
+        image_sequence_tensor=frames,
+        final_upscale_factor=1.0,
+        has_aligned_frames=False,
+        only_center_face=True,
+        draw_box=False,
+        max_clip_length=2,
+    )
+
+    assert tuple(output.shape) == (6, 512, 512, 3), output.shape
+    canvas_shape = (512, 512, 3)
+    tail_stacks = [
+        shape for shape in stacks
+        if len(shape) == 4 and shape[1:] == canvas_shape
+    ]
+    assert tail_stacks, "the flush must stack the fallback frames"
+    assert max(shape[0] for shape in tail_stacks) <= 2, (
+        f"no tail stack may exceed one gray group's fallback rows "
+        f"(2 here), got {tail_stacks}")
+    whole_fallback = [shape for shape in tail_stacks if shape[0] == 4]
+    assert whole_fallback == [], (
+        f"the whole-fallback stack is gone from the tail, got {whole_fallback}")
+    # the round-18 conjunction: one whole-clip float32 buffer, and it is
+    # the returned IMAGE
+    float_buffers = [
+        (shape, ref) for shape, dtype, ref in empties
+        if dtype == torch.float32 and len(shape) == 4
+        and shape[1:] == canvas_shape
+    ]
+    assert len(float_buffers) == 1, (
+        f"the mixed case must hold one canvas-shaped float32 buffer, got "
+        f"{[shape for shape, _ in float_buffers]}")
+    assert float_buffers[0][0][0] == 6, (
+        f"the buffer must carry the whole clip's rows, got {float_buffers[0][0]}")
+    assert float_buffers[0][1]() is output, (
+        "the returned IMAGE must be the paste buffer itself")

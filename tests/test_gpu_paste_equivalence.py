@@ -2732,3 +2732,125 @@ def test_the_paste_wrap_moves_the_face_upscaler_to_the_device_and_back(
     assert model.moves == [torch.device("cpu"), torch.device("meta")], model.moves
     # the face upscaler ran on the 512 face (the ROI warp sampled the x2)
     assert model.calls == [(1, 3, 512, 512)], model.calls
+
+
+# ---------------------------------------------------------------------------
+# Round 19 (FIX 1) - the lazy face source (the mixed-case faces gather)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_lazy_face_source_serves_the_gather_rows_byte_for_byte(gpu_paste):
+    """Round 19 (FIX 1): the lazy source serves the old gather's rows exactly.
+
+    The mixed case used to copy the eligible faces once
+    (``np.stack([restored_faces[i] for i in eligible])``) although the
+    paste cores read the faces **per group** - on the owner's
+    776-eligible 512x512 faces that copy was ~611 MB of host RAM.  The
+    lazy :class:`~.keep_gpu_paste.LazyFaceSource` selects the rows
+    instead and serves them per group; the pin is **bit-exact**: every
+    group the source serves - a contiguous slice, a scattered list, a
+    range, one row, the whole selection - is ``np.array_equal`` to the
+    same rows of the old ``np.stack`` gather.
+
+    The view semantics ride along: a group contiguous in **stack** space
+    is the slice (a view of the caller's stack, ``np.shares_memory``), a
+    scattered one is the small advanced-index copy (no aliasing).
+    """
+    rng = np.random.default_rng(421)
+    stack = rng.integers(0, 256, size=(6, 512, 512, 3), dtype=np.uint8)
+    selected = [1, 3, 4]
+    gathered = np.stack([stack[row] for row in selected])  # the old branch
+    source = gpu_paste.LazyFaceSource(stack).select(selected)
+
+    assert source.shape == (3, 512, 512, 3), source.shape
+    assert len(source) == 3, len(source)
+    assert np.array_equal(source.group(slice(0, 2)), gathered[0:2])
+    assert np.array_equal(source.group([2]), gathered[2:])
+    assert np.array_equal(source.group(range(0, 3)), gathered)
+    assert np.array_equal(source.materialize(), gathered)
+    assert np.array_equal(source.row(1), gathered[1])
+    # the view semantics: contiguous in stack space -> the slice (a view)
+    assert np.shares_memory(source.group(slice(1, 3)), stack), (
+        "a group contiguous in stack space must be a view of the stack"
+    )
+    whole = gpu_paste.LazyFaceSource(stack)
+    assert np.shares_memory(whole.group(slice(0, 2)), stack), (
+        "a contiguous group of the whole stack must be a view"
+    )
+    # a scattered group is the small per-group copy (never the whole stack)
+    assert not np.shares_memory(source.group([0, 2]), stack), (
+        "a scattered group must be the group-sized copy, not an alias"
+    )
+
+
+@pytest.mark.unit
+def test_the_chunked_core_consumes_the_lazy_face_source_byte_for_byte(gpu_paste):
+    """Round 19 (FIX 1): the core's IMAGE rows are unchanged by the lazy faces.
+
+    The mixed case hands the chunked core a lazy selected-rows source
+    instead of the eligible-sized ``np.stack``; the pin is **bit-exact**:
+    the chunked assembly over the lazy source equals the one over the old
+    gather, byte for byte, with the eligible rows scattered (``[1, 3]``
+    of a 4-face stack) and served **one row per group** (``frame_chunk=1``)
+    - the group-sized copies replace the whole-batch one without moving a
+    pixel.
+    """
+    rng = np.random.default_rng(431)
+    stack = rng.integers(0, 256, size=(4, 512, 512, 3), dtype=np.uint8)
+    selected = [1, 3]
+    matrices = [
+        _face_to_canvas(
+            ROI_CANVAS_HW, "interior" if index % 2 == 0 else "edge", scale=0.3
+        )
+        for index in range(len(selected))
+    ]
+    background = rng.integers(
+        0, 256, size=(len(selected), *ROI_CANVAS_HW, 3), dtype=np.uint8
+    )
+    kwargs = dict(
+        inverse_affines=matrices,
+        background_bgr=background,
+        upscale_factor=1.0,
+        bg_upscale_model=None,
+        device=torch.device("cpu"),
+        canvas_hw=None,
+        parse_net=_StubParseNet(seed=437),
+        frame_chunk=1,
+    )
+
+    gathered = np.stack([stack[row] for row in selected])  # the old branch
+    reference = gpu_paste.paste_faces_batch_chunked(faces_bgr=gathered, **kwargs)
+    lazy = gpu_paste.paste_faces_batch_chunked(
+        faces_bgr=gpu_paste.LazyFaceSource(stack).select(selected), **kwargs
+    )
+
+    assert torch.equal(lazy, reference), "the lazy faces drifted from the gather"
+
+
+@pytest.mark.unit
+def test_the_face_seam_keeps_the_numpy_path_copy_free(gpu_paste):
+    """Round 19 (FIX 1): the numpy face path serves views, no copy returns.
+
+    The all-eligible pass-through gate hands the cores the raw restored
+    stack; the seam (:func:`~.keep_gpu_paste.faces_provider`) keeps that
+    path byte-identical: an array is served by the numpy provider with no
+    copy (``materialize()`` is the very array) and its contiguous group
+    is the slice view the core consumed before the seam existed.  The
+    lazy source passes through the seam untouched (``np.asarray`` on it
+    would force the gather the lazy path exists to avoid).
+    """
+    rng = np.random.default_rng(443)
+    stack = rng.integers(0, 256, size=(5, 512, 512, 3), dtype=np.uint8)
+
+    provider = gpu_paste.faces_provider(stack)
+    assert isinstance(provider, gpu_paste.NumpyFrameProvider), type(provider)
+    assert provider.materialize() is stack, "np.asarray must not copy the stack"
+    group = provider.group(slice(1, 3))
+    assert np.shares_memory(group, stack), "the contiguous group must be a view"
+    assert np.array_equal(group, stack[1:3])
+    assert np.array_equal(provider.group([2, 4]), stack[[2, 4]])
+
+    lazy = gpu_paste.LazyFaceSource(stack)
+    assert gpu_paste.faces_provider(lazy) is lazy, (
+        "the lazy source must pass through the seam untouched"
+    )

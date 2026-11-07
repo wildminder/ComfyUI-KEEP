@@ -1282,3 +1282,228 @@ def test_the_multiface_mixed_case_draws_the_boxes_on_the_final_rows(
     assert torch.equal(boxed[1], plain[1]), (
         "the fallback row must not carry a box"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round 19 (FIX 1) - the multi-face gate keeps the raw stack
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_multiface_gate_keeps_the_raw_stack(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """Round 19 (FIX 1): the multi-face gate keeps the raw stack, no gather.
+
+    The multi-face pass-through gate (the round-4 D-R2.3.2 split of the
+    sibling's) keeps the mixed-case change object-wise out of the
+    all-eligible case: the raw restored stack is handed to the core **as
+    the ndarray it is** - the lazy source only enters through the mixed
+    branch.  The branch itself is not reachable through the full sequence
+    today - the crop stage drops the ineligible faces **before** the
+    restored stack is built, so ``batch_faces`` always covers the stack -
+    and the core-level byte identity of the mixed branch is pinned in
+    ``tests/test_multiface_paste.py``.
+
+    The pin drives the full multi-face sequence in the **chunked** mode
+    over the round-18 rig (the middle frame has no face, so the eligible
+    frames are scattered ``[0, 2]`` and the restored stack carries both
+    faces) and spies the hand-off plus every ``np.stack`` of the run: the
+    core receives the raw ``(total_faces, 512, 512, 3)`` ndarray and no
+    ``np.stack`` carries the eligible-sized faces shape.
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    handed: list = []
+    real_chunked = paste_mod.paste_faces_batch_chunked
+
+    def recording_chunked(*args, **kwargs):
+        handed.append(kwargs.get("faces_bgr"))
+        return real_chunked(*args, **kwargs)
+
+    monkeypatch.setattr(paste_mod, "paste_faces_batch_chunked", recording_chunked)
+
+    stacks: list[tuple] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        stacks.append(tuple(int(value) for value in result.shape))
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    face_helper = make_helper(use_parse=True)
+    face_helper.face_parse = _StubParseNet(seed=217)
+    _attach_detector(face_helper, _SequenceDetector([[FACE_A], [], [FACE_C]]))
+    frames = _sequence_tensor(image_utils, _smooth_frames(3))
+
+    output = _run_sequence(processor_module, _KeepNet(), face_helper, frames)
+
+    assert tuple(output.shape) == (3, *FRAME_HW, 3), output.shape
+    assert len(handed) == 1 and isinstance(handed[0], np.ndarray), (
+        "the multi-face gate pin must hand the raw restored stack, got "
+        f"{type(handed[0]) if handed else None}"
+    )
+    assert not isinstance(handed[0], paste_mod.LazyFaceSource), (
+        "the gate path must not build the lazy source"
+    )
+    assert tuple(handed[0].shape) == (2, 512, 512, 3), handed[0].shape
+    gathers = [shape for shape in stacks if shape == (2, 512, 512, 3)]
+    assert gathers == [], (
+        f"no eligible-sized gather may exist on the gate path, got {gathers}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 19 (FIX 2) - the fallback tail converts per gray group (the twin)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_multiface_fallback_rows_convert_per_gray_group_across_the_boundary(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """Round 19 (FIX 2), pin 4 (the multi-face twin): per-gray-group flush.
+
+    The sibling of the single-face pin (``tests/test_keep_processor.py``):
+    the multi-face chunks_mode tail used to stack **all** fallback frames
+    and convert the whole stack in one call; it now flushes every gray
+    group the loop advances past plus the last group at the tail - the
+    group's stack (at most ``max_clip_length`` rows), the same elementwise
+    conversion, the indexed write into ``final_batch``.
+
+    The rig is the recurring no-face fallback with a boundary in it: 6
+    frames whose faces sit only on the frames 0 and 5 (the ``_SequenceDetector``
+    per-frame sets) fall back on rows [1, 2, 3, 4]; with
+    ``max_clip_length=2`` the gray groups are [1, 2] and [3, 4].  The spy
+    records the frames of every canvas-shaped ``np.stack`` of the run (the
+    fixture frames are built **before** the spy - their own stack is
+    canvas-shaped); the reference is the one-shot whole-stack conversion
+    the old tail produced, computed from the recorded frames.  Every
+    fallback row of the output must be byte-equal to its row of the
+    reference.
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    # the fixture frames first - the spy below would record their stack
+    frames = _sequence_tensor(image_utils, _smooth_frames(6))
+
+    groups: list[list[np.ndarray]] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        if result.ndim == 4 and result.shape[1:] == (*FRAME_HW, 3):
+            groups.append([np.array(frame) for frame in arrays])
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    face_helper = make_helper(use_parse=True)
+    face_helper.face_parse = _StubParseNet(seed=217)
+    _attach_detector(
+        face_helper,
+        _SequenceDetector([[FACE_A], [], [], [], [], [FACE_C]]))
+
+    output = _run_sequence(
+        processor_module, _KeepNet(), face_helper, frames, max_clip_length=2)
+
+    assert tuple(output.shape) == (6, *FRAME_HW, 3), output.shape
+    # the boundary was crossed: two group stacks of two frames each - the
+    # whole-fallback stack would be one record of four
+    assert [len(group) for group in groups] == [2, 2], (
+        f"the fallback frames must flush per gray group, got "
+        f"{[len(group) for group in groups]}")
+    # the reference: the one-shot whole-stack conversion the old tail ran
+    # (the snapshot first - the conversion below rides the same spy)
+    recorded = [list(group) for group in groups]
+    all_frames = [frame for group in recorded for frame in group]
+    reference = image_utils.bgr_u8_batch_to_comfy(np.stack(all_frames))
+    assert tuple(reference.shape) == (4, *FRAME_HW, 3), reference.shape
+    for row, ref_row in zip((1, 2, 3, 4), range(4)):
+        assert torch.equal(output[row], reference[ref_row]), (
+            f"the fallback row {row} must be byte-equal to the one-shot "
+            f"whole-stack conversion's row {ref_row}")
+
+
+@pytest.mark.unit
+def test_the_multiface_chunks_mode_tail_builds_no_whole_fallback_stack(
+    processor_module, make_helper, image_utils, monkeypatch
+):
+    """Round 19 (FIX 2), pin 5 (the multi-face twin): no whole-fallback stack.
+
+    The census pin of the sibling: the same boundary rig as the twin's
+    pin 4 (6 frames, the fallback rows [1, 2, 3, 4],
+    ``max_clip_length=2``), with every ``np.stack`` and every
+    ``torch.empty`` of the run recorded.  No stack may carry more rows than
+    one gray group's fallback rows (2 here - the old tail's whole-fallback
+    record would be a 4), and the round-18 contract stays: exactly **one**
+    canvas-shaped whole-clip float32 ``torch.empty`` exists and it **is**
+    the returned IMAGE.
+    """
+    paste_mod = importlib.import_module("ComfyUI_KEEP.src.keep_gpu_paste")
+    monkeypatch.setattr(
+        paste_mod, "device_output_mode", lambda *args, **kwargs: "chunked")
+
+    # the fixture frames first - the spy below would record their stack
+    frames = _sequence_tensor(image_utils, _smooth_frames(6))
+
+    stacks: list[tuple] = []
+    real_stack = np.stack
+
+    def recording_stack(arrays, *args, **kwargs):
+        result = real_stack(arrays, *args, **kwargs)
+        stacks.append(tuple(int(value) for value in result.shape))
+        return result
+
+    monkeypatch.setattr(np, "stack", recording_stack)
+
+    empties: list[tuple[tuple, torch.dtype, weakref.ref]] = []
+    real_empty = torch.empty
+
+    def recording_empty(*args, **kwargs):
+        tensor = real_empty(*args, **kwargs)
+        empties.append((tuple(tensor.shape), tensor.dtype, weakref.ref(tensor)))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+
+    face_helper = make_helper(use_parse=True)
+    face_helper.face_parse = _StubParseNet(seed=217)
+    _attach_detector(
+        face_helper,
+        _SequenceDetector([[FACE_A], [], [], [], [], [FACE_C]]))
+
+    output = _run_sequence(
+        processor_module, _KeepNet(), face_helper, frames, max_clip_length=2)
+
+    assert tuple(output.shape) == (6, *FRAME_HW, 3), output.shape
+    canvas_shape = (*FRAME_HW, 3)
+    tail_stacks = [
+        shape for shape in stacks
+        if len(shape) == 4 and shape[1:] == canvas_shape
+    ]
+    assert tail_stacks, "the flush must stack the fallback frames"
+    assert max(shape[0] for shape in tail_stacks) <= 2, (
+        f"no tail stack may exceed one gray group's fallback rows "
+        f"(2 here), got {tail_stacks}")
+    whole_fallback = [shape for shape in tail_stacks if shape[0] == 4]
+    assert whole_fallback == [], (
+        f"the whole-fallback stack is gone from the tail, got {whole_fallback}")
+    # the round-18 conjunction: one whole-clip float32 buffer, and it is
+    # the returned IMAGE
+    float_buffers = [
+        (shape, ref) for shape, dtype, ref in empties
+        if dtype == torch.float32 and len(shape) == 4
+        and shape[1:] == canvas_shape
+    ]
+    assert len(float_buffers) == 1, (
+        f"the mixed case must hold one canvas-shaped float32 buffer, got "
+        f"{[shape for shape, _ in float_buffers]}")
+    assert float_buffers[0][0][0] == 6, (
+        f"the buffer must carry the whole clip's rows, got {float_buffers[0][0]}")
+    assert float_buffers[0][1]() is output, (
+        "the returned IMAGE must be the paste buffer itself")

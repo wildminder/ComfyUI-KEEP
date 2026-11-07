@@ -174,6 +174,65 @@ def _core_background(background):
     return background.materialize()
 
 
+def _flush_fallback_group(final_batch,
+                          group_rows: list[int],
+                          output_frames_cv2: list,
+                          fallback_indices: list[int]) -> None:
+    """Round 19 (FIX 2): one consumed gray group's fallback frames -> the buffer.
+
+    The chunks_mode tail used to stack **all** fallback frames of the clip
+    and convert the whole stack in one ``bgr_u8_batch_to_comfy`` call - the
+    chain peaks at about 10x the stack bytes (the stack 1x, the RGB gather
+    1x, the float32 cast 4x, the ``/255`` 4x), so the peak scaled with the
+    fallback count.  The fallback loop already consumes the frames per gray
+    group (``_fallback_gray_groups`` - at most ``max_clip_length`` rows per
+    group); this flush converts **that group** at the moment the loop
+    advances past it, so at most one group's frames, its stack and its
+    conversion transient are ever alive - independent of the fallback
+    count.  The conversion is the same elementwise chain, so a row's bytes
+    cannot move (the conversion is batch-invariant, pinned round 19).
+
+    The write is the **indexed write** (``final_batch[rows] = value`` - the
+    round-18 ``index_put_`` pattern of ``comfy_convert_out``'s ``out_rows``
+    seam): in place, into the named rows.  The read-side ``final_batch[rows]``
+    would be advanced indexing - a copy - and the rows would be lost.
+
+    Every fallback row appends exactly one frame (and its row number) to
+    ``output_frames_cv2`` / ``fallback_indices``, in clip order, and a gray
+    group is a consecutive chunk of the fallback rows - so when the loop
+    advances past a group, that group's frames are the **last**
+    ``len(group_rows)`` entries of the lists.  The flush takes exactly those,
+    writes them into the group's rows and trims them off the lists - the
+    converted frames are freed and only the pending group stays collected.
+    The lists keep the one-frame-per-fallback-row alignment the other
+    output tails (the device canvas and the host) read.
+
+    Args:
+        final_batch: the whole-clip float32 IMAGE buffer (the eligible rows
+            are already in it - the tail writes only the fallback rows).
+        group_rows: the consumed group's row numbers, in clip order.
+        output_frames_cv2: the collected fallback frames (the group's are
+            the last ``len(group_rows)``); trimmed by the flush.
+        fallback_indices: the row numbers of the collected frames; trimmed
+            in step (the alignment of the other tails is kept).
+    """
+    count = len(group_rows)
+    if not count:
+        # the defensive empty group (no fallback row at all): nothing
+        # collected, nothing to write.
+        return
+    pending = len(output_frames_cv2) - count
+    if pending < 0 or len(fallback_indices) != len(output_frames_cv2):
+        raise RuntimeError(
+            f"the fallback bookkeeping drifted: {len(output_frames_cv2)} "
+            f"frames for {len(fallback_indices)} indices "
+            f"(the group holds {count} rows)")
+    final_batch[group_rows] = bgr_u8_batch_to_comfy(
+        np.stack(output_frames_cv2[pending:]))
+    del output_frames_cv2[pending:]
+    del fallback_indices[pending:]
+
+
 class KEEPFaceProcessor:
     def __init__(self, model_pack):
         self.keep_net = model_pack.keep_net
@@ -424,7 +483,14 @@ class KEEPFaceProcessor:
         if eligible == list(range(len(restored_faces))):
             faces_bgr = restored_faces
         else:
-            faces_bgr = np.stack([restored_faces[i] for i in eligible])
+            # Round 19 (FIX 1): the mixed case builds no gather copy - the
+            # lazy selected-rows source serves the core's groups (a view
+            # when the group is contiguous in stack space, a group-sized
+            # copy otherwise), so the eligible-sized np.stack of the old
+            # branch (~611 MB on the owner's mixed clip) is never alive.
+            # The pass-through gate above keeps handing the raw stack
+            # object for the all-eligible case (round 4, D-R2.3.2).
+            faces_bgr = paste_mod.LazyFaceSource(restored_faces).select(eligible)
         # The background of the batch (round 17): the **provider** of the
         # rows - the lazy source (the paste stage's path) or the numpy stack
         # (the direct-call path of the tests and the tools).  The eligible
@@ -635,7 +701,10 @@ class KEEPFaceProcessor:
         if batch_faces == list(range(len(restored_faces))):
             faces_stacked = restored_faces
         else:
-            faces_stacked = np.stack([restored_faces[k] for k in batch_faces])
+            # Round 19 (FIX 1): the multi-face split of the sibling's - the
+            # lazy selected-rows source over the face-indexed stack, no
+            # gather copy (see the sibling's comment).
+            faces_stacked = paste_mod.LazyFaceSource(restored_faces).select(batch_faces)
         # The background of the batch (round 17) - the multi-face split of
         # the sibling's: the **provider** of the rows - the lazy source (the
         # paste stage's path) or the numpy stack (the direct-call path of
@@ -1582,6 +1651,14 @@ class KEEPFaceProcessor:
                     # needs it, so only one group of uint8 frames is alive
                     # at a time.
                     while i not in group_rows:
+                        if chunks_mode:
+                            # Round 19 (FIX 2): the loop just advanced past a
+                            # gray group - the group is complete, so its
+                            # collected fallback frames convert **now** (per
+                            # group, never the whole fallback) and are freed.
+                            _flush_fallback_group(
+                                final_batch, group_rows, output_frames_cv2,
+                                fallback_indices)
                         group_rows, group_frames = next(gray_groups)
                     original_frame_bgr = group_frames[group_rows.index(i)]
                     # If the affine matrix is None, NO FACE was detected for
@@ -1686,19 +1763,30 @@ class KEEPFaceProcessor:
             # The lazy source and its last group are the paste stage's
             # scratch (round 17) - release them before the convert-out
             # tails (D-R2.3.6).
+            # Round 19 (FIX 2): in the chunked device mode the last gray
+            # group's collected fallback frames convert **here** - before
+            # the group bookkeeping is released (the flush reads the last
+            # group's rows).  The loop already flushed every group it
+            # advanced past; the last group is the only one still pending.
+            if chunks_mode:
+                _flush_fallback_group(
+                    final_batch, group_rows, output_frames_cv2,
+                    fallback_indices)
             del gray_groups, group_rows, group_frames
             del frame_source
             # The batched convert-out (design section 7.8): one stack and one
             # transfer, where the per-frame loop made a tensor per frame.
             if chunks_mode:
-                # the chunked device mode: the eligible rows are already IMAGE
-                # rows of final_batch; the vendored-fallback frames are still
-                # host arrays - one stack and one conversion written into the
-                # fallback rows (never per-frame transfers; the conversion is
-                # the same elementwise chain the device convert-out runs)
-                if output_frames_cv2:
-                    final_batch[fallback_indices] = bgr_u8_batch_to_comfy(
-                        np.stack(output_frames_cv2))
+                # Round 19 (FIX 2): the chunked device mode converts the
+                # vendored-fallback frames **per gray group** - the pull
+                # site flushed every group the loop advanced past and the
+                # flush above wrote the last group's rows.  The
+                # whole-fallback stack and the whole-stack float32
+                # conversion are gone: the peak is one group's stack plus
+                # its conversion transient (<= max_clip_length rows),
+                # independent of the fallback count.  The other output modes
+                # keep the whole-stack form below (they are not the
+                # production chunked path).
                 return final_batch
             if device_canvas_mode:
                 # F1: the fallback frames are still host arrays - one stacked
@@ -2139,6 +2227,14 @@ class KEEPFaceProcessor:
                     # needs it, so only one group of uint8 frames is alive
                     # at a time.
                     while i not in group_rows:
+                        if chunks_mode:
+                            # Round 19 (FIX 2): the loop just advanced past a
+                            # gray group - the group is complete, so its
+                            # collected fallback frames convert **now** (per
+                            # group, never the whole fallback) and are freed.
+                            _flush_fallback_group(
+                                final_batch, group_rows, output_frames_cv2,
+                                fallback_indices)
                         group_rows, group_frames = next(gray_groups)
                     original_frame_bgr = group_frames[group_rows.index(i)]
                     # The background short-circuit (the owner's fix 4,
@@ -2221,18 +2317,30 @@ class KEEPFaceProcessor:
             # The lazy source and its last group are the paste stage's
             # scratch (round 17) - release them before the convert-out
             # tails (D-R2.3.6).
+            # Round 19 (FIX 2): in the chunked device mode the last gray
+            # group's collected fallback frames convert **here** - before
+            # the group bookkeeping is released (the flush reads the last
+            # group's rows).  The loop already flushed every group it
+            # advanced past; the last group is the only one still pending.
+            if chunks_mode:
+                _flush_fallback_group(
+                    final_batch, group_rows, output_frames_cv2,
+                    fallback_indices)
             del gray_groups, group_rows, group_frames
             del frame_source
             # The batched convert-out (design section 7.8): one stack and one
             # transfer, where the per-frame loop made a tensor per frame.
             if chunks_mode:
-                # the chunked device mode: the eligible rows are already IMAGE
-                # rows of final_batch; the vendored-fallback frames are still
-                # host arrays - one stack and one conversion written into the
-                # fallback rows (never per-frame transfers)
-                if output_frames_cv2:
-                    final_batch[fallback_indices] = bgr_u8_batch_to_comfy(
-                        np.stack(output_frames_cv2))
+                # Round 19 (FIX 2): the chunked device mode converts the
+                # vendored-fallback frames **per gray group** - the pull
+                # site flushed every group the loop advanced past and the
+                # flush above wrote the last group's rows.  The
+                # whole-fallback stack and the whole-stack float32
+                # conversion are gone: the peak is one group's stack plus
+                # its conversion transient (<= max_clip_length rows),
+                # independent of the fallback count.  The other output modes
+                # keep the whole-stack form below (they are not the
+                # production chunked path).
                 return final_batch
             if device_canvas_mode:
                 # F1: the fallback frames are still host arrays - one stacked
