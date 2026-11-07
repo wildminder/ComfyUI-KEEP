@@ -1,6 +1,6 @@
 [project]
 name = "ComfyUI-KEEP"
-description = "Kalman-Inspired Feature Propagation for Video Face Super-Resolution"
+description = "Video Face Super-Resolution"
 version = "2.0.0"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
@@ -54,7 +54,7 @@ markers = [
     "gpu_acceptance: Opt-in real-weight run (RUN_KEEP_E2E=1 and KEEP_MODEL_DIR)",
 ]
 
-# P1.5 - the lint gate of .github/workflows/tests.yml.
+# P1.5 - the lint gate (ruff, correctness rules only).
 # Scope decision (same as the reference pack ComfyUI-DyPE): the gate covers the
 # *correctness* rules (pyflakes F + syntax errors E9).  The vendored
 # third-party tree (modules/deps) is excluded - it is upstream code, not ours.
