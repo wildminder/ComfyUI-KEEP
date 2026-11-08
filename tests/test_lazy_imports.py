@@ -61,6 +61,17 @@ for name in (
 ):
     importlib.import_module(alias + ".src." + name)
 
+# Round 21: the alias above is *not* the default one - if the vendored
+# namespace derived from the runtime parent package, the registry module
+# would carry that name here.  It must be the fixed private name, and none
+# of the shared top-level names may be bound.
+configs = importlib.import_module(alias + ".src.keep_model_configs")
+shadowed = sorted(
+    name for name in ("basicsr", "facelib", "modules") if name in sys.modules
+)
+print("KEEP_NO_COMFY_SHADOWED:" + ",".join(shadowed))
+print("KEEP_NO_COMFY_REGISTRY:" + configs.ARCH_REGISTRY.__module__)
+
 print("KEEP_NO_COMFY_IMPORT True")
 """
 
@@ -77,7 +88,14 @@ ENGINE_MODULES = (
 
 @pytest.mark.unit
 def test_the_engines_import_without_a_comfy_server():
-    """The engines import while every ``comfy`` import is blocked."""
+    """The engines import while every ``comfy`` import is blocked.
+
+    Round 21 (AC1): the probe runs under the non-default alias
+    ``ComfyUI_KEEP_NO_COMFY``, so the vendored namespace it reports cannot
+    have derived from the runtime parent package: it must be the fixed
+    private name ``_keep_vendor``, and none of the shared top-level names
+    (``basicsr`` / ``facelib`` / ``modules``) may be bound.
+    """
     result = subprocess.run(
         [sys.executable, "-c", _NO_COMFY_PROBE, str(REPO_ROOT)],
         cwd=str(REPO_ROOT),
@@ -90,6 +108,20 @@ def test_the_engines_import_without_a_comfy_server():
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
     assert "KEEP_NO_COMFY_IMPORT True" in result.stdout, result.stdout
+    shadowed_line = next(
+        line for line in result.stdout.splitlines()
+        if line.startswith("KEEP_NO_COMFY_SHADOWED:")
+    )
+    assert shadowed_line == "KEEP_NO_COMFY_SHADOWED:", (
+        f"the engines bound a shared top-level name: {shadowed_line!r}"
+    )
+    registry_line = next(
+        line for line in result.stdout.splitlines()
+        if line.startswith("KEEP_NO_COMFY_REGISTRY:")
+    )
+    assert registry_line == (
+        "KEEP_NO_COMFY_REGISTRY:_keep_vendor.basicsr.utils.registry"
+    ), registry_line
 
 
 @pytest.mark.unit

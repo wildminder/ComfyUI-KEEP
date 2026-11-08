@@ -41,22 +41,26 @@ from .keep_logger import logger
 from .keep_progress import ProgressReporter
 from .keep_stage_progress import StageBar
 
-# Imports from vendored basicsr and facelib
+# The vendored basicsr / facelib helpers - imported through the pack-private
+# namespace (Round 21, :mod:`src.keep_vendored`): the old dual-mode pattern
+# (package-relative first, flat fallback second) bound the shared top-level
+# ``modules`` name, so on a ``sys.path`` where another root ships a
+# ``modules/`` package, first-importer-wins decided which tree the pack
+# binds.  Under ``_keep_vendor`` the trees are instantiated once per process,
+# anchored to the pack's own files, in every import mode.  A broken vendored
+# dependency still fails loudly (P2.7).
 #
 # P2.1: the vendored ``basicsr.utils.video_util`` module is deleted (it ran
 # a pip install of ``ffmpeg-python`` at import time).  Its video helpers are
 # not importable any more and the dead video path of the processor that used
 # them was removed with it (P4.7).  The image / image-sequence paths are
 # unaffected.
-#
-# P2.7: the dummy image helpers are gone - a broken vendored dependency must
-# fail loudly instead of returning ``None`` images.
-try:  # the package import (the node package is the parent package)
-    from ..modules.deps.basicsr.utils.img_util import img2tensor, tensor2img
-    from ..modules.deps.facelib.utils.misc import is_gray
-except ImportError:  # the flat import (the repository root on sys.path)
-    from modules.deps.basicsr.utils.img_util import img2tensor, tensor2img
-    from modules.deps.facelib.utils.misc import is_gray
+from .keep_vendored import vendor
+
+_img_util = vendor("basicsr.utils.img_util")
+img2tensor = _img_util.img2tensor
+tensor2img = _img_util.tensor2img
+is_gray = vendor("facelib.utils.misc").is_gray
 
 
 def _soft_empty_cache() -> bool:

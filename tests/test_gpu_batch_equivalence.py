@@ -32,6 +32,8 @@ import numpy as np
 import pytest
 import torch
 
+from src.keep_vendored import vendor  # the pack-private namespace (Round 21)
+
 #: The vendored 5-point 512 template (``face_restoration_helper.py:52-53``).
 FACE_TEMPLATE = np.array(
     [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
@@ -51,12 +53,12 @@ def image_utils():
 
 @pytest.fixture(scope="module")
 def img_util():
-    return importlib.import_module("ComfyUI_KEEP.modules.deps.basicsr.utils.img_util")
+    return vendor("basicsr.utils.img_util")
 
 
 @pytest.fixture(scope="module")
 def helper_module():
-    return importlib.import_module("ComfyUI_KEEP.modules.deps.facelib.utils.face_restoration_helper")
+    return vendor("facelib.utils.face_restoration_helper")
 
 
 @pytest.fixture()
@@ -823,7 +825,7 @@ def test_parse_forward_chunks_are_batch_invariant():
     probe cheap - the claim is resolution-independent (BatchNorm in eval
     mode uses running stats, so no cross-sample path exists).
     """
-    parsing = importlib.import_module("ComfyUI_KEEP.modules.deps.facelib.parsing.parsenet")
+    parsing = vendor("facelib.parsing.parsenet")
     net = parsing.ParseNet(in_size=256, out_size=256).eval()
     torch.manual_seed(29)
     inputs = torch.randn(8, 3, 256, 256)

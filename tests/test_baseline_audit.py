@@ -130,14 +130,16 @@ def test_utils_exposes_the_real_arch_registry(baseline_report):
     Since P2.2 the vendored tree imports completely, so the
     ``DummyArchRegistry`` fallback of ``modules/utils.py`` is not used any
     more and the registry knows the ``KEEP`` architecture.  Since P2.5 the
-    registry lives inside the node package (``..deps.basicsr``) and never
-    shadows an installed ``basicsr``.
+    registry lives inside the node package and never shadows an installed
+    ``basicsr``; since Round 21 its canonical name is the pack-private
+    ``_keep_vendor`` namespace (``src/keep_vendored.py``) - independent of
+    the alias the probe registers the pack under.
     """
     arch_registry = baseline_report["arch_registry"]
     assert arch_registry["is_stub"] is False, arch_registry
     assert arch_registry["class_name"] == "Registry", arch_registry
     assert arch_registry["module"].endswith(
-        ".modules.deps.basicsr.utils.registry"
+        "_keep_vendor.basicsr.utils.registry"
     ), arch_registry
     assert arch_registry["get_keep"] is True, arch_registry
     # the fallback block is still in the source (P2.7 removes it) but it did
@@ -150,24 +152,23 @@ def test_utils_exposes_the_real_arch_registry(baseline_report):
 def test_vendored_keep_arch_import_succeeds_after_p22():
     """(b) importing the vendored ``keep_arch`` succeeds (B2 closed).
 
-    P2.1 moved the failure to the ``diffusers`` import, P2.2 vendored the two
-    symbols into ``modules/deps/basicsr/archs/_diffusers_compat.py`` and P2.5
-    turned the vendored tree into a package of the node package - the arch is
-    imported relatively and needs neither the (unusable) diffusers package
-    nor a ``sys.path`` entry.
+    P2.1 moved the failure to the ``diffusers`` import and P2.2 vendored the
+    two symbols into ``modules/deps/basicsr/archs/_diffusers_compat.py``.
+    Since Round 21 the arch loads under the pack-private namespace
+    (``src/keep_vendored.py``) - it needs neither the (unusable) diffusers
+    package nor a ``sys.path`` entry, and the private name is the same in
+    every import mode.
     """
-    import importlib
+    from src.keep_vendored import vendor
 
-    module = importlib.import_module(
-        "ComfyUI_KEEP.modules.deps.basicsr.archs.keep_arch"
-    )
-    assert module.__name__.endswith(".modules.deps.basicsr.archs.keep_arch")
+    module = vendor("basicsr.archs.keep_arch")
+    assert module.__name__ == "_keep_vendor.basicsr.archs.keep_arch"
     # both symbols come from the vendored compat module, not from diffusers
-    assert module.FeedForward.__module__.endswith(
-        ".modules.deps.basicsr.archs._diffusers_compat"
+    assert module.FeedForward.__module__ == (
+        "_keep_vendor.basicsr.archs._diffusers_compat"
     )
-    assert module.AdaLayerNorm.__module__.endswith(
-        ".modules.deps.basicsr.archs._diffusers_compat"
+    assert module.AdaLayerNorm.__module__ == (
+        "_keep_vendor.basicsr.archs._diffusers_compat"
     )
     # the vendored packages are not top-level packages
     assert "basicsr" not in sys.modules
