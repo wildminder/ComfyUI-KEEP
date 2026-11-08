@@ -303,11 +303,12 @@ def probe(simulate_missing_ffmpeg: bool = False) -> dict:
 
     # ------------------------------------------------------------------
     # 4. the *real* (unmasked) import of the vendored KEEP arch (B1/B2)
+    #    Round 21: through the pack-private namespace (src/keep_vendored.py)
+    #    - the same one-instantiation path the pack runtime uses.
     # ------------------------------------------------------------------
     try:
-        importlib.import_module(
-            f"{sys_module_name}.modules.deps.basicsr.archs.keep_arch"
-        )
+        vendored = importlib.import_module(f"{sys_module_name}.src.keep_vendored")
+        vendored.vendor("basicsr.archs.keep_arch")
         report["arch_scan"] = {"ok": True, "error": None}
     except BaseException as exc:  # noqa: BLE001
         report["arch_scan"] = {"ok": False, "error": _exc_info(exc)}

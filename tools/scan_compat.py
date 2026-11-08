@@ -18,7 +18,12 @@ The closure is computed with a static import tracer:
 * the **eager folder scans** of the vendored ``basicsr`` packages are dynamic
   ``importlib.import_module`` loops - they are modelled explicitly (see
   :data:`EAGER_SCAN_PACKAGES`), so every matching module of those folders
-  belongs to the closure.
+  belongs to the closure;
+* the pack imports the vendored tree through the pack-private namespace
+  (Round 21, ``src/keep_vendored.py``): a ``vendor("basicsr.utils.registry")``
+  call with a **string-literal** first argument is modelled as a level-0
+  import of that vendored module (see :data:`VENDOR_PACKAGE`), so the vendored
+  tree stays in the static closure.
 
 Usage (embedded python, from the repository root):
 
@@ -54,6 +59,12 @@ ENTRY_POINTS = (
 #: ``modules/deps`` (the vendored tree is part of the node package since
 #: P2.5 - it is never put on ``sys.path``).
 VENDORED_ROOTS = ("basicsr", "facelib")
+
+#: The pack-private namespace the vendored tree is imported under (Round 21,
+#: ``src/keep_vendored.py``).  A ``vendor("...")`` argument may carry the
+#: prefix; the resolver strips it, so even a static
+#: ``import _keep_vendor.basicsr...`` resolves into ``modules/deps``.
+VENDOR_PACKAGE = "_keep_vendor"
 
 #: The vendored ``basicsr`` packages whose ``__init__.py`` scans its own folder
 #: at import time and imports every matching module **eagerly** through
@@ -216,6 +227,19 @@ def _imported_module_names(tree: ast.AST, current_file: Path) -> list[tuple[int,
             for alias in node.names:
                 if alias.name != "*":
                     imports.append((node.level or 0, base + [alias.name]))
+        elif isinstance(node, ast.Call):
+            # Round 21: ``vendor("<module>")`` (``src/keep_vendored.py``) - the
+            # vendored import behind the pack-private namespace.  Only a
+            # string-literal first argument can be modelled statically; any
+            # other form stays invisible to the tracer.
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "vendor" and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    name = arg.value
+                    if name.startswith(VENDOR_PACKAGE + "."):
+                        name = name[len(VENDOR_PACKAGE) + 1:]
+                    imports.append((0, name.split(".")))
     return imports
 
 
@@ -237,13 +261,28 @@ def _resolve(level: int, parts: list[str], current_file: Path) -> list[Path]:
         ]
     if not parts:
         return []
+    if parts[0] == VENDOR_PACKAGE:
+        # A static import of the private namespace (Round 21) resolves into
+        # the vendored tree as well; the bare private root is the deps
+        # ``__init__.py`` itself.
+        parts = parts[1:]
+        if not parts:
+            return [DEPS_DIR / "__init__.py"]
     if parts[0] not in VENDORED_ROOTS:
         return []  # third-party / ComfyUI: not our closure
-    return [
-        candidate
-        for candidate in _module_candidates(DEPS_DIR, parts)
-        if candidate.is_file()
-    ] + [parent for parent in _package_inits(DEPS_DIR, parts) if parent.is_file()]
+    # Round 21: any vendored import executes the private root's file as well
+    # (``src/keep_vendored.py`` execs ``modules/deps/__init__.py`` under
+    # ``_keep_vendor`` before any vendored module is imported), so it belongs
+    # to the closure of every vendored import.
+    return (
+        [
+            candidate
+            for candidate in _module_candidates(DEPS_DIR, parts)
+            if candidate.is_file()
+        ]
+        + [parent for parent in _package_inits(DEPS_DIR, parts) if parent.is_file()]
+        + [DEPS_DIR / "__init__.py"]
+    )
 
 
 def _has_dynamic_folder_scan(init_file: Path, suffix: str) -> bool:

@@ -61,17 +61,19 @@ utils_dir = root / "modules" / "deps" / "basicsr" / "utils"
 sys.path.insert(0, str(root))
 import conftest  # registers the package alias and the ComfyUI mocks
 
+from src.keep_vendored import vendor  # the pack-private namespace (Round 21)
+
 result = {"pip_imported": False, "modules": {}, "errors": []}
 for path in sorted(utils_dir.glob("*.py")):
     if path.name == "__init__.py":
         continue
-    name = "ComfyUI_KEEP.modules.deps.basicsr.utils." + path.stem
+    target = "basicsr.utils." + path.stem
     try:
-        importlib.import_module(name)
-        result["modules"][name] = "ok"
+        module = vendor(target)
+        result["modules"][module.__name__] = "ok"
     except BaseException as exc:  # noqa: BLE001 - the probe records everything
-        result["modules"][name] = type(exc).__name__ + ": " + str(exc)[:200]
-        result["errors"].append(name)
+        result["modules"][target] = type(exc).__name__ + ": " + str(exc)[:200]
+        result["errors"].append(target)
 print(json.dumps(result))
 """
 
@@ -128,11 +130,11 @@ root = Path(sys.argv[1])
 sys.path.insert(0, str(root))
 import conftest  # registers the package alias and the ComfyUI mocks
 
+from src.keep_vendored import vendor  # the pack-private namespace (Round 21)
+
 report = {}
 try:
-    module = importlib.import_module(
-        "ComfyUI_KEEP.modules.deps.basicsr.archs.keep_arch"
-    )
+    module = vendor("basicsr.archs.keep_arch")
 except BaseException as exc:  # noqa: BLE001 - the probe records everything
     import traceback
     report["error"] = type(exc).__name__ + ": " + str(exc)[:300]
@@ -160,16 +162,16 @@ def test_the_next_failure_after_p21_is_resolved_by_the_vendored_diffusers():
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout.strip().splitlines()[-1])
     assert "error" not in report, report
-    # the architecture imports through the package of the node
+    # the architecture imports through the pack-private namespace
     assert report["module"] == (
-        "ComfyUI_KEEP.modules.deps.basicsr.archs.keep_arch"
+        "_keep_vendor.basicsr.archs.keep_arch"
     ), report
     # B2 is resolved by the vendored copy, not by a hidden fallback
     assert report["feedforward"] == (
-        "ComfyUI_KEEP.modules.deps.basicsr.archs._diffusers_compat"
+        "_keep_vendor.basicsr.archs._diffusers_compat"
     ), report
     assert report["ada_layer_norm"] == (
-        "ComfyUI_KEEP.modules.deps.basicsr.archs._diffusers_compat"
+        "_keep_vendor.basicsr.archs._diffusers_compat"
     ), report
     # no top-level ``basicsr`` shadows an installed one (P2.5)
     assert report["basicsr_in_sys_modules"] is False, report
@@ -403,8 +405,10 @@ def test_import_basicsr_still_succeeds():
     ``modules/utils.py`` swallows into the ``DummyArchRegistry`` - the node
     would keep loading and silently lose the KEEP architecture.
 
-    Since P2.5 the package is imported relatively (it is part of the node
-    package), so it is never a top-level ``basicsr`` module.
+    Since P2.5 the package is part of the node package; since Round 21 it
+    loads under the pack-private namespace (``src/keep_vendored.py``), so
+    the import goes through the loader and the assertion also pins the
+    private name itself - it is never a top-level ``basicsr`` module.
 
     2026-11-03, keep-fix5-implement1 Phase 4.1: ``models``/``data``/
     ``losses`` are deleted; ``metrics`` and ``ops`` stay on disk but off the
@@ -412,14 +416,12 @@ def test_import_basicsr_still_succeeds():
     ``utils`` and ``version``), so exactly those two subpackages are
     asserted.
     """
-    import importlib
+    from src.keep_vendored import vendor
 
-    module = importlib.import_module("ComfyUI_KEEP.modules.deps.basicsr")
-    assert module.__name__ == "ComfyUI_KEEP.modules.deps.basicsr"
+    module = vendor("basicsr")
+    assert module.__name__ == "_keep_vendor.basicsr"
     for name in ("archs", "utils"):
-        assert importlib.import_module(
-            f"ComfyUI_KEEP.modules.deps.basicsr.{name}"
-        ) is not None
+        assert vendor(f"basicsr.{name}") is not None
     assert "basicsr" not in sys.modules
 
 
@@ -427,12 +429,10 @@ def test_import_basicsr_still_succeeds():
 @pytest.mark.unit
 def test_the_keep_architecture_is_still_registered():
     """P2.4/P2.5: the explicit arch list still registers the KEEP architecture."""
-    import importlib
+    from src.keep_vendored import vendor
 
-    importlib.import_module("ComfyUI_KEEP.modules.deps.basicsr.archs")
-    registry = importlib.import_module(
-        "ComfyUI_KEEP.modules.deps.basicsr.utils.registry"
-    )
+    vendor("basicsr.archs")  # the explicit arch list runs the registrations
+    registry = vendor("basicsr.utils.registry")
     assert registry.ARCH_REGISTRY.get("KEEP").__name__ == "KEEP"
 
 
@@ -440,8 +440,12 @@ def test_the_keep_architecture_is_still_registered():
 # P2.5 - the vendored tree is a package of the node package
 # ---------------------------------------------------------------------------
 
-#: The vendored packages inside the node package.
-VENDORED = "ComfyUI_KEEP.modules.deps"
+#: The canonical name of the vendored packages - the pack-private namespace
+#: (Round 21).  It does not derive from the name the host registers the pack
+#: under, so it is the same in every import mode (the V3 package mode, the
+#: pytest alias mode, the headless alias mode) and the tree instantiates
+#: exactly once per process.
+VENDORED = "_keep_vendor"
 
 #: P2.5 (a): every module of ``modules/deps`` imports - with pip blocked and
 #: without touching the network (no import of the vendored tree downloads
@@ -454,7 +458,12 @@ root = Path(sys.argv[1])
 sys.path.insert(0, str(root))
 import conftest  # registers the package alias and the ComfyUI mocks
 
-import ComfyUI_KEEP.modules.deps as deps
+# Round 21: the walk runs over the pack-private namespace - the loader
+# anchors the private root to the pack's own ``modules/deps`` files.
+from src.keep_vendored import _ensure_vendor_root
+
+_ensure_vendor_root()
+deps = sys.modules["_keep_vendor"]
 
 failures = []
 for info in pkgutil.walk_packages(deps.__path__, deps.__name__ + "."):
@@ -462,7 +471,7 @@ for info in pkgutil.walk_packages(deps.__path__, deps.__name__ + "."):
     # import path - the package init no longer imports it and its files
     # import deleted utils (matlab_functions, color_util); the folder stays
     # on disk, so the walk skips it deliberately.
-    if info.name.startswith("ComfyUI_KEEP.modules.deps.basicsr.metrics"):
+    if info.name.startswith("_keep_vendor.basicsr.metrics"):
         continue
     try:
         importlib.import_module(info.name)
@@ -502,11 +511,16 @@ def test_every_vendored_module_imports_without_pip():
 
 @pytest.mark.unit
 def test_the_vendored_packages_never_enter_sys_modules():
-    """P2.5 (b): ``basicsr`` / ``facelib`` are not top-level modules."""
-    import importlib
+    """P2.5 (b): ``basicsr`` / ``facelib`` are not top-level modules.
 
-    importlib.import_module(f"{VENDORED}.basicsr")
-    importlib.import_module(f"{VENDORED}.facelib")
+    Since Round 21 the packages load under the pack-private namespace: the
+    import goes through the loader, so the private name (and only it) lands
+    in ``sys.modules``.
+    """
+    from src.keep_vendored import vendor
+
+    assert vendor("basicsr").__name__ == f"{VENDORED}.basicsr"
+    assert vendor("facelib").__name__ == f"{VENDORED}.facelib"
     assert "basicsr" not in sys.modules
     assert "basicsr.utils" not in sys.modules
     assert "facelib" not in sys.modules
@@ -604,9 +618,13 @@ _HOST_MODULES = ("comfy", "comfy_api", "folder_paths", "app", "utils")
 _VENDORED_MODULES = ("basicsr", "facelib")
 
 #: The pack's own top-level packages - they are part of this repository, not
-#: a distribution.  ``modules`` shows up in the closure through the flat
-#: import fallback of the dual-mode imports (``from modules.deps...``).
-_OWN_PACKAGES = ("modules", "src", "nodes")
+#: a distribution.  Since Round 21 ``modules`` is deliberately **absent**
+#: from this set: the vendored tree loads under ``_keep_vendor`` and nothing
+#: imports the shared top-level ``modules`` name any more.  If the flat
+#: fallback ever came back, the closure import would no longer be excluded
+#: and the declared-set check below would fail loudly instead of silently
+#: tolerating the regression.
+_OWN_PACKAGES = ("src", "nodes")
 
 #: The third-party modules the closure imports **lazily** (inside a
 #: function).  They are not runtime dependencies of the node, so they are not
@@ -830,20 +848,20 @@ def test_the_stub_sites_yield_the_real_vendored_symbols():
     loader = importlib.import_module("ComfyUI_KEEP.src.keep_model_loader")
 
     assert utils.ARCH_REGISTRY.__module__.endswith(
-        ".modules.deps.basicsr.utils.registry"
+        "_keep_vendor.basicsr.utils.registry"
     )
     # P4.7: the ``load_file_from_url`` import of the config module was dead
     # (the downloads run through ``src/keep_paths.py``) - it is gone.
     assert not hasattr(utils, "load_file_from_url")
     assert processor.img2tensor.__module__.endswith(
-        ".modules.deps.basicsr.utils.img_util"
+        "_keep_vendor.basicsr.utils.img_util"
     )
     assert processor.tensor2img.__module__.endswith(
-        ".modules.deps.basicsr.utils.img_util"
+        "_keep_vendor.basicsr.utils.img_util"
     )
-    assert processor.is_gray.__module__.endswith(".modules.deps.facelib.utils.misc")
+    assert processor.is_gray.__module__.endswith("_keep_vendor.facelib.utils.misc")
     assert loader.FaceRestoreHelper.__module__.endswith(
-        ".modules.deps.facelib.utils.face_restoration_helper"
+        "_keep_vendor.facelib.utils.face_restoration_helper"
     )
     # the dummy fallbacks are gone
     assert not hasattr(utils, "DummyArchRegistry")
@@ -959,12 +977,12 @@ def test_no_import_fallback_stub_remains_in_the_vendored_tree():
 @pytest.mark.unit
 def test_the_facelib_model_helpers_use_the_vendored_download_util():
     """P2.7: the facelib detection / parsing helpers use the vendored symbol."""
-    import importlib
+    from src.keep_vendored import vendor
 
     for name in ("detection", "parsing"):
-        module = importlib.import_module(f"ComfyUI_KEEP.modules.deps.facelib.{name}")
+        module = vendor(f"facelib.{name}")
         assert module.load_file_from_url.__module__ == (
-            "ComfyUI_KEEP.modules.deps.basicsr.utils.download_util"
+            "_keep_vendor.basicsr.utils.download_util"
         ), module.load_file_from_url
 
 
@@ -988,3 +1006,366 @@ def test_the_vendored_tree_never_mutates_sys_path():
                     f"{line.strip()}"
                 )
     assert offenders == [], offenders
+
+
+# ---------------------------------------------------------------------------
+# Round 21 - the pack-private namespace (``_keep_vendor``)
+# ---------------------------------------------------------------------------
+#
+# Since Round 21 the vendored trees are imported only through
+# ``src/keep_vendored.py`` under the pack-private name ``_keep_vendor``
+# (pip ``_vendor`` semantics): one canonical name per process, anchored to
+# the pack's own files, independent of the name the host registers the pack
+# under.  The pins of this section make the property un-rottable:
+#
+# * the vendored tree itself must stay free of the imports that would
+#   defeat the private namespace (absolute self-imports, import machinery);
+# * the pack code and the harness must never reach the shared top-level
+#   names (``modules`` everywhere, ``basicsr`` / ``facelib`` in the pack
+#   runtime);
+# * a flat engine import must bind no shared name - even on a ``sys.path``
+#   where a foreign ``modules/`` package wins (the decoy probe);
+# * the alias mode and the flat mode must share one vendored instantiation
+#   (registry identity).
+
+#: The vendored trees' own top-level names: an absolute import of one of
+#: these from **inside** ``modules/deps`` would bind the tree under a
+#: shared name instead of the private one.
+_VENDORED_ROOTS = ("basicsr", "facelib")
+
+#: The import machinery the vendored tree must not use: a dynamic import
+#: would re-resolve a module outside the private namespace (and the static
+#: closure of ``tools/scan_compat.py`` could not see it either).
+_DYNAMIC_IMPORT_CALLS = (
+    "import_module",
+    "__import__",
+    "create_module",
+    "exec_module",
+    "spec_from_file_location",
+)
+
+#: The shared top-level names banned per directory (AC4): the pack runtime
+#: may reach none of the three, the harness surface (``tools/``, ``tests/``)
+#: not the ``modules`` name - that is the name the old flat fallback bound.
+_SHARED_NAME_BAN = {
+    "src": ("modules", "basicsr", "facelib"),
+    "nodes": ("modules", "basicsr", "facelib"),
+    "tools": ("modules",),
+    "tests": ("modules",),
+}
+
+#: The §2.6 (b) exemption of the namespace ban: the machine-local GPU
+#: profiling probe keeps its three function-local flat imports
+#: (``from modules.deps... import ...``).  It is a dev-time probe,
+#: referenced by no test, ``pyproject.toml`` entry or CI workflow, and the
+#: round's ownership partition leaves it unowned - so pin 2 exempts it by
+#: explicit path with this reason.  Migrating it to the loader
+#: (design §2.6 (a)) lifts the exemption; the stale-exemption check below
+#: forces that edit.
+_PROF_TOOL_EXEMPTION = {
+    "tools/prof_gpu_video_pipeline.py": (
+        "machine-local GPU profiling probe: flat-imports the vendored trees "
+        "function-locally; not run by the tier-1 gate, not referenced by "
+        "tests/ or CI (Round 21 design §2.6 (b))"
+    ),
+}
+
+
+def _absolute_import_roots(node: ast.AST):
+    """The top-level names an absolute ``Import`` / ``ImportFrom`` reaches.
+
+    Relative imports (``level > 0``) stay inside their own tree and yield
+    nothing; string contents (docstrings, probe sources) are not import
+    statements and are never seen by the AST.
+    """
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            yield alias.name.split(".")[0]
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        yield node.module.split(".")[0]
+
+
+def _absolute_import_offenders(rel_dirs, banned_roots) -> list[str]:
+    """Every absolute import under ``rel_dirs`` reaching ``banned_roots``."""
+    offenders = []
+    for rel_dir in rel_dirs:
+        for path in sorted((REPO_ROOT / rel_dir).rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                for root_name in _absolute_import_roots(node):
+                    if root_name in banned_roots:
+                        offenders.append(f"{rel}:{node.lineno} {root_name}")
+    return offenders
+
+
+def _dynamic_import_offenders() -> list[str]:
+    """Every use of the import machinery inside the vendored tree."""
+    offenders = []
+    for path in sorted(DEPS_DIR.rglob("*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = (
+                    func.attr if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", None)
+                )
+                if name in _DYNAMIC_IMPORT_CALLS:
+                    offenders.append(f"{rel}:{node.lineno} {name}()")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "importlib.util" or (
+                        alias.name == "importlib"
+                        and any(a.name == "util" for a in node.names)
+                    ):
+                        offenders.append(f"{rel}:{node.lineno} {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and (
+                node.module == "importlib.util"
+                or (
+                    node.module == "importlib"
+                    and any(a.name == "util" for a in node.names)
+                )
+            ):
+                offenders.append(f"{rel}:{node.lineno} importlib.util")
+    return offenders
+
+
+@pytest.mark.unit
+def test_no_absolute_self_import_or_import_machinery_remains_in_the_vendored_tree():
+    """AC2, Round 21: the vendored tree cannot escape the private namespace.
+
+    Under ``_keep_vendor`` the trees' own imports must stay relative (the
+    private root's ``__path__`` carries the subpackages) and the trees must
+    not use the import machinery: a dynamic import would re-resolve a
+    module under a shared name and defeat the one-instantiation property.
+    The scan is AST based, so the commented absolute import at
+    ``facelib/utils/misc.py:9`` is not an offender.
+    """
+    absolute = _absolute_import_offenders(["modules/deps"], _VENDORED_ROOTS)
+    assert absolute == [], (
+        "the vendored tree imports itself under a shared top-level name: "
+        f"{absolute}"
+    )
+    dynamic = _dynamic_import_offenders()
+    assert dynamic == [], (
+        f"the vendored tree uses the import machinery: {dynamic}"
+    )
+
+
+@pytest.mark.unit
+def test_no_pack_code_reaches_the_shared_top_level_names():
+    """AC4, Round 21: the pack imports none of the shared names - in any mode.
+
+    The ban covers ``src/``, ``nodes/``, ``tools/`` and ``tests/``: no
+    absolute import may reach the top-level ``modules`` name (the name the
+    old dual-mode flat fallback bound - first-importer-wins decided which
+    tree the pack got), and the pack runtime (``src/``, ``nodes/``) may not
+    reach ``basicsr`` / ``facelib`` either.  After the Round 21 migration
+    the count is zero; the one exemption is recorded with its reason.
+    """
+    exempt = set(_PROF_TOOL_EXEMPTION)
+    offenders = _absolute_import_offenders(
+        ["src", "nodes", "tools", "tests"], {"modules"}
+    )
+    offenders += _absolute_import_offenders(["src", "nodes"], {"basicsr", "facelib"})
+    remaining = [off for off in offenders if off.split(":")[0] not in exempt]
+    assert remaining == [], (
+        "pack code reaches a shared top-level name; every hit must move to "
+        f"the pack-private namespace (src/keep_vendored.py): {remaining}"
+    )
+    # the exemption is not a permanent hole: when the prof tool migrates,
+    # the stale entry forces this one-set edit instead of hiding silently
+    stale = sorted(
+        path for path in exempt
+        if not any(off.split(":")[0] == path for off in offenders)
+    )
+    assert stale == [], (
+        "the namespace-ban exemption is stale (the file no longer imports a "
+        f"shared name) - drop it from _PROF_TOOL_EXEMPTION: {stale}"
+    )
+
+
+#: The flat decoy probe (AC3 flat / AC4): a foreign ``modules/`` package on
+#: ``sys.path`` (the decoy) must win nothing the pack binds, and the pack's
+#: vendored tree must still come from the pack's own files.  The flat
+#: engine mode itself stays (the design keeps it - no launcher can be
+#: *proven* to never import flat), so the probe proves the safe half: after
+#: the engine imports, ``import modules`` reaches the **decoy**.
+_FLAT_DECOY_PROBE = """\
+import importlib, json, sys, types
+
+decoy_root, repo_root = sys.argv[1], sys.argv[2]
+
+# The decoy root FIRST, the repository second: on this sys.path a flat
+# import of every shared name the decoy ships would resolve into the decoy
+# - unless the pack really stopped binding them (Round 21).
+sys.path.insert(0, decoy_root)
+sys.path.append(repo_root)
+
+# The vendored face_restoration_helper imports ``comfy`` at module level;
+# the probe has no server, so a minimal stand-in covers the two names it
+# imports (the real host provides them in every real import mode).
+comfy = types.ModuleType("comfy")
+model_management = types.ModuleType("comfy.model_management")
+comfy_utils = types.ModuleType("comfy.utils")
+comfy_utils.tiled_scale = lambda *args, **kwargs: None
+comfy.model_management = model_management
+comfy.utils = comfy_utils
+sys.modules["comfy"] = comfy
+sys.modules["comfy.model_management"] = model_management
+sys.modules["comfy.utils"] = comfy_utils
+
+import src.keep_model_configs as configs
+import src.keep_processor as processor
+import src.keep_model_loader as loader
+
+shadowed = sorted(
+    name for name in ("modules", "basicsr", "facelib") if name in sys.modules
+)
+report = {
+    "shadowed": shadowed,
+    "registry_module": type(configs.ARCH_REGISTRY).__module__,
+    "keep_registered": configs.ARCH_REGISTRY.get("KEEP") is not None,
+    "img2tensor_module": processor.img2tensor.__module__,
+    "face_helper_module": loader.FaceRestoreHelper.__module__,
+    "flat_engine_imported": "src.keep_model_configs" in sys.modules,
+}
+print("KEEP_FLAT_DECOY:" + json.dumps(report))
+
+# The pack bound no shared name - a flat import NOW must reach the decoy,
+# not the pack's own modules/ package.
+import modules
+print("KEEP_FLAT_DECOY_DECOY:" + str(getattr(modules, "KEEP_DECOY", False)))
+"""
+
+
+@pytest.mark.unit
+def test_the_flat_engine_imports_bind_no_shared_name_and_the_decoy_survives(tmp_path):
+    """AC3 (flat) / AC4: a foreign ``modules/`` package wins nothing.
+
+    The probe builds a decoy tree (``modules/__init__.py`` and
+    ``modules/deps/__init__.py``, each with a marker constant), puts the
+    decoy root **first** on ``sys.path`` and the repository second, and
+    flat-imports the three engines.  Assertions:
+
+    * no top-level ``modules`` / ``basicsr`` / ``facelib`` is in
+      ``sys.modules`` after the engine imports - the pack bound none of
+      the shared names (``"src"`` *is* imported: the flat engine mode
+      still works, from the repository);
+    * the registry and the vendored symbols come from the private
+      namespace, and the KEEP architecture is registered - the pack's own
+      files won, not the decoy;
+    * ``import modules`` afterwards binds the **decoy** (marker found) -
+      the pack imported first without shadowing the shared name.
+    """
+    decoy_root = tmp_path / "decoy-root"
+    (decoy_root / "modules" / "deps").mkdir(parents=True)
+    (decoy_root / "modules" / "__init__.py").write_text(
+        "KEEP_DECOY = True\n", encoding="utf-8"
+    )
+    (decoy_root / "modules" / "deps" / "__init__.py").write_text(
+        "KEEP_DECOY_DEPS = True\n", encoding="utf-8"
+    )
+
+    result = _run_python(_FLAT_DECOY_PROBE, str(decoy_root), str(REPO_ROOT))
+    assert result.returncode == 0, (
+        f"the flat decoy probe failed\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    sentinel = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("KEEP_FLAT_DECOY:")
+    ]
+    assert sentinel, (
+        f"the probe produced no report\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    report = json.loads(sentinel[-1].split(":", 1)[1])
+    assert report["shadowed"] == [], report
+    assert report["registry_module"] == "_keep_vendor.basicsr.utils.registry", report
+    assert report["keep_registered"] is True, report
+    assert report["img2tensor_module"].startswith("_keep_vendor.basicsr"), report
+    assert report["face_helper_module"].startswith("_keep_vendor.facelib"), report
+    assert report["flat_engine_imported"] is True, report
+    # the pack did not shadow the shared name: the decoy wins a flat import
+    assert "KEEP_FLAT_DECOY_DECOY:True" in result.stdout, result.stdout
+
+
+#: The registry-identity probe (AC3): the alias mode and the flat mode in
+#: **one** interpreter must share the one vendored instantiation.  This is
+#: the collision the round closes - two engine copies that each built their
+#: own vendored tree would carry two ``ARCH_REGISTRY`` objects, and the
+#: second execution of ``keep_arch`` fails the registry's duplicate assert.
+_REGISTRY_IDENTITY_PROBE = """\
+import importlib, json, sys
+
+root = sys.argv[1]
+sys.path.insert(0, root)
+import conftest  # registers the package alias and the ComfyUI mocks
+
+alias_configs = importlib.import_module("ComfyUI_KEEP.src.keep_model_configs")
+flat_configs = importlib.import_module("src.keep_model_configs")
+alias_processor = importlib.import_module("ComfyUI_KEEP.src.keep_processor")
+flat_processor = importlib.import_module("src.keep_processor")
+alias_loader = importlib.import_module("ComfyUI_KEEP.src.keep_model_loader")
+flat_loader = importlib.import_module("src.keep_model_loader")
+
+report = {
+    "vendor_roots": [n for n in sys.modules if n == "_keep_vendor"],
+    "registry_entries": [
+        n for n in sys.modules if n == "_keep_vendor.basicsr.utils.registry"
+    ],
+    "registry_module": type(alias_configs.ARCH_REGISTRY).__module__,
+    "same_registry_object": (
+        alias_configs.ARCH_REGISTRY is flat_configs.ARCH_REGISTRY
+    ),
+    "same_img2tensor": alias_processor.img2tensor is flat_processor.img2tensor,
+    "same_face_helper": (
+        alias_loader.FaceRestoreHelper is flat_loader.FaceRestoreHelper
+    ),
+    "shared_names_bound": sorted(
+        n for n in sys.modules if n in ("modules", "ComfyUI_KEEP.modules")
+    ),
+}
+print("KEEP_REGISTRY_IDENTITY:" + json.dumps(report))
+"""
+
+
+@pytest.mark.unit
+def test_the_alias_mode_and_the_flat_mode_share_one_vendored_instantiation():
+    """AC3: two import modes, one vendored tree, one ``ARCH_REGISTRY``.
+
+    The probe imports the engines under the pytest alias **and** flat in a
+    single interpreter - the suite's other probes never mix the two modes.
+    Both engine copies must hold the same vendored objects: exactly one
+    ``_keep_vendor`` root in ``sys.modules``, exactly one registry module
+    entry, and object identity across the copies (the registry's duplicate
+    assert would have failed the probe on a second instantiation).
+    """
+    result = _run_python(_REGISTRY_IDENTITY_PROBE, str(REPO_ROOT))
+    assert result.returncode == 0, (
+        f"the registry-identity probe failed\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    sentinel = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("KEEP_REGISTRY_IDENTITY:")
+    ]
+    assert sentinel, (
+        f"the probe produced no report\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    report = json.loads(sentinel[-1].split(":", 1)[1])
+    assert report["vendor_roots"] == ["_keep_vendor"], report
+    assert report["registry_entries"] == ["_keep_vendor.basicsr.utils.registry"], (
+        report
+    )
+    assert report["registry_module"] == "_keep_vendor.basicsr.utils.registry", report
+    assert report["same_registry_object"] is True, report
+    assert report["same_img2tensor"] is True, report
+    assert report["same_face_helper"] is True, report
+    assert report["shared_names_bound"] == [], report

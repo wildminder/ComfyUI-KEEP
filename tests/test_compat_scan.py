@@ -260,11 +260,18 @@ def test_audit_doc_lists_every_finding(scanner):
 
 #: Imports every module of the runtime closure in a **fresh** interpreter (the
 #: import must not leak into the pytest session) and reports the failures.
+#: Since Round 21 the vendored part of the closure is imported under the
+#: pack-private namespace: the loader anchors the private root first, then
+#: the walk imports every closure module by its private name.
 _CLOSURE_IMPORT_SCRIPT = """\
 import importlib, json, sys
 
 sys.path.insert(0, sys.argv[1])
 import conftest  # registers the package alias and the ComfyUI mocks
+
+from src.keep_vendored import _ensure_vendor_root
+
+_ensure_vendor_root()  # the private root, before the closure walk below
 
 failures = []
 for name in json.loads(sys.argv[2]):
@@ -277,7 +284,12 @@ print("KEEP_CLOSURE_FAILURES:" + json.dumps(failures))
 
 
 def _closure_module_names(report):
-    """The importable module names of the vendored part of the closure."""
+    """The private-namespace names of the vendored part of the closure.
+
+    Since Round 21 the vendored tree lives under ``_keep_vendor``
+    (``src/keep_vendored.py``) - the closure walk imports it by that name,
+    the same name the pack runtime binds.
+    """
     names = []
     for rel in report["closure_files"]:
         if not rel.startswith("modules/deps/"):
@@ -285,7 +297,7 @@ def _closure_module_names(report):
         dotted = rel[len("modules/deps/"):].replace("/", ".").removesuffix(".py")
         if dotted.endswith(".__init__"):
             dotted = dotted[: -len(".__init__")]
-        names.append("ComfyUI_KEEP.modules.deps." + dotted)
+        names.append("_keep_vendor." + dotted)
     return names
 
 

@@ -24,6 +24,8 @@ import pytest
 import torch
 from PIL import Image
 
+from src.keep_vendored import vendor  # the pack-private namespace (Round 21)
+
 #: The size of the borderline frame - 64x64 is divisible by 8, so the
 #: three-eighths split of the construction is exact.
 BORDERLINE_HW = (64, 64)
@@ -36,7 +38,7 @@ def gpu_paste():
 
 @pytest.fixture(scope="module")
 def misc_module():
-    return importlib.import_module("ComfyUI_KEEP.modules.deps.facelib.utils.misc")
+    return vendor("facelib.utils.misc")
 
 
 @pytest.fixture(scope="module")

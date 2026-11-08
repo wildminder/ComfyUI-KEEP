@@ -18,18 +18,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# directly import from the vendored basicsr
-#
-# P2.7: the swallow-and-stub fallback is gone.  A broken vendored dependency
-# must fail loudly - the dummy registry hid the missing KEEP architecture and
-# the node kept loading without it.
+# The vendored basicsr registry - imported through the pack-private
+# namespace (Round 21, :mod:`src.keep_vendored`).  The old dual-mode pattern
+# (package-relative first, flat fallback second) bound the shared top-level
+# ``modules`` name, so on a ``sys.path`` where another root ships a
+# ``modules/`` package, first-importer-wins decided which tree - and with it
+# which ``ARCH_REGISTRY`` object - the pack binds.  Under ``_keep_vendor``
+# the tree is instantiated once per process, anchored to the pack's own
+# files, in every import mode.  A broken vendored dependency still fails
+# loudly (P2.7).
 #
 # P4.7: the unused ``load_file_from_url`` import is gone - the downloads run
 # through ``src/keep_download.py`` (the manifest-driven downloader of P5.2).
-try:  # the package import (the node package is the parent package)
-    from ..modules.deps.basicsr.utils.registry import ARCH_REGISTRY
-except ImportError:  # the flat import (the repository root on sys.path)
-    from modules.deps.basicsr.utils.registry import ARCH_REGISTRY
+from .keep_vendored import vendor
+
+ARCH_REGISTRY = vendor("basicsr.utils.registry").ARCH_REGISTRY
 
 
 @dataclass(frozen=True)

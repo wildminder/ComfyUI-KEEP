@@ -52,6 +52,7 @@ from .keep_model_configs import (
     WeightEntry,
     weight_entry_for,
 )
+from .keep_vendored import vendor
 
 #: The name of the GMFlow manifest entry (the defensive flow weights).
 GMFLOW_WEIGHT_NAME = "gmflow_sintel-0c07dcb3.pth"
@@ -62,14 +63,14 @@ GMFLOW_WEIGHT_NAME = "gmflow_sintel-0c07dcb3.pth"
 def _face_restore_helper():
     """The vendored ``FaceRestoreHelper`` - imported **lazily**.
 
-    The vendored facelib imports ``comfy`` at module level, so the import
-    must not run while ``src.keep_model_loader`` is imported.
+    The vendored facelib imports ``comfy`` at module level, so the vendored
+    module must not execute while ``src.keep_model_loader`` is imported -
+    the call below does it only when the attribute is really read.  The
+    module itself comes from the pack-private namespace (Round 21,
+    :mod:`src.keep_vendored`): one instantiation per process, anchored to
+    the pack's own files.
     """
-    try:  # the package import (the node package is the parent package)
-        from ..modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
-    except ImportError:  # the flat import (the repository root on sys.path)
-        from modules.deps.facelib.utils.face_restoration_helper import FaceRestoreHelper
-    return FaceRestoreHelper
+    return vendor("facelib.utils.face_restoration_helper").FaceRestoreHelper
 
 
 def __getattr__(name: str):
@@ -93,15 +94,12 @@ def _facelib_model_names() -> dict[str, str]:
     downloads exactly the file the helper loads - a second table would
     drift.
 
-    The import is **lazy**: the vendored module pulls ``requests`` and
-    ``torch.hub`` (through ``modules/deps/basicsr/utils/download_util.py``)
-    and must stay out of the import path of the pack.
+    The call is **lazy**: the vendored module pulls ``requests`` and
+    ``torch.hub`` (through the vendored ``basicsr.utils.download_util``)
+    and must stay out of the import path of the pack.  The module comes
+    from the pack-private namespace (Round 21, :mod:`src.keep_vendored`).
     """
-    try:  # the package import (the node package is the parent package)
-        from ..modules.deps.facelib.detection import MODEL_NAMES
-    except ImportError:  # the flat import (the repository root on sys.path)
-        from modules.deps.facelib.detection import MODEL_NAMES
-    return dict(MODEL_NAMES)
+    return dict(vendor("facelib.detection").MODEL_NAMES)
 
 
 def detection_weight_entry(model_name: str) -> WeightEntry:
