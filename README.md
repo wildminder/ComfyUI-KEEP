@@ -2,7 +2,7 @@
 <div align="center">
 <h1 align="center">ComfyUI-KEEP</h1>
 
-<img src="./assets/keep-preview.png" alt="ComfyUI-KEEP workflow preview" width="70%">
+<img  alt="ComfyUI-KEEP workflow preview" src="https://github.com/user-attachments/assets/bc30d6a3-a1ea-41b4-8278-614070a4c500" />
 
 <p align="center">
 ComfyUI custom node pack for <strong>video face super-resolution</strong> — the
@@ -18,8 +18,8 @@ ComfyUI custom node pack for <strong>video face super-resolution</strong> — th
 <div align="center">
 
 [![Stargazers][stars-shield]][stars-url]
-[![Issues][issues-shield]][issues-url]
-[![Forks][forks-shield]][forks-url]
+[![Telegram][telegram-shield]][telegram-url]
+[![X][x-shield]][x-url]
 
 </div>
 
@@ -31,11 +31,6 @@ ComfyUI custom node pack for <strong>video face super-resolution</strong> — th
 
 This pack ports the algorithm to ComfyUI as three pure **V3** nodes — load the model, restore an image, restore a sequence.
 
-<div align="center">
-<img alt="ComfyUI-KEEP example workflow" width="70%" src="./example_workflows/keep-workflow.png" />
-<p><sub><i>The shipped example workflow: a single image and a video sequence, both restored with KEEP.</i></sub></p>
-</div>
-
 ### ❖ Highlights
 
 * **Video-aware** — the sequence node propagates the features over the frames (optical flow), so the faces stay consistent.
@@ -45,6 +40,12 @@ This pack ports the algorithm to ComfyUI as three pure **V3** nodes — load the
 * **Clean V3** — `comfy_api.latest` nodes only, no legacy mappings, no import-time installs, no `sys.path` hacks.
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
+
+<div align="center">
+<img alt="ComfyUI-KEEP example workflow" width="70%" src="https://github.com/user-attachments/assets/62eaf7ea-0ab5-447c-85f7-9952c32b0c47"  />
+<p><sub><i>The shipped example workflow: a single image and a video sequence, both restored with KEEP.</i></sub></p>
+</div>
+
 
 <a id="keep-nodes"></a>
 ## ▓ Nodes
@@ -136,32 +137,6 @@ The node ids, the display names, the category, the socket types (`IMAGE`, `KEEP_
 
 <p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
-<a id="keep-weights"></a>
-## ▓ Weights
-
-The pack downloads its checkpoints on the first run and verifies every file against the sha256 of the manifest (`src/keep_model_configs.py`). The provenance of every hash is recorded by `tools/fetch_weight_hashes.py`, which downloads each published checkpoint once and hashes it.
-
-| File | Size | SHA-256 | Destination | Notes |
-|:---|---:|:---|:---|:---|
-| `KEEP-b76feb75.pth` | 604.7 MiB | `b76feb75f3ed782f4e91eda85c03018241827bba8693532dc10351bab5052c1a` | `models/keep_models/KEEP/KEEP-b76feb75.pth` | required |
-| `KEEP_Asian-4765ebe0.pth` | — | `—` | `models/keep_models/KEEP/KEEP_Asian-4765ebe0.pth` | **not published upstream (HTTP 404)** — the file has to be placed manually |
-| `detection_Resnet50_Final.pth` | 104.4 MiB | `6d1de9c2944f2ccddca5f5e010ea5ae64a39845a86311af6fdf30841b0a5a16d` | `models/facedetection/detection_Resnet50_Final.pth` | required |
-| `detection_mobilenet0.25_Final.pth` | 1.7 MiB | `2979b33ffafda5d74b6948cd7a5b9a7a62f62b949cef24e95fd15d2883a65220` | `models/facedetection/detection_mobilenet0.25_Final.pth` | required |
-| `yolov5n-face.pth` | 6.8 MiB | `d2bbfbe9f36cf1ec345dc69658d7209e5448a676d946f1bf7818ac50d4489357` | `models/facedetection/yolov5n-face.pth` | required |
-| `yolov5l-face.pth` | 178.3 MiB | `1ba9d2125fda4d823df5152b9fc2903c59aa76c0d3771e02bcf13a56a282cf96` | `models/facedetection/yolov5l-face.pth` | required |
-| `parsing_parsenet.pth` | 81.4 MiB | `3d558d8d0e42c20224f13cf5a29c79eba2d59913419f945545d8cf7b72920de2` | `models/facedetection/parsing_parsenet.pth` | required |
-| `gmflow_sintel-0c07dcb3.pth` | 17.9 MiB | `0c07dcb35770464f38a5ff4de18c04177b242dc5de8cd2068adf46f3d4fe193a` | `models/gmflow/gmflow_sintel-0c07dcb3.pth` | optional (defensive) — only used when the checkpoint has no flow weights |
-
-The on-disk layout is the one of the original pack: the KEEP checkpoints live in `models/keep_models/KEEP/`, the face detection / parsing weights in `models/facedetection/`, the optional GMFlow checkpoint in `models/gmflow/`. The upscaler models are **not** part of the pack — they come from the ComfyUI core *Load Upscale Model* node (`models/upscale_models/`).
-
-> [!WARNING]
-> **The `Asian` checkpoint is not published upstream** (the release URL answers *HTTP 404*), so it cannot be downloaded and has no verifiable hash. The `Asian` option of the `model` widget stays (it is part of the node contract), but selecting it raises an actionable error until the file is placed manually in `models/keep_models/KEEP/KEEP_Asian-4765ebe0.pth`. The default `KEEP` model is unaffected.
-
-> [!NOTE]
-> **The GMFlow checkpoint is defensive.** The shipped KEEP checkpoint carries its own trained flow weights; the GMFlow file is only resolved when a loaded checkpoint provides no `flownet.*` weights at all.
-
-<p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
-
 <a id="keep-getting-started"></a>
 ## ▓ Getting Started
 
@@ -197,13 +172,6 @@ Restart ComfyUI. The weights are downloaded automatically on the first run — n
 * **Aligned crops are faster and sharper.** For an already aligned 512×512 face, set `has_aligned_face` / `has_aligned_frames` — the detection step is skipped.
 * **`only_center_face` keeps the subject.** With several faces in the frame, the one closest to the center is restored.
 * **A failed node fails loudly.** A missing weight or a broken dependency raises an error that names the file and the path — the pack never returns a silently empty image.
-
-<a id="keep-future-work"></a>
-## ▓ Future work
-
-* **A video node** — a node that takes a video file, restores the faces of every frame with KEEP and writes the result back as a video. The pack deliberately ships **no** video code path (the vendored ffmpeg shim was removed — it installed `ffmpeg-python` at import time). Until such a node exists, feed the frames of a video into the **KEEP Image Sequence** node (e.g. with the *Video Helper Suite* nodes) and write them back there.
-
-<p align="right"><a href="#readme-top" title="back to top">⟔ ▲ ⟓</a></p>
 
 <a id="keep-license"></a>
 ## ▓ License
@@ -274,3 +242,7 @@ If you use the core KEEP algorithm or models in your research, please cite the o
 [bug-url]: https://github.com/wildminder/ComfyUI-KEEP/issues/new?labels=bug&template=bug-report---.md
 [feature-shield]: https://img.shields.io/badge/Request-Feature-blue?style=flat-square&logo=github
 [feature-url]: https://github.com/wildminder/ComfyUI-KEEP/issues/new?labels=enhancement&template=feature-request---.md
+[telegram-shield]: https://img.shields.io/badge/Telegram-TokenDiff-26A5E4?style=for-the-badge&logo=telegram&logoColor=white
+[telegram-url]: https://t.me/TokenDiff
+[x-shield]: https://img.shields.io/badge/X-@wildmindai-000000?style=for-the-badge&logo=x&logoColor=white
+[x-url]: https://x.com/wildmindai
